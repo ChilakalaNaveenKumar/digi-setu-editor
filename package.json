@@ -1,0 +1,21 @@
+{
+  "name": "pi-typst-test",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Smoke-test pi-coding-agent against the Typst workflow you currently run on Google ADK.",
+  "pi": {
+    "extensions": [
+      "./extensions/typst-tools.ts"
+    ]
+  },
+  "dependencies": {
+    "@anthropic-ai/vertex-sdk": "^0.16.0",
+    "@google/genai": "^1.0.0",
+    "typebox": "^1.1.24"
+  },
+  "devDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "tsx": "^4.21.0"
+  }
+}
