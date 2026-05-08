@@ -31,6 +31,27 @@ GID_APP=1100
 # sandbox plumbing. Listed alphabetically to make `diff` review easier.
 CAPS="+chown,+fowner,+setgid,+setuid"
 
+# ── Auto-align the in-container `docker_host` group with the host's
+#    /var/run/docker.sock GID. Phase 6 (per-session containers) needs
+#    `app` to be a member of a group whose numeric GID matches the
+#    docker socket's group on the HOST kernel — without that, every
+#    `docker run pi-session …` call from inside the backend gets
+#    permission denied on /var/run/docker.sock and pi_session.py
+#    silently falls back to subprocess mode, defeating the whole
+#    point of the per-session container architecture.
+#
+# At image-build time we hard-code GID 988 (Debian default for the
+# docker package), but the host's GID drifts across distros. We
+# refresh it here so a freshly imaged VM with a different docker GID
+# Just Works without rebuilding the backend image.
+if [ -S /var/run/docker.sock ]; then
+  DOCKER_SOCK_GID=$(stat -c %g /var/run/docker.sock 2>/dev/null || echo 988)
+  CURRENT_GID=$(getent group docker_host | cut -d: -f3 || echo 988)
+  if [ "${DOCKER_SOCK_GID}" != "${CURRENT_GID}" ]; then
+    groupmod -g "${DOCKER_SOCK_GID}" docker_host >/dev/null 2>&1 || true
+  fi
+fi
+
 # IMPORTANT: --init-groups (NOT --clear-groups). The Dockerfile creates
 # `app` with `--groups sandbox`, so `app` is a SECONDARY member of the
 # sandbox group (gid 1000). That's what lets the backend read+write

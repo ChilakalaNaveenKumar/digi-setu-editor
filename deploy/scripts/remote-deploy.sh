@@ -43,6 +43,12 @@ VM="${GCP_VM:-digi-setu-live}"
 AR_HOST="${AR_HOST:-us-central1-docker.pkg.dev}"
 AR_REPO="${AR_REPO:-digi-setu}"
 BACKEND_IMAGE="${AR_HOST}/${PROJECT}/${AR_REPO}/pi-backend"
+# Per-session container image. The backend spawns one of these per
+# chat session via `docker run` (see web/backend/services/pi_session.py).
+# Built alongside the backend in Cloud Build; pulled to the VM during
+# `roll_stack` so the first chat after a deploy doesn't pay the
+# "docker pull pi-session" latency on the user-visible path.
+SESSION_IMAGE="${AR_HOST}/${PROJECT}/${AR_REPO}/pi-session"
 REMOTE_ROOT="${REMOTE_ROOT:-/opt/pi}"
 TAG="${TAG:-$(git rev-parse --short HEAD 2>/dev/null || date -u +%Y%m%d%H%M)}"
 
@@ -91,9 +97,16 @@ scp_remote() {
     "${src}" "${VM}:${dst}"
 }
 
-# ── Step 1: backend image via Cloud Build ─────────────────────────
+# ── Step 1: backend + per-session images via Cloud Build ─────────
+#
+# Cloud Build runs both image builds in parallel (separate `steps`
+# with no `waitFor` chain) so total build time is roughly
+# max(backend, session) instead of sum. Per-session image is smaller
+# (~600 MB vs backend's ~1.2 GB) and reuses many layers — typical
+# Cloud Build with E2_HIGHCPU_8 wall time: backend 4-6 min, session
+# 2-3 min, total ~5-6 min.
 build_backend() {
-  log "submitting backend image ${BACKEND_IMAGE}:${TAG} to Cloud Build"
+  log "submitting backend + session images @ ${TAG} to Cloud Build"
   cd "${REPO_ROOT}"
   run gcloud builds submit \
     --project "${PROJECT}" \
@@ -102,7 +115,8 @@ build_backend() {
     --substitutions "_TAG=${TAG}" \
     "${REPO_ROOT}" <<'YAML'
 steps:
-  - name: gcr.io/cloud-builders/docker
+  - id: backend
+    name: gcr.io/cloud-builders/docker
     args:
       - build
       - --file
@@ -114,11 +128,28 @@ steps:
       - --cache-from
       - ${_BACKEND_IMAGE}:latest
       - .
+  - id: session
+    name: gcr.io/cloud-builders/docker
+    waitFor: ['-']
+    args:
+      - build
+      - --file
+      - deploy/Dockerfile.session
+      - --tag
+      - ${_SESSION_IMAGE}:${_TAG}
+      - --tag
+      - ${_SESSION_IMAGE}:latest
+      - --cache-from
+      - ${_SESSION_IMAGE}:latest
+      - .
 images:
   - ${_BACKEND_IMAGE}:${_TAG}
   - ${_BACKEND_IMAGE}:latest
+  - ${_SESSION_IMAGE}:${_TAG}
+  - ${_SESSION_IMAGE}:latest
 substitutions:
   _BACKEND_IMAGE: us-central1-docker.pkg.dev/digi-setu-dev/digi-setu/pi-backend
+  _SESSION_IMAGE: us-central1-docker.pkg.dev/digi-setu-dev/digi-setu/pi-session
   _TAG: latest
 options:
   machineType: E2_HIGHCPU_8
@@ -170,6 +201,7 @@ push_stack() {
   scp_remote "${DEPLOY_DIR}/systemd/pi.service"                  "${REMOTE_ROOT}/systemd/pi.service"
   scp_remote "${DEPLOY_DIR}/systemd/pi-prepare.service"          "${REMOTE_ROOT}/systemd/pi-prepare.service"
   scp_remote "${DEPLOY_DIR}/systemd/pi-firewall.service"         "${REMOTE_ROOT}/systemd/pi-firewall.service"
+  scp_remote "${DEPLOY_DIR}/systemd/pi-egress-network.service"   "${REMOTE_ROOT}/systemd/pi-egress-network.service"
   scp_remote "${DEPLOY_DIR}/nftables/pi-egress.nft"              "${REMOTE_ROOT}/nftables/pi-egress.nft"
   scp_remote "${DEPLOY_DIR}/scripts/cutover-from-typst-agent.sh" "${REMOTE_ROOT}/scripts/cutover-from-typst-agent.sh"
   scp_remote "${DEPLOY_DIR}/scripts/backup-to-gcs.sh"            "${REMOTE_ROOT}/scripts/backup-to-gcs.sh"
@@ -188,9 +220,10 @@ push_stack() {
 
   ssh_remote "set -e
 # Install systemd units.
-sudo install -m 0644 ${REMOTE_ROOT}/systemd/pi.service          /etc/systemd/system/pi.service
-sudo install -m 0644 ${REMOTE_ROOT}/systemd/pi-prepare.service  /etc/systemd/system/pi-prepare.service
-sudo install -m 0644 ${REMOTE_ROOT}/systemd/pi-firewall.service /etc/systemd/system/pi-firewall.service
+sudo install -m 0644 ${REMOTE_ROOT}/systemd/pi.service                /etc/systemd/system/pi.service
+sudo install -m 0644 ${REMOTE_ROOT}/systemd/pi-prepare.service        /etc/systemd/system/pi-prepare.service
+sudo install -m 0644 ${REMOTE_ROOT}/systemd/pi-firewall.service       /etc/systemd/system/pi-firewall.service
+sudo install -m 0644 ${REMOTE_ROOT}/systemd/pi-egress-network.service /etc/systemd/system/pi-egress-network.service
 
 # Install nftables ruleset (drop the metadata server for uid 1100).
 sudo install -d -m 0755 /etc/nftables.d
@@ -207,12 +240,16 @@ sudo chmod +x ${REMOTE_ROOT}/scripts/cutover-from-typst-agent.sh
 sudo chmod +x ${REMOTE_ROOT}/scripts/backup-to-gcs.sh
 
 sudo systemctl daemon-reload
-sudo systemctl enable pi-prepare.service pi-firewall.service pi.service
+sudo systemctl enable pi-prepare.service pi-firewall.service pi-egress-network.service pi.service
 
-# Start the firewall NOW so the metadata-server hole is closed even
-# before pi.service (re)starts. nftables rules apply immediately.
+# Start the firewall + create the docker network NOW so the metadata-
+# server hole is closed and per-session containers have somewhere to
+# attach even before pi.service (re)starts. nftables rules apply
+# immediately; \`docker network create\` is idempotent.
 sudo systemctl restart pi-firewall.service
-sudo nft list ruleset | grep -A 6 'table inet pi_egress' | head -10
+sudo systemctl restart pi-egress-network.service
+sudo nft list ruleset | grep -A 6 'table inet pi_egress' | head -16
+sudo docker network inspect pi-egress --format '{{(index .IPAM.Config 0).Subnet}} gw={{(index .IPAM.Config 0).Gateway}}'
 "
 }
 
@@ -248,6 +285,19 @@ TOK=\$(curl -fsS -H 'Metadata-Flavor: Google' \\
   'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token' \\
   | python3 -c 'import sys,json; print(json.load(sys.stdin)[\"access_token\"])')
 echo \"\${TOK}\" | sudo docker login -u oauth2accesstoken --password-stdin https://${AR_HOST}
+
+# Pre-pull the per-session image so the first chat after the deploy
+# doesn't eat 30-60s of \"docker pull\" latency on the user-visible path.
+# Backend's docker.sock mount lets it spawn pi-session containers
+# directly; pulling here primes dockerd's local cache.
+#
+# We also tag the short alias \`pi-session:latest\` because the
+# backend's PI_SESSION_IMAGE env defaults to that bare name (so
+# laptop dev with a locally-built image works without env tweaks).
+# stack.env's PI_SESSION_IMAGE setting wins if present.
+sudo docker pull ${SESSION_IMAGE}:${TAG} || true
+sudo docker tag  ${SESSION_IMAGE}:${TAG} ${SESSION_IMAGE}:latest || true
+sudo docker tag  ${SESSION_IMAGE}:${TAG} pi-session:latest          || true
 
 sudo systemctl restart pi-prepare.service
 sudo systemctl restart pi.service

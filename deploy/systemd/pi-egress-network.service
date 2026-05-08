@@ -1,0 +1,94 @@
+# /etc/systemd/system/pi-egress-network.service
+#
+# Creates the `pi-egress` Docker bridge network that every per-session
+# container joins (see web/backend/services/pi_session.py). The
+# network is the trust boundary between the AI's bash and the rest of
+# the world: containers can only see the bridge gateway IP (where the
+# backend's egress proxy listens), and the host nftables ruleset
+# (deploy/nftables/pi-egress.nft) hard-blocks any other destination.
+#
+# Topology:
+#
+#   pi-egress (bridge driver)
+#     subnet:  172.30.16.0/20
+#     gateway: 172.30.16.1
+#     internal: false        — needs internet egress for the proxy to
+#                              forward, but every container's egress
+#                              is filtered by the nftables rules
+#
+# Why a custom bridge instead of `--network=host`?
+#   1. Kernel namespace isolation between containers: each per-session
+#      container has its own netns, can't sniff or address-spoof its
+#      neighbours.
+#   2. Predictable subnet for the firewall rules. Docker assigns a
+#      random /16 to a default-named bridge; we'd have to scrape it
+#      from `docker network inspect` at every boot. Pinning 172.30.16/20
+#      makes nft rules static.
+#   3. Slot count: /20 = 4096 IPs, plenty for the 50-concurrent-chats
+#      sizing on a single VM.
+#
+# Idempotent: re-running with the network already present is a no-op
+# (docker network create returns non-zero "already exists", which we
+# explicitly accept). Subnet drift (operator changed the env vars
+# after the network was created) is detected by inspecting the
+# existing network's IPAM config; the unit refuses to start until the
+# operator manually `docker network rm pi-egress`s the stale one.
+#
+# Operator overrides via /opt/pi/stack.env:
+#   PI_EGRESS_SUBNET   default 172.30.16.0/20
+#   PI_EGRESS_GATEWAY  default 172.30.16.1
+# When changed, ALSO update deploy/nftables/pi-egress.nft and
+# Dockerfile.session's HTTPS_PROXY env (or override at docker run time
+# via PI_EGRESS_PROXY_HOST in stack.env).
+
+[Unit]
+Description=pi-typst-test — create pi-egress docker bridge network
+Before=pi.service docker.service
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-/opt/pi/stack.env
+Environment=PI_EGRESS_SUBNET=172.30.16.0/20
+Environment=PI_EGRESS_GATEWAY=172.30.16.1
+Environment=PI_EGRESS_NETWORK=pi-egress
+
+# Create-or-update. `docker network create` is idempotent only at the
+# "name exists" level — to detect drift in the subnet/gateway args we
+# inspect first and only recreate if mismatch. Using a small bash to
+# keep the systemd unit self-contained.
+ExecStart=/bin/bash -c '\
+  set -eux; \
+  if docker network inspect "$PI_EGRESS_NETWORK" >/dev/null 2>&1; then \
+    cur_subnet=$(docker network inspect "$PI_EGRESS_NETWORK" --format "{{(index .IPAM.Config 0).Subnet}}"); \
+    cur_gw=$(docker network inspect "$PI_EGRESS_NETWORK" --format "{{(index .IPAM.Config 0).Gateway}}"); \
+    if [ "$cur_subnet" = "$PI_EGRESS_SUBNET" ] && [ "$cur_gw" = "$PI_EGRESS_GATEWAY" ]; then \
+      echo "pi-egress: network already at desired config"; exit 0; \
+    fi; \
+    echo "pi-egress: existing network has subnet=$cur_subnet gw=$cur_gw, expected $PI_EGRESS_SUBNET / $PI_EGRESS_GATEWAY"; \
+    echo "pi-egress: refusing to recreate — operator must \"docker network rm $PI_EGRESS_NETWORK\" first"; \
+    exit 1; \
+  fi; \
+  docker network create \
+    --driver bridge \
+    --subnet "$PI_EGRESS_SUBNET" \
+    --gateway "$PI_EGRESS_GATEWAY" \
+    --opt com.docker.network.bridge.enable_icc=true \
+    --opt com.docker.network.bridge.enable_ip_masquerade=true \
+    --opt com.docker.network.bridge.name=pi-egress0 \
+    "$PI_EGRESS_NETWORK"; \
+  echo "pi-egress: network created"; \
+'
+
+# Stop = remove the network. Containers using it will be killed first
+# by pi.service's stop sequence; if any are still attached, docker
+# refuses the rm and we leave it (next start will see it as
+# "already exists" and reuse).
+ExecStop=/bin/bash -c '\
+  docker network rm "${PI_EGRESS_NETWORK:-pi-egress}" 2>/dev/null || true \
+'
+
+[Install]
+WantedBy=pi.service

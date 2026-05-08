@@ -5,14 +5,34 @@ Single responsibility: spawn pi for a given (session_id, workspace_path)
 pair, expose two queues (events out, commands in), and clean up on close.
 Knows nothing about Vue or WebSockets — that's app.py's job.
 
-The `--session-dir` flag points pi at a per-session folder so its built-in
-SessionManager handles persistence/resume for free.
+Two runtime backends, selected by PI_SESSION_RUNTIME env (auto-detected
+when unset):
+
+    PI_SESSION_RUNTIME=docker
+        Production. Each chat spawns a per-chat Docker container from
+        the `pi-session` image. The container has root inside (with
+        sudo NOPASSWD for the AI's bash), full kernel-namespace
+        isolation, and an egress-firewalled network that funnels
+        every outbound TCP through the backend's egress proxy
+        (services/egress_proxy.py) where the auth/allow-list policy
+        lives. Container is destroyed (--rm) when the chat closes.
+
+    PI_SESSION_RUNTIME=subprocess
+        Operator's laptop / CI smoke test. Spawn pi as a regular
+        subprocess (no setpriv, no container). Faster iteration, no
+        isolation. NEVER used in production.
+
+    PI_SESSION_RUNTIME=auto (default)
+        Probe /var/run/docker.sock at start-time. If reachable AND the
+        pi-session image is locally available, use docker. Else fall
+        back to subprocess. The probe runs ONCE on first PiSession
+        start and the result is cached for the process lifetime.
 
 The `cwd` of the spawned subprocess is the **workspace_path** the caller
-supplies. In web mode that's a fresh per-session sandbox under
-web/data/workspaces/<wsid>/. In desktop mode it's whatever folder the user
-opened. Either way, pi's filesystem-touching tools (write/edit/read/bash)
-live entirely inside that path.
+supplies. In docker runtime this is bind-mounted at /workspace inside
+the container; in subprocess runtime it's used as-is. Either way, pi's
+filesystem-touching tools (write/edit/read/bash) live entirely inside
+that path.
 """
 
 from __future__ import annotations
@@ -21,54 +41,165 @@ import asyncio
 import json
 import os
 import shlex
+import shutil
 import sys
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional
 
 from config import DATA_ROOT, PROJECT_ROOT  # noqa: E402
-from services.sandbox_layout import (  # noqa: E402
-    SANDBOX_UID, SANDBOX_GID, stamp_sandbox_dir, is_active as sandbox_active,
+from services.container_pool import (  # noqa: E402
+    LABEL_APP_KEY,
+    LABEL_APP_VALUE,
+    LABEL_CREATED_AT,
+    LABEL_SESSION_ID,
+    LABEL_USER_ID,
 )
 
 SESSIONS_ROOT = DATA_ROOT / "chats"
 
-# Path to the setpriv binary (util-linux). Installed by Dockerfile.backend.
-# Pinned absolute so a hostile $PATH manipulation can't redirect it.
-_SETPRIV = "/usr/bin/setpriv"
+
+# ── Runtime selection ────────────────────────────────────────────────
+# Decide once per process whether to use docker or subprocess. The
+# answer rarely changes between PiSession spawns (it depends on the
+# host environment, not per-call inputs), so caching is fine.
+_RUNTIME_CACHE: Optional[str] = None
 
 
-# ── Env allow-list ───────────────────────────────────────────────────────
-# pi spawns bash, npm, git, typst, etc. as direct subprocesses; every one
-# of them inherits pi's environment, which is whatever WE pass via
-# `env=self._env` to asyncio.create_subprocess_exec. So the env we pass
-# pi is the env the AI's bash sees when it runs `env` or `printenv`.
+def _detect_runtime() -> str:
+    """
+    Return "docker" or "subprocess". Memoised after first call.
+
+    Resolution order:
+      1. PI_SESSION_RUNTIME env var (explicit override, wins)
+      2. /var/run/docker.sock present AND `docker info` succeeds AND
+         the pi-session image exists locally → "docker"
+      3. Fall back to "subprocess".
+    """
+    global _RUNTIME_CACHE
+    if _RUNTIME_CACHE is not None:
+        return _RUNTIME_CACHE
+
+    explicit = os.environ.get("PI_SESSION_RUNTIME", "").strip().lower()
+    if explicit in ("docker", "subprocess"):
+        _RUNTIME_CACHE = explicit
+        print(f"[pi_session] runtime={_RUNTIME_CACHE} (explicit env)", file=sys.stderr)
+        return _RUNTIME_CACHE
+
+    sock = Path("/var/run/docker.sock")
+    if not sock.exists():
+        _RUNTIME_CACHE = "subprocess"
+        print("[pi_session] runtime=subprocess (no /var/run/docker.sock)", file=sys.stderr)
+        return _RUNTIME_CACHE
+
+    docker_bin = shutil.which("docker")
+    if not docker_bin:
+        _RUNTIME_CACHE = "subprocess"
+        print("[pi_session] runtime=subprocess (no `docker` binary in PATH)", file=sys.stderr)
+        return _RUNTIME_CACHE
+
+    # Probe with `docker info` — this exercises the socket AND auth.
+    # 5s timeout because dockerd can be slow on first call after boot.
+    try:
+        import subprocess as _sp
+        _sp.run(
+            [docker_bin, "info", "--format", "{{.ID}}"],
+            check=True,
+            capture_output=True,
+            timeout=5.0,
+        )
+    except (FileNotFoundError, _sp.CalledProcessError, _sp.TimeoutExpired) as exc:
+        _RUNTIME_CACHE = "subprocess"
+        print(f"[pi_session] runtime=subprocess (docker info failed: {exc})", file=sys.stderr)
+        return _RUNTIME_CACHE
+
+    # Probe for the pi-session image. Don't require :latest specifically
+    # because remote-deploy.sh tags both :<sha> and :latest at deploy
+    # time but a fresh VM might briefly have only the :<sha> tag.
+    image = os.environ.get("PI_SESSION_IMAGE", "pi-session:latest")
+    try:
+        _sp.run(
+            [docker_bin, "image", "inspect", image],
+            check=True,
+            capture_output=True,
+            timeout=5.0,
+        )
+    except (_sp.CalledProcessError, _sp.TimeoutExpired) as exc:
+        _RUNTIME_CACHE = "subprocess"
+        print(
+            f"[pi_session] runtime=subprocess (image {image} not found locally: {exc.stderr if hasattr(exc, 'stderr') else exc})",
+            file=sys.stderr,
+        )
+        return _RUNTIME_CACHE
+
+    _RUNTIME_CACHE = "docker"
+    print(f"[pi_session] runtime=docker (image {image} ready)", file=sys.stderr)
+    return _RUNTIME_CACHE
+
+
+# ── Docker config ────────────────────────────────────────────────────
+# Tunables read from env at module load. All optional — defaults work
+# for the digi-setu.com VM out of the box.
+
+PI_SESSION_IMAGE = os.environ.get("PI_SESSION_IMAGE", "pi-session:latest")
+
+# Docker network the per-session container joins. Created at
+# pi-prepare.service boot time (see deploy/systemd/pi-prepare.service).
+# All containers in this network can reach the backend's egress proxy
+# at 172.30.0.1:1080 but cannot reach the host's other interfaces (the
+# nftables rules in deploy/nftables/pi-egress.nft enforce this at the
+# kernel layer, not just the docker network policy).
+PI_EGRESS_NETWORK = os.environ.get("PI_EGRESS_NETWORK", "pi-egress")
+
+# Address the backend's egress proxy is reachable on FROM INSIDE the
+# per-session container. The bridge gateway IP is the standard docker
+# trick for "container talks to host"; we pin a non-default subnet so
+# users can't accidentally collide with our network in their own setups.
+# Must match deploy/systemd/pi-egress-network.service (PI_EGRESS_GATEWAY)
+# and deploy/nftables/pi-egress.nft (define pi_egress_gateway).
+PI_EGRESS_PROXY_HOST = os.environ.get("PI_EGRESS_PROXY_HOST", "172.30.16.1")
+PI_EGRESS_PROXY_PORT = os.environ.get("PI_EGRESS_PROXY_PORT", "1080")
+
+# Path on the HOST where the MITM CA cert lives. Phase 5 (Vertex auth
+# proxy) generates this lazily on first proxy boot if missing. The
+# backend bind-mounts this file (read-only) into every per-session
+# container at /etc/pi/mitm-ca.crt and points NODE_EXTRA_CA_CERTS /
+# CURL_CA_BUNDLE / SSL_CERT_FILE at it via the entrypoint.
+PI_MITM_CA_PATH = os.environ.get(
+    "PI_MITM_CA_PATH", "/srv/pi/state/proxy/mitm-ca.crt"
+)
+
+# Resource caps for each per-session container. Conservative defaults
+# matching the operator's "$BILLING_VM_USERS_AT_ONCE concurrent users
+# on a single VM" sizing. Bump in stack.env for higher-end plans.
+PI_SESSION_MEM_LIMIT = os.environ.get("PI_SESSION_MEM_LIMIT", "1g")
+PI_SESSION_CPU_LIMIT = os.environ.get("PI_SESSION_CPU_LIMIT", "1.0")
+PI_SESSION_PIDS_LIMIT = os.environ.get("PI_SESSION_PIDS_LIMIT", "512")
+PI_SESSION_NOFILE_LIMIT = os.environ.get("PI_SESSION_NOFILE_LIMIT", "4096")
+
+# Shared @preview package cache so typst doesn't re-download cetz /
+# fletcher / etc. for every fresh chat container. Bind-mounted RW into
+# the per-session container (uid 1000 owns this on the host so the
+# container's uid 1000 has write access without needing chown).
+PI_TYPST_CACHE_HOST_PATH = os.environ.get(
+    "PI_TYPST_CACHE_HOST_PATH", "/srv/pi/data/typst-packages"
+)
+
+
+# ── Env allow-list ───────────────────────────────────────────────────
+# pi spawns bash, npm, git, typst, etc. as direct subprocesses; every
+# one of them inherits pi's environment. The env we pass pi (and
+# therefore through to bash) is the env the AI sees with `printenv`.
 #
-# The container (docker-compose.yml) loads /opt/pi/stack.env via env_file
-# AND sets explicit `environment:` keys, so the backend process starts
-# with the FULL set of operator secrets in os.environ:
+# In docker runtime we deliberately pass a much SMALLER set than the
+# subprocess runtime needed — the container's own ENV directives
+# (Dockerfile.session) provide all the Linux fundamentals (PATH, HOME,
+# LANG, …), Typst paths, proxy config, etc. We only inject the
+# per-session bits the backend chooses dynamically (provider, model,
+# permission mode, Gemini key when present).
 #
-#   CLERK_SECRET_KEY, CLERK_WEBHOOK_SECRET, CLERK_PUBLISHABLE_KEY
-#   STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, STRIPE_PRICE_*
-#   CLOUDFLARE_API_TOKEN, ACME_EMAIL
-#   ADMIN_EMAILS, ADMIN_USER_IDS
-#
-# A naive `env=os.environ` would let the AI dump every one of those with
-# a single `bash` call. We replace it with a strict allow-list: anything
-# not on the list is removed, even if a future config knob forgets to
-# add itself to the deny rules.
-#
-# DO NOT add a secret to the allow-list without thinking through "is it
-# OK for the AI's bash to read this?". Items here today fall into three
-# buckets:
-#
-#   1. Linux fundamentals (PATH, HOME, USER, …) — bash/git/npm need them.
-#   2. Vertex / Gemini auth — pi's HTTP client + the typst-tools.ts
-#      extension's sub-LLM calls need them. Vertex uses ADC (no
-#      JSON key), so the only secret here is GEMINI_API_KEY which is
-#      project-scoped.
-#   3. pi's own runtime config (PI_*).
-#   4. Typst font/cache paths.
-_PI_ENV_ALLOW: frozenset[str] = frozenset({
+# In subprocess runtime we keep the broader allow-list because pi
+# inherits the operator's full environment.
+_PI_ENV_ALLOW_SUBPROCESS: frozenset[str] = frozenset({
     # Linux essentials.
     "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM",
     "LANG", "LANGUAGE", "TZ", "TMPDIR", "PWD",
@@ -79,12 +210,8 @@ _PI_ENV_ALLOW: frozenset[str] = frozenset({
     # JSON key file), so only the project / location need to flow.
     "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION",
     "GOOGLE_GENAI_USE_VERTEXAI",
-    "GOOGLE_APPLICATION_CREDENTIALS",  # honored only when set explicitly
-    # Gemini fallback (used by the typst-tools.ts sub-LLM web_search /
-    # search_docs router when Vertex 429s). Project-scoped key, but
-    # still a credential — the AI's bash CAN read it. This is the
-    # one allow-list item to consider stripping later if you decide
-    # the Vertex-only path is sufficient.
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    # Gemini fallback for the typst-tools.ts sub-LLM router.
     "GEMINI_API_KEY",
     # Typst.
     "TYPST_FONT_PATHS", "TYPST_PACKAGE_CACHE_PATH",
@@ -92,9 +219,11 @@ _PI_ENV_ALLOW: frozenset[str] = frozenset({
     "FONTCONFIG_PATH",
 })
 
-
 # Explicit deny — even if a key matches a wildcard prefix below, these
 # always get stripped. Belt-and-suspenders for the most-sensitive ones.
+# The docker runtime's container image NEVER receives any of these
+# regardless of the host backend's environment, because we only pass
+# explicitly-listed keys via -e flags.
 _PI_ENV_DENY: frozenset[str] = frozenset({
     "CLERK_SECRET_KEY",
     "CLERK_WEBHOOK_SECRET",
@@ -116,34 +245,16 @@ _PI_ENV_DENY: frozenset[str] = frozenset({
     "OPENAI_API_KEY",
 })
 
-
-# Wildcard prefixes that are allowed THROUGH unless on the explicit
-# deny list. PI_* covers all of pi's runtime knobs (PI_PROVIDER,
-# PI_MODEL, PI_PERMISSION_MODE, PI_TYPST_*, …).
 _PI_ENV_ALLOW_PREFIXES: tuple[str, ...] = ("PI_",)
 
 
-def _scrub_env_for_pi(full_env: dict[str, str]) -> dict[str, str]:
-    """
-    Filter `full_env` down to only keys pi (and its bash subprocesses)
-    are allowed to see.
-
-    Rule order:
-      1. Drop everything in _PI_ENV_DENY.
-      2. Keep everything in _PI_ENV_ALLOW.
-      3. Keep keys whose name starts with any _PI_ENV_ALLOW_PREFIXES
-         entry, UNLESS the full key is in _PI_ENV_DENY.
-      4. Drop everything else.
-
-    This means a freshly-added secret like NEW_PROVIDER_API_KEY does
-    NOT leak by default — you have to add it to the allow-list
-    explicitly, with a comment justifying why bash should see it.
-    """
+def _scrub_env_for_subprocess(full_env: dict[str, str]) -> dict[str, str]:
+    """Subprocess runtime: drop secrets, keep PI_*/GOOGLE_*/etc."""
     out: dict[str, str] = {}
     for key, value in full_env.items():
         if key in _PI_ENV_DENY:
             continue
-        if key in _PI_ENV_ALLOW:
+        if key in _PI_ENV_ALLOW_SUBPROCESS:
             out[key] = value
             continue
         if any(key.startswith(p) for p in _PI_ENV_ALLOW_PREFIXES):
@@ -154,14 +265,9 @@ def _scrub_env_for_pi(full_env: dict[str, str]) -> dict[str, str]:
 def _load_env_sh() -> dict[str, str]:
     """
     Source pi-typst-test/scripts/env.sh in a child shell and capture the
-    resulting environment, so the backend inherits the same provider/model
-    defaults the user has been running interactively. Falls back to the
-    current process env if env.sh is missing or fails.
-
-    NOTE: env.sh is "first one wins" (it never overwrites a pre-set value).
-    We pre-set PI_PROVIDER=anthropic-vertex and PI_MODEL=claude-sonnet-4-6 so
-    the web backend pins to your patched provider regardless of env.sh's
-    google-vertex defaults. Override per-session via PiSession(...) args.
+    resulting environment. Used by the subprocess runtime to inherit the
+    operator's interactive defaults. The docker runtime ignores this
+    (the container has its own baked-in defaults).
     """
     env_sh = PROJECT_ROOT / "scripts" / "env.sh"
     if not env_sh.exists():
@@ -170,7 +276,6 @@ def _load_env_sh() -> dict[str, str]:
     try:
         import subprocess
 
-        # Pre-pin the patched provider so env.sh respects it.
         bash_prefix = (
             'export PI_PROVIDER="${PI_PROVIDER:-anthropic-vertex}"; '
             'export PI_MODEL="${PI_MODEL:-claude-sonnet-4-6}"; '
@@ -194,11 +299,75 @@ def _load_env_sh() -> dict[str, str]:
         return dict(os.environ)
 
 
+# ── Container env ────────────────────────────────────────────────────
+# Tight allow-list of env keys we forward into per-session containers.
+# Anything not here is NOT visible to the AI, regardless of the
+# backend's own environment. The container's Dockerfile.session ENV
+# directives provide Linux fundamentals (PATH, HOME, LANG, proxy
+# config) so we don't need to forward those.
+def _container_env(
+    provider: str,
+    model: str,
+    permission_mode: str,
+    permission_mode_file_in_container: Optional[str],
+    backend_env: dict[str, str],
+) -> dict[str, str]:
+    out: dict[str, str] = {
+        "PI_PROVIDER": provider,
+        "PI_MODEL": model,
+        "PI_PERMISSION_MODE": permission_mode,
+        # Vertex configuration. The container's HTTPS_PROXY env
+        # routes outbound HTTPS through the backend's MITM proxy,
+        # which adds the Authorization header from the backend's ADC
+        # before forwarding upstream. The container itself never
+        # holds a Vertex token.
+        "GOOGLE_CLOUD_PROJECT": backend_env.get("GOOGLE_CLOUD_PROJECT", ""),
+        "GOOGLE_CLOUD_LOCATION": backend_env.get("GOOGLE_CLOUD_LOCATION", "global"),
+        "GOOGLE_GENAI_USE_VERTEXAI": "true",
+        # Tells the patched pi-ai (`hasVertexAdcCredentials`) to skip
+        # the on-disk ADC check — the proxy handles auth, the
+        # container has no creds. See patches/apply-edits.mjs §3b.
+        "PI_TRUST_GCE_METADATA": "1",
+        # Force gcp-metadata library to route via HTTP_PROXY by
+        # using hostnames everywhere (including the IP fallback).
+        # Without this the lib hits 169.254.169.254 directly →
+        # nftables drops it → pi-ai dies. See the long-form rationale
+        # in deploy/Dockerfile.session.
+        "GCE_METADATA_HOST": "metadata.google.internal",
+        "GCE_METADATA_IP": "metadata.google.internal",
+        "METADATA_SERVER_DETECTION": "assume-present",
+        # Gemini fallback for the typst-tools.ts sub-LLM router.
+        # When set the router can fall through to AI Studio for
+        # 429-prone Vertex hosts. Empty value is fine — typst-tools
+        # treats it as "Gemini fallback disabled".
+        "GEMINI_API_KEY": backend_env.get("GEMINI_API_KEY", ""),
+        # Pin search_docs to Gemini Flash by default (Claude Haiku's
+        # 200k context can't fit the typst corpus).
+        "PI_TYPST_ROUTER_MODEL": backend_env.get(
+            "PI_TYPST_ROUTER_MODEL", "gemini-3-flash-preview"
+        ),
+    }
+
+    if permission_mode_file_in_container:
+        out["PI_PERMISSION_MODE_FILE"] = permission_mode_file_in_container
+
+    if provider == "anthropic-vertex":
+        out["PI_VERTEX_ANTHROPIC_LOCATION"] = backend_env.get(
+            "PI_VERTEX_ANTHROPIC_LOCATION", "global"
+        )
+
+    # Drop empty values — `docker run -e KEY=` with no value sets KEY
+    # to empty inside the container, which can confuse libraries that
+    # treat empty-string differently from unset (Anthropic SDK does
+    # this for ANTHROPIC_API_KEY). Strip them so unset means unset.
+    return {k: v for k, v in out.items() if v != ""}
+
+
 class PiSession:
     """
     One pi RPC subprocess. Lifecycle:
 
-        s = PiSession(session_id="abc")
+        s = PiSession(session_id="abc", workspace_path=Path(...))
         await s.start()
         async for evt in s.events():        # incoming JSONL from pi
             ...
@@ -221,86 +390,52 @@ class PiSession:
         session_dir: Optional[Path] = None,
         permission_mode: str = "approve_risky",
         permission_mode_file: Optional[Path] = None,
+        user_id: Optional[str] = None,
     ):
         self.session_id = session_id
-        # Per-session sandbox the subprocess will cwd into. Caller (Registry)
-        # is responsible for ensuring it exists and has the agent's required
-        # symlinks (extensions/, guides/, .pi/, AGENTS.md, package.json).
-        self.workspace_path = Path(workspace_path)
+        # user_id is ATTRIBUTION ONLY for the docker label set —
+        # services/container_pool.py uses it to enforce the per-user
+        # concurrency cap and assign orphan ownership. NOT a security
+        # boundary by itself; the actual cross-tenant isolation comes
+        # from the kernel namespaces of the per-session container.
+        self.user_id = (user_id or "anonymous").replace(" ", "_")[:64]
+        self.workspace_path = Path(workspace_path).resolve()
         if not self.workspace_path.exists():
             raise FileNotFoundError(
                 f"workspace_path does not exist: {self.workspace_path}"
             )
-        # Where pi persists its own session JSONL. Defaults to a per-session
-        # folder under web/data/chats/ when caller doesn't supply one.
-        self.session_dir = Path(session_dir) if session_dir else SESSIONS_ROOT / session_id
+        self.session_dir = Path(session_dir).resolve() if session_dir else (SESSIONS_ROOT / session_id).resolve()
         self.session_dir.mkdir(parents=True, exist_ok=True)
-        # Stamp 2770 1000:1000 so the sandbox-uid pi can write its
-        # JSONL without EACCES, while the backend still reaches it
-        # via secondary-group membership for backups / audit reads.
-        stamp_sandbox_dir(self.session_dir)
 
-        # Source env.sh first (gives us PI_PROVIDER, PI_MODEL defaults +
-        # all pi runtime knobs), THEN scrub down to the allow-list so
-        # CLERK_SECRET_KEY, STRIPE_SECRET_KEY, CLOUDFLARE_API_TOKEN, etc.
-        # are NOT inherited by pi (and therefore not by bash). See the
-        # _PI_ENV_ALLOW / _PI_ENV_DENY sets at module top.
+        # Source env.sh once for both runtimes — provider/model defaults
+        # come from there, even if the docker runtime later only forwards
+        # a small subset.
         full_env = _load_env_sh()
-        env = _scrub_env_for_pi(full_env)
-        # Per-session overrides win over env.sh defaults.
-        self._provider = provider or env.get("PI_PROVIDER", "anthropic-vertex")
-        self._model = model or env.get("PI_MODEL", "claude-opus-4-7")
-        # anthropic-vertex needs location pinned to "global" for opus-4-7 (per patches/PATCH.md).
-        if self._provider == "anthropic-vertex":
-            env.setdefault("PI_VERTEX_ANTHROPIC_LOCATION", "global")
 
-        # On the GCE VM the workload identity comes from the metadata
-        # server (169.254.169.254), not from a written ADC file. pi-ai's
-        # `hasVertexAdcCredentials()` heuristic only checks for a file on
-        # disk and otherwise rejects every chat at startup with "No API
-        # key found for {anthropic-vertex,google-vertex}" — even though
-        # google-auth-library inside the SDK would happily fetch a
-        # token from metadata at request time. The patched-in escape
-        # hatch (`PI_TRUST_GCE_METADATA=1`, see
-        # patches/apply-edits.mjs §3b) tells the heuristic to trust
-        # GCE workload identity.
-        #
-        # We set it whenever the env declares the operator INTENDS to
-        # use Vertex (`GOOGLE_GENAI_USE_VERTEXAI=true`) AND a
-        # `GOOGLE_CLOUD_PROJECT` is defined — same signal the SDK
-        # itself uses to decide between AI Studio and Vertex routing.
-        # On a non-GCE machine without ADC the actual API call will
-        # fail with a clear "could not load Application Default
-        # Credentials" error from google-auth-library; our heuristic
-        # only widens the auth-PRESENCE check, not the auth FACT.
-        if (
-            env.get("GOOGLE_GENAI_USE_VERTEXAI", "").lower() == "true"
-            and env.get("GOOGLE_CLOUD_PROJECT")
-        ):
-            env.setdefault("PI_TRUST_GCE_METADATA", "1")
+        self._provider = provider or full_env.get("PI_PROVIDER", "anthropic-vertex")
+        self._model = model or full_env.get("PI_MODEL", "claude-sonnet-4-6")
 
-        # The permission extension reads PI_PERMISSION_MODE on startup. We pin
-        # it here so each spawned pi inherits the user's preference (or the
-        # plan default the caller chose). Validation happens inside the
-        # extension; we just clamp obvious typos to the safe default.
         mode = (permission_mode or "approve_risky").strip().lower()
         if mode not in {"auto", "approve_risky", "approve_all"}:
             mode = "approve_risky"
-        env["PI_PERMISSION_MODE"] = mode
         self._permission_mode = mode
 
-        # PI_PERMISSION_MODE_FILE lets the extension re-read the user's
-        # current mode on every tool_call, so flipping the picker in the
-        # browser immediately affects the running pi (no respawn). We
-        # write the file here too in case the user has never changed
-        # their default — the extension always finds a file to read
-        # instead of having two code paths.
+        # Materialise the permission_mode_file with mode 0644 so the
+        # container's sandbox uid (1000) can read it via the bind mount.
+        # The mode token itself ("auto" / "approve_risky" / "approve_all")
+        # is not a secret — it's a UI preference — so widening read perms
+        # does not leak anything sensitive.
+        self._permission_mode_file_host: Optional[Path] = None
         if permission_mode_file is not None:
             try:
                 permission_mode_file.parent.mkdir(parents=True, exist_ok=True)
                 if not permission_mode_file.exists():
                     permission_mode_file.write_text(mode + "\n", encoding="utf-8")
-                env["PI_PERMISSION_MODE_FILE"] = str(permission_mode_file)
+                try:
+                    os.chmod(permission_mode_file, 0o644)
+                except OSError:
+                    pass
+                self._permission_mode_file_host = permission_mode_file.resolve()
             except Exception as exc:
                 print(
                     f"[pi_session {session_id}] WARN: permission_mode_file unusable ({exc}); "
@@ -308,124 +443,246 @@ class PiSession:
                     file=sys.stderr,
                 )
 
-        self._env = env
+        self._backend_env = full_env  # captured for container env build
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._closed = False
         self._stderr_task: Optional[asyncio.Task] = None
+        self._runtime: str = _detect_runtime()
+        # Container name — short, deterministic, easy to grep in
+        # `docker ps`. Truncated session_id keeps it under Docker's
+        # 64-char name limit comfortably.
+        short_sid = session_id.replace("/", "_").replace(":", "_")[:48]
+        self._container_name = f"pi-sess-{short_sid}"
 
     # ── lifecycle ───────────────────────────────────────────────────────────
     async def start(self) -> None:
         if self._proc is not None:
             return
 
-        # Self-heal sandbox symlinks before every spawn. Two reasons:
-        # (1) workspaces created before SANDBOX_SYMLINKS gained a new
-        #     entry (e.g. node_modules added in the dual-uid migration)
-        #     would otherwise stay broken forever — pi crashes at
-        #     startup with "Cannot find module 'X'" because the require
-        #     resolver can't see /app/node_modules from the workspace
-        #     cwd.
-        # (2) hostile or accidental `rm symlink` inside the workspace
-        #     would silently disable the agent. Re-creating idempotent
-        #     symlinks on every session start is cheap and robust.
-        # Importing inside start() avoids a circular import at module
-        # load (registry imports pi_session indirectly via routes).
-        try:
-            from services.registry import Registry as _Registry
-            _Registry.instance()._wire_sandbox_symlinks(self.workspace_path)
-        except Exception as exc:
-            # Failure here isn't fatal — pi might still work if the
-            # symlinks already exist from create_web_workspace. Log and
-            # continue.
-            print(
-                f"[pi_session {self.session_id}] WARN: "
-                f"_wire_sandbox_symlinks failed: {exc}",
-                file=sys.stderr,
-            )
+        if self._runtime == "docker":
+            cmd = self._build_docker_cmd()
+            cwd: Optional[str] = None
+            spawn_env: Optional[dict[str, str]] = None
+        else:
+            cmd, cwd, spawn_env = self._build_subprocess_cmd()
 
-        # Base argv for pi --mode rpc. Built first so the setpriv prefix
-        # below can be prepended cleanly.
+        # asyncio.StreamReader defaults to a 64 KB line limit. pi RPC
+        # events routinely exceed that (a `write` of a multi-KB file
+        # ships the full content as one JSON line). Bump to 16 MB.
+        self._proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=cwd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=spawn_env,
+            limit=16 * 1024 * 1024,
+        )
+        self._stderr_task = asyncio.create_task(self._drain_stderr())
+
+        print(
+            f"[pi_session {self.session_id}] spawned runtime={self._runtime} "
+            f"pid={self._proc.pid} provider={self._provider} model={self._model} "
+            f"permission_mode={self._permission_mode} "
+            f"container={self._container_name if self._runtime == 'docker' else '-'} "
+            f"cwd={self.workspace_path} chats={self.session_dir}",
+            file=sys.stderr,
+        )
+
+    def _build_docker_cmd(self) -> list[str]:
+        """
+        Construct the `docker run -i --rm …` argv for spawning a
+        per-chat container. The container is destroyed when the
+        process exits (--rm) so we don't accumulate dead containers
+        in `docker ps -a` even if the backend crashes.
+
+        Volume mounts:
+          /workspace        rw  user content (host: workspace_path)
+          /session          rw  pi's session JSONL (host: session_dir)
+          /home/sandbox/.cache/typst rw shared @preview cache
+          /etc/pi/permission_mode  ro live permission mode file
+          /etc/pi/mitm-ca.crt      ro backend's MITM CA cert (Phase 5)
+
+        Network: pi-egress (created at boot by pi-prepare). All
+        outbound traffic is forced through the backend's egress proxy
+        at PI_EGRESS_PROXY_HOST:PI_EGRESS_PROXY_PORT by host nftables
+        rules — see deploy/nftables/pi-egress.nft.
+        """
+        permission_mode_file_in_container: Optional[str] = None
+        volume_args: list[str] = []
+
+        # Workspace: the user's content. The host parent dir's SGID
+        # (mode 2770 gid=1000) makes new files inside inherit gid 1000
+        # so the backend's `app` user can rw them via secondary group
+        # membership for GCS sync / audit / billing.
+        volume_args += [
+            "--volume",
+            f"{self.workspace_path}:/workspace:rw",
+        ]
+        # Per-session JSONL.
+        volume_args += [
+            "--volume",
+            f"{self.session_dir}:/session:rw",
+        ]
+
+        # Shared typst @preview cache. Optional — if the host path
+        # doesn't exist (laptop dev) skip the mount and the container
+        # will populate its own ephemeral cache.
+        typst_cache = Path(PI_TYPST_CACHE_HOST_PATH)
+        if typst_cache.exists():
+            volume_args += [
+                "--volume",
+                f"{typst_cache}:/home/sandbox/.cache/typst:rw",
+            ]
+
+        # Permission mode file (live UI preference). Bind-mount the
+        # FILE (not its parent dir), read-only — the extension just
+        # reads on every tool_call, the backend writes from the host
+        # side.
+        if self._permission_mode_file_host and self._permission_mode_file_host.is_file():
+            permission_mode_file_in_container = "/etc/pi/permission_mode"
+            volume_args += [
+                "--volume",
+                f"{self._permission_mode_file_host}:/etc/pi/permission_mode:ro",
+            ]
+
+        # MITM CA cert (Phase 5). Bind-mounted read-only; the
+        # entrypoint copies it onto the system trust store + sets
+        # NODE_EXTRA_CA_CERTS so node fetch trusts the proxy's
+        # leaf certs for *.aiplatform.googleapis.com.
+        mitm_ca = Path(PI_MITM_CA_PATH)
+        if mitm_ca.exists():
+            volume_args += [
+                "--volume",
+                f"{mitm_ca}:/etc/pi/mitm-ca.crt:ro",
+            ]
+
+        # ── Env injection ──────────────────────────────────────────
+        env_args: list[str] = []
+        for key, value in _container_env(
+            provider=self._provider,
+            model=self._model,
+            permission_mode=self._permission_mode,
+            permission_mode_file_in_container=permission_mode_file_in_container,
+            backend_env=self._backend_env,
+        ).items():
+            env_args += ["--env", f"{key}={value}"]
+
+        # ── Resource caps ──────────────────────────────────────────
+        cap_args = [
+            "--memory", PI_SESSION_MEM_LIMIT,
+            "--memory-swap", PI_SESSION_MEM_LIMIT,
+            "--cpus", PI_SESSION_CPU_LIMIT,
+            "--pids-limit", PI_SESSION_PIDS_LIMIT,
+            "--ulimit", f"nofile={PI_SESSION_NOFILE_LIMIT}:{PI_SESSION_NOFILE_LIMIT}",
+        ]
+
+        # ── Capabilities ───────────────────────────────────────────
+        # Drop ALL, then add back the minimum needed for sudo + apt
+        # install + chown of newly-extracted package files. See
+        # Dockerfile.session header for the full rationale on each.
+        secopt_args = [
+            "--cap-drop", "ALL",
+            "--cap-add", "CHOWN",
+            "--cap-add", "FOWNER",
+            "--cap-add", "SETUID",
+            "--cap-add", "SETGID",
+            "--cap-add", "DAC_OVERRIDE",
+            "--cap-add", "DAC_READ_SEARCH",
+            "--cap-add", "NET_BIND_SERVICE",
+            # MUST be false because sudo requires the setuid bit; see
+            # Dockerfile.session header for the trade-off discussion.
+            "--security-opt", "no-new-privileges=false",
+        ]
+
+        # ── pi argv (passed as CMD, image's ENTRYPOINT prepends
+        # tini + entrypoint-session.sh which drops to uid 1000) ────
         pi_argv = [
+            "pi",
+            "--mode", "rpc",
+            "--provider", self._provider,
+            "--model", self._model,
+            "--session-dir", "/session",
+            "--extension", "/opt/pi-session/extensions/typst-tools.ts",
+            "--extension", "/opt/pi-session/extensions/permission.ts",
+        ]
+
+        # ── Labels for container_pool.py ───────────────────────────
+        # Used for orphan cleanup on backend restart, per-user
+        # concurrency cap enforcement, and debug correlation.
+        from datetime import datetime, timezone
+        created_at = datetime.now(timezone.utc).isoformat()
+        label_args = [
+            "--label", f"{LABEL_APP_KEY}={LABEL_APP_VALUE}",
+            "--label", f"{LABEL_USER_ID}={self.user_id}",
+            "--label", f"{LABEL_SESSION_ID}={self.session_id}",
+            "--label", f"{LABEL_CREATED_AT}={created_at}",
+        ]
+
+        # Map the human-readable name `pi-proxy` to the docker bridge
+        # gateway IP. The Dockerfile.session bakes HTTPS_PROXY=http://
+        # pi-proxy:1080 into the image so neither the AI nor curious
+        # `env` calls ever see the raw 172.30.16.1 — they get a stable
+        # symbolic name even if the operator changes the bridge subnet
+        # (deploy/systemd/pi-egress-network.service is the source of
+        # truth for the IP, and pi_session.py reads it from env).
+        host_args = ["--add-host", f"pi-proxy:{PI_EGRESS_PROXY_HOST}"]
+
+        return [
+            "docker", "run",
+            "-i",                     # keep STDIN open (RPC stdio)
+            "--rm",                   # delete container on exit
+            "--name", self._container_name,
+            "--network", PI_EGRESS_NETWORK,
+            "--workdir", "/workspace",
+            *host_args,
+            *label_args,
+            *volume_args,
+            *env_args,
+            *cap_args,
+            *secopt_args,
+            # No DNS override — the egress proxy handles DNS resolution
+            # upstream of the container's TCP path.
+            PI_SESSION_IMAGE,
+            *pi_argv,
+        ]
+
+    def _build_subprocess_cmd(self) -> tuple[list[str], str, dict[str, str]]:
+        """
+        Subprocess runtime (laptop dev / CI smoke). Spawns pi as a
+        regular subprocess with the operator's env. No isolation —
+        DO NOT USE IN PRODUCTION.
+        """
+        env = _scrub_env_for_subprocess(self._backend_env)
+
+        # Per-session overrides win over env.sh defaults.
+        if self._provider == "anthropic-vertex":
+            env.setdefault("PI_VERTEX_ANTHROPIC_LOCATION", "global")
+
+        # Vertex on a GCE VM (laptop dev usually doesn't hit this; the
+        # operator runs `gcloud auth application-default login` which
+        # writes ~/.config/gcloud/application_default_credentials.json
+        # so the on-disk ADC heuristic in pi-ai succeeds normally).
+        if (
+            env.get("GOOGLE_GENAI_USE_VERTEXAI", "").lower() == "true"
+            and env.get("GOOGLE_CLOUD_PROJECT")
+        ):
+            env.setdefault("PI_TRUST_GCE_METADATA", "1")
+
+        env["PI_PERMISSION_MODE"] = self._permission_mode
+        if self._permission_mode_file_host:
+            env["PI_PERMISSION_MODE_FILE"] = str(self._permission_mode_file_host)
+
+        cmd = [
             "pi",
             "--mode", "rpc",
             "--provider", self._provider,
             "--model", self._model,
             "--session-dir", str(self.session_dir),
             "--extension", "./extensions/typst-tools.ts",
-            # Permission gate. Reads PI_PERMISSION_MODE from env, asks the
-            # user via ctx.ui.select (which RPC mode forwards to us as
-            # extension_ui_request frames). See routes/chat_ws.py for the
-            # backend-side bridge that translates those frames into
-            # permission_request WS events.
             "--extension", "./extensions/permission.ts",
         ]
-
-        # ── Sandbox drop ───────────────────────────────────────────
-        # When PI_SANDBOX_UID is set (production), we wrap the pi
-        # invocation in `setpriv` so pi (and every bash subprocess
-        # the AI spawns) runs as uid 1000, distinct from the backend's
-        # uid 1100. The backend keeps unrestricted access to
-        # billing.db / registry.json / users/, the AI gets nothing.
-        #
-        # Flags:
-        #   --reuid / --regid       drop to the sandbox identity
-        #   --clear-groups          discard supplementary groups so
-        #                           the AI's bash isn't accidentally
-        #                           a member of `app` via inheritance
-        #   --no-new-privs          set PR_SET_NO_NEW_PRIVS so any
-        #                           subsequent execve cannot gain new
-        #                           privileges via setuid bits. Pairs
-        #                           with the container's
-        #                           `security_opt: no-new-privileges:true`.
-        #
-        # If the sandbox isn't active (laptop dev, or container missing
-        # CAP_SETUID), we run pi directly under the backend uid the
-        # same way v1.0 did. The `sandbox_active()` probe takes care
-        # of detecting a missing capability so we don't blow up at
-        # exec time with a confusing "setpriv: permission denied".
-        if sandbox_active():
-            cmd = [
-                _SETPRIV,
-                "--reuid", str(SANDBOX_UID),
-                "--regid", str(SANDBOX_GID),
-                "--clear-groups",
-                "--no-new-privs",
-                *pi_argv,
-            ]
-            # Override HOME so $HOME points at the sandbox user's
-            # tmpfs home (mounted at /home/sandbox by the compose
-            # file). Without this, pi/npm/git would still try
-            # /home/app and hit EACCES.
-            self._env["HOME"] = "/home/sandbox"
-            self._env["USER"] = "sandbox"
-            self._env["LOGNAME"] = "sandbox"
-        else:
-            cmd = pi_argv
-
-        # asyncio.StreamReader defaults to a 64 KB line limit. pi RPC events
-        # routinely exceed that (e.g. tool_execution_end for a `write` of a
-        # multi-KB file ships the full content as one JSON line). Bump to 16 MB
-        # to comfortably hold any reasonable single tool result.
-        self._proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=str(self.workspace_path),
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=self._env,
-            limit=16 * 1024 * 1024,
-        )
-        self._stderr_task = asyncio.create_task(self._drain_stderr())
-
-        print(
-            f"[pi_session {self.session_id}] spawned pid={self._proc.pid} "
-            f"provider={self._provider} model={self._model} "
-            f"permission_mode={self._permission_mode} "
-            f"sandbox={'on' if sandbox_active() else 'off'} "
-            f"sandbox_uid={SANDBOX_UID if sandbox_active() else 'shared'} "
-            f"cwd={self.workspace_path} chats={self.session_dir}",
-            file=sys.stderr,
-        )
+        return cmd, str(self.workspace_path), env
 
     async def close(self) -> None:
         if self._closed:
@@ -435,19 +692,54 @@ class PiSession:
         if self._proc is None:
             return
 
-        # Polite: close stdin so pi exits cleanly; force kill after grace period.
+        # Polite shutdown: close stdin so pi exits cleanly.
         try:
             if self._proc.stdin and not self._proc.stdin.is_closing():
                 self._proc.stdin.close()
         except Exception:
             pass
 
+        # Grace period for the container/process to exit normally.
         try:
             await asyncio.wait_for(self._proc.wait(), timeout=5.0)
         except asyncio.TimeoutError:
-            print(f"[pi_session {self.session_id}] grace period elapsed, killing", file=sys.stderr)
+            print(
+                f"[pi_session {self.session_id}] grace period elapsed, killing",
+                file=sys.stderr,
+            )
+            if self._runtime == "docker":
+                # `docker kill` sends SIGKILL to PID 1 inside the
+                # container; with --rm this also tears the container
+                # down. We still call `self._proc.kill()` afterwards
+                # in case the docker CLI itself is hung waiting.
+                try:
+                    import subprocess as _sp
+                    _sp.run(
+                        ["docker", "kill", self._container_name],
+                        check=False,
+                        capture_output=True,
+                        timeout=5.0,
+                    )
+                except Exception:
+                    pass
             self._proc.kill()
             await self._proc.wait()
+
+        # Belt-and-suspenders cleanup: even on clean shutdown, if the
+        # container somehow survived (--rm should remove it but a
+        # dockerd race or aborted exit could leave it hanging) force
+        # a remove. Never block on this — the chat is over.
+        if self._runtime == "docker":
+            try:
+                import subprocess as _sp
+                _sp.run(
+                    ["docker", "rm", "-f", self._container_name],
+                    check=False,
+                    capture_output=True,
+                    timeout=3.0,
+                )
+            except Exception:
+                pass
 
         if self._stderr_task and not self._stderr_task.done():
             self._stderr_task.cancel()
@@ -467,11 +759,9 @@ class PiSession:
             raise RuntimeError("PiSession not started")
 
         stdout = self._proc.stdout
-        # RPC protocol: split on LF only. Strip optional CR. Never use generic
-        # line readers that split on U+2028/U+2029 — those are valid inside JSON.
         while True:
             line = await stdout.readline()
-            if not line:  # EOF
+            if not line:
                 break
             text = line.rstrip(b"\r\n")
             if not text:

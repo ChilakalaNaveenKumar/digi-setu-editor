@@ -65,8 +65,23 @@ RequiresMountsFor=/srv
 Type=oneshot
 RemainAfterExit=yes
 
-# State — root-only. Host the bearer-token JWT key + auth.db here.
-ExecStart=/usr/bin/install -d -m 0700 -o 0    -g 0    /srv/pi/state
+# State — mostly root-only (host the bearer-token JWT key + auth.db
+# here). The egress proxy needs a backend-writable subdir for its CA
+# cert + leaf-cert cache, so we:
+#
+#   /srv/pi/state           0710 root:1100  ← backend traverses, can't list
+#   /srv/pi/state/proxy/    0700 1100:1100  ← backend rwx, others nothing
+#   /srv/pi/state/proxy/leaf-certs/  0700 1100:1100
+#
+# The 0710 trick on the parent is the same pattern used for
+# /srv/pi/data: backend's gid 1100 picks up the group --x bit so it
+# can `cd /srv/pi/state/proxy/`, but `ls /srv/pi/state/` returns
+# Permission denied — the JWT key, auth.db, etc. remain invisible to
+# the backend (and to the per-session containers, which never get
+# this volume mounted in the first place).
+ExecStart=/usr/bin/install -d -m 0710 -o 0    -g 1100 /srv/pi/state
+ExecStart=/usr/bin/install -d -m 0700 -o 1100 -g 1100 /srv/pi/state/proxy
+ExecStart=/usr/bin/install -d -m 0700 -o 1100 -g 1100 /srv/pi/state/proxy/leaf-certs
 
 # Top-level data dir. Backend (1100) is owner with full rwx; sandbox
 # group (1000) gets --x (traverse) but no r (no listing). Mode 0710

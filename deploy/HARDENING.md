@@ -704,3 +704,218 @@
   (operationally messy at scale) or a runuser-style namespace
   per chat session (engineering cost: ~1 week). Not blocking the
   closed beta; tracked as a Phase-5+ deliverable.
+
+  > **2026-05-08 update — superseded by §12.** The "Phase-5+" item
+  > above is now §12 below: per-session Docker containers replace
+  > the dual-uid sandbox. Section 11 is kept as historical reference
+  > for the registry/file-tree code path (which still runs uid 1100
+  > on the backend); the AI's bash no longer runs as uid 1000 in
+  > the backend container — it runs in its own ephemeral
+  > `pi-session` container.
+
+  ---
+
+  ## 12. Per-session Docker container sandbox (Phase 6 architecture)
+
+  **Why it matters:** This is the trust boundary between the user's
+  AI-driven shell and everything else (the backend, other users'
+  workspaces, the host filesystem, the public internet). It replaces
+  the dual-uid model in §11 with **one ephemeral Docker container
+  per chat session**, giving each user kernel-namespace isolation
+  AND root-inside-container freedom (sudo apt install, install rust,
+  etc.) without compromising cross-tenant or host security.
+
+  ### 12a. Architecture at a glance
+
+  ```text
+   ┌─ host (GCP VM) ────────────────────────────────────────────────────────┐
+   │                                                                        │
+   │  pi-backend (host network mode)         pi-egress docker network       │
+   │  uid 1100 / 1000 dual-uid               172.30.16.0/20                 │
+   │                                                                        │
+   │  ┌──────────────────────────┐           ┌─────────────────┐            │
+   │  │ FastAPI                  │◄─stdio────┤ pi-sess-<sid-A> │ user A     │
+   │  │  + egress proxy thread   │           │ uid 1000 inside │            │
+   │  │    listening on          │           │ /workspace bind │            │
+   │  │    172.30.16.1:1080      │◄──HTTPS───┤ HTTPS_PROXY=    │            │
+   │  │  + container_pool        │           │   172.30.16.1   │            │
+   │  └─────────┬────────────────┘           └─────────────────┘            │
+   │            │                                                           │
+   │            │ docker.sock                ┌─────────────────┐            │
+   │            ├────────────────────────────┤ pi-sess-<sid-B> │ user B     │
+   │            │                            └─────────────────┘            │
+   │            │                                                           │
+   │            ▼                                                           │
+   │  /srv/pi/state (CA + secrets)                                          │
+   │  /srv/pi/data  (workspaces, chats, registry)                           │
+   │                                                                        │
+   │  nftables rules (deploy/nftables/pi-egress.nft):                       │
+   │    src=172.30.16.0/20 → dst=172.30.16.1:1080  ALLOW                    │
+   │    src=172.30.16.0/20 → anywhere else         DROP (incl. 169.254.x)   │
+   └────────────────────────────────────────────────────────────────────────┘
+  ```
+
+  ### 12b. The boundaries (what each layer enforces)
+
+  | Layer | Enforces | Bypass cost |
+  |-------|----------|-------------|
+  | Kernel namespaces (per-container netns/mountns/pidns) | "Container A cannot see container B's files / processes / network" | A kernel CVE in namespace setup. Patch promptly. |
+  | nftables host firewall (`pi-egress.nft`) | "Container subnet 172.30.16.0/20 can ONLY talk to the proxy at 172.30.16.1:1080" | Root on the VM. |
+  | Egress proxy hostname allow-list | "Outbound HTTPS only to ~30 curated hostnames" | Root in the proxy = backend RCE. |
+  | MITM CA (signs leaf certs for `*.aiplatform.googleapis.com`) | "Vertex auth header is injected by proxy, not the AI" | Container can't see CA private key (only public cert is bind-mounted ro). |
+  | Per-session container `cap_drop ALL` + small cap_add | "AI can sudo inside container, can't escape" | Kernel CVE in the cap_add set we kept (CHOWN/FOWNER/SETUID/SETGID/DAC_OVERRIDE/NET_BIND_SERVICE). |
+  | Bash policy (`services/policy.py`) | "Refuse cryptominer / metadata-IP curl / docker.sock probe attempts at the bash layer for clearer error messages" | Trivial — this is advisory, not the trust boundary. |
+
+  Any one of the layers being defeated is contained by the others.
+  The matrix is intentional defense-in-depth.
+
+  ### 12c. Wiring (files that have to stay in sync)
+
+  | File | Role |
+  |------|------|
+  | `deploy/Dockerfile.session` | Per-session image: Debian + node + typst + sudo NOPASSWD for sandbox uid 1000 |
+  | `deploy/entrypoint-session.sh` | tini → install MITM CA → `setpriv --reuid 1000` → `pi --mode rpc` |
+  | `web/backend/services/pi_session.py` | Spawns `docker run -i --rm … pi-session …` per chat |
+  | `web/backend/services/egress_proxy.py` | HTTP CONNECT proxy + Vertex MITM auth injector |
+  | `web/backend/services/container_pool.py` | Quotas + orphan cleanup |
+  | `deploy/nftables/pi-egress.nft` | Force traffic from 172.30.16.0/20 through proxy only |
+  | `deploy/systemd/pi-egress-network.service` | Creates the `pi-egress` docker bridge (172.30.16.0/20) at boot |
+  | `deploy/docker-compose.yml` | Backend gets `/var/run/docker.sock` + `/srv/pi/state` rw |
+
+  Every one of these files has a header comment documenting why it
+  exists and what its peers are. When you change subnet / gateway /
+  port settings, change ALL of them in lockstep.
+
+  ### 12d. Vertex auth — the MITM CA
+
+  The backend's egress proxy generates a CA cert at first boot and
+  stores it under `/srv/pi/state/`:
+
+  ```
+  /srv/pi/state/proxy/mitm-ca.crt   0644 1100 ←─ public, bind-mounted ro into containers
+  /srv/pi/state/proxy/mitm-ca.key   0600 1100 ←─ private, NEVER leaves the host
+  /srv/pi/state/proxy/leaf-certs/   0700 1100 ←─ per-host signed leaf certs (cache)
+  ```
+
+  Every per-session container bind-mounts `mitm-ca.crt` (read-only)
+  at `/etc/pi/mitm-ca.crt` and the entrypoint installs it into the
+  container's trust store + sets `NODE_EXTRA_CA_CERTS` /
+  `CURL_CA_BUNDLE` / `SSL_CERT_FILE`.
+
+  When pi-ai (Node) makes an HTTPS request to
+  `*.aiplatform.googleapis.com`, the chain is:
+
+  ```
+  pi-ai fetch → HTTPS_PROXY=http://172.30.16.1:1080
+            → CONNECT us-central1-aiplatform.googleapis.com:443
+            → proxy returns 200 OK, presents leaf cert signed by
+              backend CA (Node trusts because NODE_EXTRA_CA_CERTS)
+            → proxy reads request, drops any client-supplied
+              Authorization, injects Bearer <ADC token from
+              backend google-auth>, adds X-Goog-User-Project
+            → proxy opens REAL TLS to upstream, forwards modified
+              request, reads response, forwards back through the
+              client-side TLS tunnel
+  ```
+
+  Result: container has zero credentials, proxy holds them all.
+  An RCE on the container can scrape its env / disk / processes
+  forever and find nothing.
+
+  ### 12e. CA rotation procedure
+
+  Run on the VM whenever a backend code change touches the proxy
+  module, or every 90 days, whichever is sooner:
+
+  ```bash
+  ssh digi-setu-live '
+    sudo systemctl stop pi.service
+    sudo rm -rf /srv/pi/state/proxy
+    sudo systemctl start pi-prepare.service  # recreates the dir
+    sudo systemctl start pi.service          # proxy regenerates on first request
+  '
+  ```
+
+  Live chats during rotation get one TLS handshake error and the
+  AI's SDK retries (Anthropic SDK's default). UX impact: <1s
+  hiccup, no user action needed.
+
+  ### 12f. Verification
+
+  ```bash
+  # 1. The egress proxy is listening
+  ssh digi-setu-live 'sudo ss -lnt sport = :1080'
+  # Expect: LISTEN  0  64  172.30.16.1:1080
+
+  # 2. CA cert is present and has correct perms
+  ssh digi-setu-live 'sudo ls -la /srv/pi/state/proxy/'
+  # Expect: mitm-ca.crt: -rw-r--r--  app   (uid 1100)
+  #         mitm-ca.key: -rw-------  app   (uid 1100)
+  #         leaf-certs/  drwx------ app    (uid 1100)
+
+  # 3. Container subnet cannot reach metadata server
+  ssh digi-setu-live 'sudo docker run --rm --network pi-egress \
+                          alpine sh -c "wget -qO- --timeout=2 \
+                          http://169.254.169.254/ && echo LEAKED"'
+  # Expect: nothing (timeout) — NOT "LEAKED"
+
+  # 4. Container subnet CAN reach the proxy
+  ssh digi-setu-live 'sudo docker run --rm --network pi-egress \
+                          pi-session:latest \
+                          sh -c "curl -m 3 -sS -x http://172.30.16.1:1080 \
+                          https://api.github.com >/dev/null && echo OK"'
+  # Expect: OK
+
+  # 5. Off-allow-list host returns 451 from proxy
+  ssh digi-setu-live 'sudo docker run --rm --network pi-egress \
+                          pi-session:latest \
+                          sh -c "curl -m 3 -sS -o /dev/null -w \"%{http_code}\" \
+                                 -x http://172.30.16.1:1080 \
+                                 -X CONNECT https://evil.example.com:443"'
+  # Expect: 451
+
+  # 6. No container labelled pi.app=pi-typst-test is orphaned
+  ssh digi-setu-live 'sudo docker ps -a --filter label=pi.app=pi-typst-test --format "{{.Names}}: {{.Status}}"'
+  # Expect: only currently-active chats (up <N>m) — no Exited containers
+
+  # 7. Run the smoke test
+  ./deploy/scripts/smoke-session.sh
+  # Expect: PASS: 8  FAIL: 0  SKIP: 0
+  ```
+
+  ### 12g. Trade-offs you signed up for
+
+  - **`/var/run/docker.sock` mounted in backend.** The backend has
+    docker root via the socket. A backend RCE is now full host root
+    via `docker run --privileged --pid=host --net=host -v /:/host`.
+    Mitigation: backend cap_drop ALL except CHOWN/FOWNER/SETUID/
+    SETGID + read_only rootfs + Clerk auth required for all routes.
+    Do NOT add new dev tools to the backend image without signing
+    off on this trade.
+
+  - **CA private key on the backend.** A backend RCE leaks the CA
+    private key, which is trusted by every container running our
+    image. Attacker could MITM Vertex calls from any of OUR
+    deployments running our image. They could not MITM Vertex calls
+    on someone else's deployment (different CA), nor any third-party
+    Vertex client. Rotate per §12e on every backend code change to
+    keep the leak window small.
+
+  - **Per-session container has root inside.** This is a feature,
+    not a bug. The container is namespaced from the host kernel
+    (root in container ≠ root on host). The user explicitly wanted
+    this so the AI can `apt install` whatever the user asks for.
+    Belt-and-suspenders: `cap_drop ALL` reduces what container-root
+    can actually do (no CAP_SYS_ADMIN, no CAP_NET_ADMIN, no
+    CAP_SYS_PTRACE, no CAP_NET_RAW), and the container has a 1 GiB
+    memory cap, 512-PID limit, and 1-CPU quota so a runaway can't
+    starve the host.
+
+  - **Egress allow-list is curated by hostname.** It can't catch a
+    malicious package hosted on github.com or an exfil endpoint
+    proxied through gist.github.com. We accept this — the threat
+    model assumes a benign user with a possibly-confused AI, not a
+    user who has been promp-injected into running specific exfil
+    code. Enterprise-tier hardening can add per-user payload
+    inspection (Suricata sniffing the proxy's upstream connection)
+    later.

@@ -4,16 +4,28 @@ Defence-in-depth policy layer.
 Three concerns live here:
 
   1. **bash command policy** — block obviously-dangerous shell
-     invocations the AI might be coaxed into running (extracting
-     metadata-server tokens, reading /etc/shadow, modifying
-     .bashrc for prompt-injection persistence, sudo, etc.).
+     invocations the AI might be coaxed into running. With the
+     per-session container architecture (Phase 6) the kernel
+     namespace + egress proxy do most of the heavy lifting, so this
+     layer focuses on:
+         - host-level metadata SSRF attempts (defense in depth — the
+           container subnet can't route to 169.254.169.254 anyway,
+           but we want to log the *attempt* and refuse the bash call
+           before it hits the network)
+         - cryptominers (waste of the user's billed compute)
+         - container-escape probes (`docker socket`, `nsenter`,
+           `mount /proc/host`, etc.)
+     Most "global install" / "curl|sh" / "apt install" rules from
+     the dual-uid era have been REMOVED — those are now legitimate
+     and useful inside the user's per-session container, where the
+     installs evaporate on chat close anyway.
 
-  2. **filesystem deny-list** — paths the AI must never read or
-     write even from within its sandbox cwd. We can't fully prevent
-     it without OS-level controls (chroot/namespaces; landing in
-     v1.1 with the runuser sandbox), but the bash wrapper can short-
-     circuit obvious attempts and the read/write tools (which we
-     proxy via services/file_ops.py) can refuse the path.
+  2. **filesystem deny-list** — paths the backend (uid 1100) must
+     never serve to the SPA's file-tree / read endpoints. The AI's
+     bash now lives in a separate per-session container with its own
+     mount namespace; bind mounts only expose `/workspace`. So this
+     list is mostly relevant for the file-tree route which still
+     reads from the host filesystem.
 
   3. **secret scrubber** — last-line scrub of any high-entropy
      token-shaped string in streamed model output. If the agent ever
@@ -23,22 +35,10 @@ Three concerns live here:
 
 This module is **advisory** for tools we don't fully wrap (i.e.
 pi's own bash) — it's authoritative for the routes/file_ops paths
-the SPA hits directly. The OS-level enforcement layer (firewall,
-filesystem perms, runuser drop) is documented in deploy/README.md
-and is what actually keeps a determined attacker out.
-
-Decisions encoded here are based on the public threat-research read
-in May 2026:
-  - SANDBOXESCAPEBENCH (arXiv 2603.02277) — frontier LLMs *can*
-    exploit container escapes when given shell access.
-  - GCP IMDS SSRF (Tenable, 2026) — default service account + the
-    metadata server is the #1 GCP credential-theft path; block at
-    the network layer AND prompt-warn the agent.
-  - "PromptMink" / slopsquatting (InfoWorld, 2026) — AI agents
-    auto-install hallucinated package names; force a confirmation
-    flow before any global install. We refuse the most common
-    install incantations here and the system prompt teaches the
-    agent to ask first.
+the SPA hits directly. The OS-level enforcement layers (kernel
+namespaces, nftables egress firewall, MITM auth proxy) are
+documented in deploy/HARDENING.md and are what actually keep a
+determined attacker out.
 """
 
 from __future__ import annotations
@@ -73,102 +73,53 @@ _BASH_RULES: tuple[_BashRule, ...] = (
         re.compile(r"\b(?:fd00:ec2::254|metadata\.aws|169\.254\.170\.2)\b", re.I),
         "blocked: AWS/ECS metadata endpoint",
     ),
-    # ── Privilege escalation ────────────────────────────────────
+    # ── Container escape probes ─────────────────────────────────
+    # The per-session container has cap_drop ALL + a small cap_add
+    # set that does NOT include CAP_SYS_ADMIN, CAP_NET_ADMIN, or
+    # CAP_SYS_PTRACE. These tools won't actually do anything inside
+    # the container, but the AI trying to invoke them at all is a
+    # signal of hostile intent — refuse and log.
     _BashRule(
-        re.compile(r"(?:^|\s|;|&&|\|\|)(?:sudo|su|doas)\b"),
-        "blocked: privilege escalation (sudo/su/doas)",
+        re.compile(r"\b(?:nsenter|unshare\s+--mount|mount\s+--bind\s+/proc/\d+)"),
+        "blocked: container-escape probe (cap_drop ALL + read-only host paths neutralise these anyway)",
     ),
     _BashRule(
-        re.compile(r"\b(?:setcap|chmod\s+[+]?[us]\b|chown\s+root\b)"),
-        "blocked: capability/ownership change",
+        re.compile(r"/var/run/docker\.sock|/host/proc|/host/sys|/host/etc"),
+        "blocked: docker-socket or host-namespace path (container has none of these mounted)",
     ),
-    # ── Persistence (rewriting shell init or cron) ──────────────
-    _BashRule(
-        re.compile(
-            r">\s*~?/?\.(?:bashrc|zshrc|profile|bash_profile|zprofile)\b"
-        ),
-        "blocked: shell-init rewrite (persistence vector)",
-    ),
-    _BashRule(
-        re.compile(r"\bcrontab\b|\bsystemctl\b|\bservice\s+\w+\s+(?:start|stop|enable)"),
-        "blocked: scheduler / service management",
-    ),
-    # ── Sensitive system paths the AI should never read ─────────
-    # `(?:cat|grep|…)\s+(?:\S+\s+)?/etc/…` allows trailing flags or
-    # search-pattern arguments before the path: "grep root /etc/passwd"
-    # is just as bad as "cat /etc/passwd".
-    _BashRule(
-        re.compile(
-            r"\b(?:cat|less|head|tail|grep|awk|sed|strings|hexdump|xxd)"
-            r"(?:\s+-\S+)*"           # any number of -flag args
-            r"(?:\s+\S+)*"            # then any number of non-flag args (e.g. a regex pattern)
-            r"\s+/etc/(?:shadow|passwd|sudoers|gshadow)\b"
-        ),
-        "blocked: system credential file",
-    ),
-    _BashRule(
-        re.compile(r"/srv/pi/state\b|/opt/pi\b|/etc/secrets?\b"),
-        "blocked: server-private path (operator secrets live here)",
-    ),
-    # ── Container/host introspection ────────────────────────────
-    _BashRule(
-        re.compile(r"\b(?:docker|kubectl|nsenter|unshare|mount\s|umount\s)\b"),
-        "blocked: container/host management tool",
-    ),
-    # ── Network exfiltration patterns ───────────────────────────
-    _BashRule(
-        re.compile(r"\bnc\s+-[le]|\bncat\s+-[le]|\b/dev/tcp/"),
-        "blocked: raw socket / netcat listener (exfil vector)",
-    ),
+    # ── Network exfiltration via raw IPs ────────────────────────
+    # Egress proxy already rejects raw-IP CONNECTs (allow-list is by
+    # hostname), but blocking at the bash layer gives a clearer
+    # error message than "connection refused".
     _BashRule(
         re.compile(r"\bcurl\b[^\n;]*\bhttp[s]?://[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}"),
         "blocked: curl to a raw IP — egress allow-list rejects this; "
         "if the user provided a URL, ask for the hostname instead",
     ),
-    # ── Global package installs (slopsquatting + cryptominer
-    #    risk; force a workspace-local install instead) ──────────
-    # We can't use `\b-g\b` because `-` isn't a word char so `\b`
-    # never matches before it. `(?:^|\s)-g(?=\s|$)` looks for `-g`
-    # as a stand-alone token instead. We also catch the long form.
-    _BashRule(
-        re.compile(
-            r"\bnpm\s+(?:install|i|add|isntall)\b[^\n;]*"
-            r"(?:(?:^|\s)-g(?=\s|$)|--global\b)"
-        ),
-        "blocked: `npm install -g/--global` (use a workspace-local install instead)",
-    ),
-    _BashRule(
-        re.compile(r"\byarn\s+global\s+add\b"),
-        "blocked: `yarn global add` (use a workspace-local install instead)",
-    ),
-    _BashRule(
-        re.compile(r"\bpip\s+install\b[^\n;]*\b--user\b"),
-        "blocked: `pip install --user` (writes outside workspace; install into a venv)",
-    ),
-    _BashRule(
-        re.compile(r"\b(?:apt|apt-get|yum|dnf|brew|snap)\s+(?:install|add|update|upgrade)\b"),
-        "blocked: system package manager (no root, no persistent state)",
-    ),
-    # ── Common eval-from-stream patterns ────────────────────────
-    # Both curl AND wget can pipe into a shell; cover both.
-    _BashRule(
-        re.compile(r"\b(?:curl|wget|fetch)\b[^\n;]*\|\s*(?:bash|sh|zsh|fish|python\d?|node|perl|ruby)\b"),
-        "blocked: download-pipe-shell (downloads + executes opaque content)",
-    ),
-    _BashRule(
-        re.compile(r"\bbase64\s+-d[^\n;]*\|\s*(?:bash|sh|zsh|python|node)\b"),
-        "blocked: base64-decode | shell (obfuscated execution)",
-    ),
-    # Process substitution variant: `bash <(curl …)` — same risk.
-    _BashRule(
-        re.compile(r"(?:bash|sh|zsh|python\d?)\s+<\(\s*(?:curl|wget|fetch)\b"),
-        "blocked: shell <(curl …) (downloads + executes opaque content)",
-    ),
     # ── Cryptominer hints ───────────────────────────────────────
+    # The user IS billed for compute inside the container. Mining
+    # crypto via their session would burn their plan's credits on
+    # something they didn't ask for. This rule predates per-session
+    # containers and remains relevant.
     _BashRule(
-        re.compile(r"\b(?:xmrig|t-rex|nbminer|ethminer|cgminer)\b", re.I),
-        "blocked: cryptocurrency miner",
+        re.compile(r"\b(?:xmrig|t-rex|nbminer|ethminer|cgminer|phoenixminer|teamredminer)\b", re.I),
+        "blocked: cryptocurrency miner (would burn the user's billed compute budget)",
     ),
+    # NOTE: With per-session container architecture the following
+    # bash patterns are now ALLOWED (they were blocked in the dual-
+    # uid era). The container is ephemeral and namespace-isolated;
+    # what the AI does inside is the user's choice.
+    #     - sudo / su / doas — sudo NOPASSWD is configured on purpose
+    #     - apt/yum/dnf/brew/snap install — pkg installs are fine
+    #     - npm install -g, yarn global add, pip --user — fine
+    #     - curl … | sh, bash <(curl …) — fine, container is throwaway
+    #     - editing ~/.bashrc, /etc/, crontab, systemctl — fine, all
+    #       container-local and gone on chat close
+    #     - cat /etc/shadow — fine, the container's shadow file is
+    #       generated at image build time and contains no real users
+    # The trust boundary moved from "regex on bash strings" to
+    # "kernel namespaces + egress allow-list" — we no longer need
+    # to play whack-a-mole on bash patterns for these.
 )
 
 

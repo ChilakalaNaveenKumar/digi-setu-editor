@@ -138,10 +138,31 @@ services:
       # sandbox user added in v1.1) so it cannot traverse into the
       # state dir or read its contents — the kernel rejects with
       # EACCES before any application logic runs.
+      #
+      # rw:  the egress proxy (services/egress_proxy.py) generates
+      # the MITM CA cert/key under /srv/pi/state/ on first start;
+      # leaf certs are cached under /srv/pi/state/leaf-certs/. Per-
+      # session containers mount only the public CA cert (read-only)
+      # via a separate file-bind below.
       - /srv/pi/state:/srv/pi/state
       # Workspaces, chats, shadows, registry. Owned by uid 1100 so the
       # backend (app user) can RW everything.
       - /srv/pi/data:/srv/pi/data
+      # Docker socket. Phase 6 architecture: each chat session spawns
+      # its own per-chat `pi-session` container via `docker run`. The
+      # backend talks to dockerd via this socket; spawned containers
+      # become SIBLINGS of the backend on the host (not nested inside
+      # it). Mounted read-write because we issue write-style commands
+      # (run / kill / rm / inspect).
+      #
+      # Trust implication: a backend RCE that writes to the docker
+      # socket can `docker run --privileged --pid=host …` itself onto
+      # the host = root-equivalent. This is a known and accepted
+      # trade-off for the per-session-container architecture; see
+      # deploy/HARDENING.md §8 for the full rationale and what the
+      # other layers (Clerk auth, Stripe rate limit, bash policy,
+      # egress filter) need to be tightened to compensate.
+      - /var/run/docker.sock:/var/run/docker.sock
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8788/healthz >/dev/null || exit 1"]
       interval: 30s

@@ -15,5 +15,13 @@ svix==1.92.2
 # (Paddle / Lemon Squeezy) once the first paid customer asks for it.
 stripe==15.1.0
 
+# Egress proxy (services/egress_proxy.py). The proxy MITMs HTTPS for
+# *.aiplatform.googleapis.com to inject the Vertex auth header from
+# the backend's ADC, and CONNECT-relays everything else on the
+# allow-list. cryptography for CA + leaf cert generation, google-auth
+# for picking up the VM's workload-identity token.
+cryptography==45.0.6
+google-auth==2.42.1
+
 # Test runner. Only needed for `pytest`; not pulled into the prod image.
 pytest==9.0.3

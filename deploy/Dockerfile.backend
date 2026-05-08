@@ -78,6 +78,31 @@ RUN echo "deb http://deb.debian.org/debian bookworm contrib" \
  && apt-get install -y --no-install-recommends ttf-mscorefonts-installer \
  && rm -rf /var/lib/apt/lists/*
 
+# ── Docker CLI ────────────────────────────────────────────────────
+# The backend spawns one per-session container per chat by exec'ing
+# `docker run pi-session …` against the host's docker.sock (mounted
+# at /var/run/docker.sock — see deploy/docker-compose.yml). This needs
+# the `docker` client binary on PATH inside the backend container.
+#
+# Without it, services/pi_session.py's `_detect_runtime()` silently
+# falls back to spawning `pi` as a subprocess of the backend (the
+# pre-Phase-6 sandbox), which means the per-session container security
+# model is bypassed entirely — no kernel namespace isolation, no
+# umasked workspace, no `sudo apt install` for the user, host paths
+# leak into the chat. Hence: install ONLY the client (no daemon).
+#
+# We install from Docker's official repo (not Debian's docker.io
+# package, which lags by ~2 minor versions). This adds ~50 MB to the
+# backend image, all of it `docker-ce-cli` deps.
+RUN curl -fsSL https://download.docker.com/linux/debian/gpg \
+        | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg \
+ && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/debian bookworm stable" \
+        > /etc/apt/sources.list.d/docker.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends docker-ce-cli \
+ && rm -rf /var/lib/apt/lists/* \
+ && docker --version
+
 # Pinned Typst — the musl static build (no glibc tying so it runs on
 # any base image). Same version as the laptop dev env (0.14.2).
 RUN set -eux; \
@@ -133,10 +158,13 @@ RUN set -eux; \
 # a curl one-liner the kernel drops the packet. The backend (uid
 # 1100) keeps unrestricted egress so its own Vertex SDK can still
 # fetch ADC tokens.
+ARG DOCKER_GID=988
+
 RUN groupadd --system --gid 1000 sandbox \
  && useradd  --system --uid 1000 --gid 1000 --home-dir /home/sandbox --create-home --shell /usr/sbin/nologin sandbox \
  && groupadd --system --gid 1100 app \
- && useradd  --system --uid 1100 --gid 1100 --groups sandbox --home-dir /home/app --create-home --shell /usr/sbin/nologin app
+ && groupadd --system --gid "${DOCKER_GID}" docker_host \
+ && useradd  --system --uid 1100 --gid 1100 --groups sandbox,docker_host --home-dir /home/app --create-home --shell /usr/sbin/nologin app
 
 WORKDIR /app
 

@@ -1,0 +1,389 @@
+# pi-typst-test PER-SESSION container image (digi-setu.com).
+#
+# Phase 6 of the deployment hardening plan: each chat session runs in its
+# own throwaway Docker container instead of sharing a uid-sandboxed
+# subprocess inside the backend container. Goals:
+#
+#   1. Hard kernel-namespace isolation between users (no more probabilistic
+#      "guess the 122-bit workspace ID" defense — the kernel itself rejects
+#      cross-tenant access because the namespaces are disjoint).
+#
+#   2. Users get a ~real Linux box: they can `sudo apt install rust`,
+#      `pip install scikit-learn`, `cargo install ripgrep`, `npm i -g
+#      typescript`, write to `/usr/bin/`, edit `/etc/`, mess with
+#      `~/.bashrc`, install daemons, do whatever a normal dev does on
+#      their laptop. None of it persists past the chat session — when
+#      the container is destroyed, all that state evaporates and the
+#      user's actual content (under /workspace) is preserved.
+#
+#   3. The backend's auth/billing/registry surface is no longer reachable
+#      from the AI's bash. The container's network is fully mediated by
+#      the backend's egress proxy (deploy/nftables/pi-egress.nft +
+#      web/backend/services/egress_proxy.py); there is no direct path
+#      from the AI's bash to GCE metadata, the host's docker socket, or
+#      any other workspace's bind mount.
+#
+# This image is spawned by web/backend/services/pi_session.py via:
+#
+#     docker run -i --rm \
+#       --name pi-sess-<sid> \
+#       --network pi-egress \
+#       --volume /srv/pi/data/workspaces/<wsid>:/workspace \
+#       --volume /srv/pi/data/chats/<sid>:/session \
+#       --memory 1g --cpus 1 --pids-limit 512 \
+#       --ulimit nofile=4096:4096 \
+#       --cap-drop ALL --cap-add CHOWN --cap-add FOWNER \
+#       --cap-add SETUID --cap-add SETGID --cap-add DAC_OVERRIDE \
+#       --cap-add NET_BIND_SERVICE \
+#       --env HTTPS_PROXY=http://172.30.16.1:1080 \
+#       --env HTTP_PROXY=http://172.30.16.1:1080 \
+#       --env NO_PROXY=localhost,127.0.0.1,172.30.16.1 \
+#       --env PI_PROVIDER=anthropic-vertex \
+#       --env PI_MODEL=claude-sonnet-4-6 \
+#       --env GOOGLE_APPLICATION_CREDENTIALS=/etc/pi/vertex.json \
+#       --read-only=false \
+#       pi-session:latest \
+#       pi --mode rpc --provider … --extension …
+#
+# Stdio of `docker run` IS the pi RPC stdio — backend reads/writes JSONL
+# straight to the spawned subprocess and dockerd transparently forwards
+# bytes to/from the container's PID 1.
+#
+# ── Why we run as a non-root user inside the container ──────────────
+#
+# Defense in depth. Even though the kernel-namespace boundary already
+# isolates this container from everything else, running as uid 1000
+# inside means:
+#
+#   * pi/bash default identity is non-root → the AI cannot e.g. unlink
+#     the egress proxy config, can't disable seccomp, can't write to
+#     /etc/sudoers, can't modify /usr/local/bin without escalation.
+#   * Files written to /workspace inherit the host workspace dir's
+#     gid (1000) via SGID (mode 2770 on parent). Backend (uid 1100,
+#     secondary group 1000) keeps its existing read access for GCS
+#     sync / billing / audit.
+#   * `sudo` is the SOLE escalation path → easy to log when the AI
+#     decided to `apt install` something. The auditd rule on the host
+#     can't see inside the container, but the bash policy at the RPC
+#     layer can match `sudo …` patterns and meter their cost.
+#
+# When users WANT to install system packages, the AI runs `sudo apt
+# install <pkg>` (NOPASSWD via /etc/sudoers.d/sandbox). The install
+# scripts run as root inside container, they have CAP_CHOWN +
+# CAP_FOWNER + CAP_DAC_OVERRIDE granted at runtime so dpkg's chown
+# work. None of that escapes the container — root in container is
+# still namespaced from root on host (and is bounded by the cap set
+# the backend grants at `docker run` time anyway).
+#
+# Important: --security-opt=no-new-privileges MUST be FALSE at run
+# time for sudo's setuid bit to take effect. We trade that bit of
+# kernel hardening for the install-anything UX. The container is
+# already namespace-isolated — no_new_privileges was a redundant
+# belt-and-suspenders inside an already-locked-down container.
+
+ARG PYTHON_VERSION=3.11
+ARG NODE_MAJOR=22
+ARG TYPST_VERSION=0.14.2
+
+FROM debian:bookworm-slim AS runtime
+
+ARG NODE_MAJOR
+ARG TYPST_VERSION
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Microsoft EULA pre-accept for ttf-mscorefonts-installer (Arial/Times/Calibri).
+RUN echo "ttf-mscorefonts-installer msttcorefonts/accepted-mscorefonts-eula select true" \
+      | debconf-set-selections
+
+# ── Base OS packages ────────────────────────────────────────────────
+#
+# Two groups in one RUN so the apt cache is wiped before commit:
+#
+#   1. Runtime essentials the user-installable surface relies on
+#      (sudo, bash, build tools, common dev languages, networking
+#      utilities). The user can `sudo apt install` more on top, but
+#      the most-asked-for set is pre-baked so first-prompt latency
+#      is decent.
+#
+#   2. Tier-A OSS font pack (same set as the backend image) so typst
+#      compiles produce the same output regardless of which container
+#      runs them.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        bash \
+        bash-completion \
+        bsdutils \
+        build-essential \
+        ca-certificates \
+        coreutils \
+        curl \
+        dnsutils \
+        file \
+        fontconfig \
+        fonts-dejavu \
+        fonts-firacode \
+        fonts-inter \
+        fonts-lato \
+        fonts-liberation \
+        fonts-noto-cjk \
+        fonts-noto-color-emoji \
+        fonts-noto-core \
+        fonts-roboto \
+        git \
+        gnupg \
+        iproute2 \
+        iputils-ping \
+        jq \
+        less \
+        locales \
+        make \
+        man-db \
+        nano \
+        netbase \
+        openssl \
+        procps \
+        psmisc \
+        python3 \
+        python3-pip \
+        python3-venv \
+        ripgrep \
+        sudo \
+        tini \
+        tzdata \
+        unzip \
+        util-linux \
+        vim-tiny \
+        wget \
+        xz-utils \
+ && curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - \
+ && apt-get install -y --no-install-recommends nodejs \
+ && rm -rf /var/lib/apt/lists/*
+
+# Microsoft core fonts (Arial / Times / Calibri / etc) from Debian contrib.
+RUN echo "deb http://deb.debian.org/debian bookworm contrib" \
+        > /etc/apt/sources.list.d/contrib.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends ttf-mscorefonts-installer \
+ && rm -rf /var/lib/apt/lists/*
+
+# Generate a UTF-8 locale so terminal output / typst / python don't
+# fall back to ASCII-only modes.
+RUN sed -i 's/# en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen \
+ && locale-gen en_US.UTF-8 \
+ && update-locale LANG=en_US.UTF-8
+
+# Pinned Typst — same musl static build the backend image uses.
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) tarball="typst-x86_64-unknown-linux-musl.tar.xz" ;; \
+      arm64) tarball="typst-aarch64-unknown-linux-musl.tar.xz" ;; \
+      *) echo "unsupported arch $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/typst.tar.xz \
+        "https://github.com/typst/typst/releases/download/v${TYPST_VERSION}/${tarball}"; \
+    tar -xJf /tmp/typst.tar.xz -C /tmp; \
+    install -m 0755 /tmp/typst-*/typst /usr/local/bin/typst; \
+    rm -rf /tmp/typst*; \
+    typst --version
+
+# ── User account: sandbox (uid 1000) + sudo NOPASSWD ─────────────────
+#
+# uid 1000 / gid 1000 deliberately matches the dual-uid sandbox on the
+# host. The workspace bind-mount lands at /workspace owned 1000:1000
+# mode 2770 (host-side); since we run as the same uid inside the
+# container, ownership matches and the AI's bash can rw the workspace
+# without permission tricks.
+#
+# /etc/sudoers.d/sandbox: full sudo without password. Yes, this is the
+# whole point of per-session containers — users / their AI get root
+# inside their container so they can `apt install`, `pip install
+# --system`, `npm install -g`, edit /etc/, install packages whose
+# postinst scripts mess with system files, etc. None of it persists
+# past container destroy (--rm on docker run).
+#
+# Mode 0440 on the sudoers file is mandatory: sudo refuses any sudoers
+# include file that's group/other-writable, and refuses any sudoers
+# include file that's readable by other (we want owner+group only).
+RUN groupadd --gid 1000 sandbox \
+ && useradd  --uid 1000 --gid 1000 \
+        --home-dir /home/sandbox --create-home \
+        --shell /bin/bash sandbox \
+ && echo "sandbox ALL=(ALL:ALL) NOPASSWD:ALL" > /etc/sudoers.d/sandbox \
+ && chmod 0440 /etc/sudoers.d/sandbox \
+ && passwd -d sandbox
+
+# ── pi-coding-agent installation ─────────────────────────────────────
+#
+# Same pinned set as the backend image. We install at /opt/pi-session/
+# rather than /app/ to leave the canonical "user's app dir" name free
+# for whatever they're working on. The pi binary is symlinked into
+# /usr/local/bin so it's on $PATH from any cwd (the container's
+# WORKDIR is /workspace, not /opt/pi-session).
+WORKDIR /opt/pi-session
+COPY package.json package-lock.json* ./
+RUN npm install --no-audit --no-fund \
+ && ln -sf /opt/pi-session/node_modules/.bin/pi /usr/local/bin/pi
+
+# ── Provider patches ─────────────────────────────────────────────────
+# Same anthropic-vertex patch the backend image uses. Without this,
+# pi crashes on startup with "Unknown provider 'anthropic-vertex'".
+COPY patches/ ./patches/
+RUN PI_PKG_GLOBAL=/opt/pi-session/node_modules/@mariozechner/pi-coding-agent \
+    bash patches/apply.sh \
+ && pi --version >/dev/null
+
+# ── Agent assets ─────────────────────────────────────────────────────
+# Extensions, indexed Typst documentation corpus, AGENTS.md, .pi/ —
+# everything pi needs to behave the same way it does on the operator's
+# laptop. These end up at /opt/pi-session/{extensions,guides,AGENTS.md,
+# .pi} and are referenced by absolute path from the backend's
+# `docker run` command (--extension /opt/pi-session/extensions/…).
+COPY extensions/ ./extensions/
+COPY guides/ ./guides/
+COPY AGENTS.md ./AGENTS.md
+COPY .pi/ ./.pi/
+
+# ── Bundled designer fonts (Typst loads at compile time) ────────────
+# Same set as the backend image. /usr/local/share/fonts so fontconfig
+# picks them up too (for users who want to render via cairo / matplotlib
+# inside their container — those go through fontconfig, not typst).
+RUN install -d -m 0755 /usr/local/share/fonts/digi-setu
+COPY web/backend/fonts/ /usr/local/share/fonts/digi-setu/
+RUN fc-cache -f -v | tail -5
+
+# ── Entrypoint ───────────────────────────────────────────────────────
+#
+# tini reaps zombies (the AI forks bash subprocesses, daemons via
+# `process` extension, etc. — without a proper PID 1 those leak as
+# defunct entries that count against pids_limit).
+#
+# The umask=002 wrapper makes new files inside /workspace land mode
+# 0664 (group-rw) instead of mode 0644 (group-r). Combined with the
+# host parent dir's SGID + group=1000, that means the backend (uid
+# 1100, secondary group 1000) keeps WRITE access too, not just read
+# — needed for GCS sync, registry updates, etc.
+#
+# Drop to uid 1000 (sandbox) before exec'ing pi. The container starts
+# as root because tini is PID 1 and dpkg-style postinstalls might want
+# root too, but the actual agent runs unprivileged with sudo as the
+# escalation lever.
+COPY deploy/entrypoint-session.sh /usr/local/bin/entrypoint-session.sh
+RUN chmod 0555 /usr/local/bin/entrypoint-session.sh
+
+# ── Runtime env ──────────────────────────────────────────────────────
+ENV LANG=en_US.UTF-8 \
+    LANGUAGE=en_US:en \
+    LC_ALL=en_US.UTF-8 \
+    \
+    HOME=/home/sandbox \
+    USER=sandbox \
+    LOGNAME=sandbox \
+    SHELL=/bin/bash \
+    \
+    PI_MODE=web \
+    PI_PROVIDER=anthropic-vertex \
+    PI_MODEL=claude-sonnet-4-6 \
+    PI_VERTEX_ANTHROPIC_LOCATION=global \
+    \
+    # Typst font discovery (same priority order as backend image).
+    TYPST_FONT_PATHS=/usr/local/share/fonts/digi-setu:/usr/local/share/fonts:/usr/share/fonts \
+    \
+    # Per-container typst cache — ephemeral. The cost (re-fetching
+    # @preview packages on first compile in a fresh container) is
+    # ~3-10s on cold start. If that becomes a UX problem we'll bind-
+    # mount a shared read-only typst-packages volume from the host.
+    TYPST_PACKAGE_CACHE_PATH=/home/sandbox/.cache/typst \
+    XDG_CACHE_HOME=/home/sandbox/.cache \
+    \
+    # The egress proxy intercepts ALL outbound traffic. Backend is
+    # reachable at 172.30.16.1:1080 from inside the pi-egress docker
+    # network. We use the symbolic name `pi-proxy` (mapped to the
+    # gateway IP via /etc/hosts at container start by the backend's
+    # `--add-host pi-proxy:172.30.16.1` flag) so neither the AI nor
+    # operator-debug `env` calls ever see the raw bridge IP. NO_PROXY
+    # excludes loopback + the proxy itself so internal-to-container
+    # ops don't double-route.
+    HTTPS_PROXY=http://pi-proxy:1080 \
+    HTTP_PROXY=http://pi-proxy:1080 \
+    NO_PROXY=localhost,127.0.0.1,pi-proxy \
+    https_proxy=http://pi-proxy:1080 \
+    http_proxy=http://pi-proxy:1080 \
+    no_proxy=localhost,127.0.0.1,pi-proxy \
+    \
+    # Tells pi-ai's hasVertexAdcCredentials() to trust the
+    # GOOGLE_APPLICATION_CREDENTIALS path the backend writes (see
+    # patches/apply-edits.mjs §3b for the patch). The actual creds
+    # file is bind-mounted by the backend at runtime.
+    PI_TRUST_GCE_METADATA=1 \
+    \
+    # ── Force gcp-metadata library to route via HTTP_PROXY ─────────
+    # The google-auth-library Node bindings have a `gcp-metadata` sub-
+    # module that probes the GCE metadata server BEFORE every Vertex
+    # call. Two pitfalls when running inside our per-session container:
+    #
+    #   1. The lib's default fallback hits `http://169.254.169.254/...`
+    #      directly. gaxios (the underlying HTTP client) treats link-
+    #      local addresses as "no-proxy" by default, so HTTP_PROXY
+    #      doesn't apply → the request leaves the container and is
+    #      dropped by nftables → ECONNRESET → pi-ai dies before it
+    #      ever issues the actual Vertex API call where our proxy
+    #      injects the auth header.
+    #
+    #   2. The lib's "auto-detect GCE environment" routine pings the
+    #      metadata IP at raw-TCP level which also bypasses the proxy.
+    #
+    # Fix both by:
+    #   * Setting GCE_METADATA_IP to the hostname instead of the
+    #     link-local IP. The lib then constructs URLs like
+    #     `http://metadata.google.internal/...` which gaxios DOES
+    #     route through HTTP_PROXY → our proxy intercepts the GET
+    #     and returns a synthetic token (services/egress_proxy.py's
+    #     _serve_fake_metadata).
+    #   * Setting METADATA_SERVER_DETECTION=assume-present to skip
+    #     the raw-TCP probe entirely.
+    GCE_METADATA_HOST=metadata.google.internal \
+    GCE_METADATA_IP=metadata.google.internal \
+    METADATA_SERVER_DETECTION=assume-present
+
+# ── Permissions on /opt/pi-session ──────────────────────────────────
+# Same `chmod -R a+rX,go-w` pattern as the backend image: world-
+# readable + execute on dirs/binaries, no write for non-owner. Makes
+# the agent code reachable from the sandbox uid (1000) without
+# letting it modify the source.
+RUN chown -R root:root /opt/pi-session \
+ && chmod -R a+rX,go-w /opt/pi-session \
+ && chmod 0755 /usr/local/bin/pi
+
+# /home/sandbox is the runtime cache + dotfile dir for the AI's bash.
+# Created by useradd -m above; force-stamp ownership/mode to be safe
+# in case a future apt install or COPY changed it.
+RUN chown -R sandbox:sandbox /home/sandbox \
+ && chmod 0755 /home/sandbox
+
+# ── Compatibility shim: /app -> /opt/pi-session ──────────────────────
+#
+# Workspaces created on the backend host carry a handful of relative
+# symlinks pointing at `/app/...` (extensions/, guides/, AGENTS.md,
+# .pi/, package.json, node_modules) — the path the pi-coding-agent
+# package lives at inside the BACKEND container. The per-session
+# image installs the same assets at `/opt/pi-session/`, so we add a
+# top-level symlink that makes both paths resolve. Existing workspaces
+# from before this migration keep working without re-stamping; new
+# workspaces get the same /app-rooted symlinks (services/registry.py
+# is the source of truth and is unchanged).
+RUN ln -s /opt/pi-session /app
+
+# /etc/pi/ is the bind-mount target dir for runtime configuration the
+# backend hands to each container (permission_mode file, MITM CA cert).
+# Pre-create it with restrictive perms so a container started without
+# the bind mounts (smoke test) doesn't see a writable /etc/pi/ that
+# the AI could plant arbitrary files into.
+RUN install -d -m 0755 /etc/pi
+
+WORKDIR /workspace
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint-session.sh"]
+# CMD is supplied by `docker run` from web/backend/services/pi_session.py
+# (the actual pi --mode rpc … invocation). No default — running this
+# image without args is a programming error.

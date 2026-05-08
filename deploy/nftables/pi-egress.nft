@@ -1,73 +1,178 @@
 # /etc/nftables.d/pi-egress.nft (deployed by remote-deploy.sh)
 #
-# Egress firewall for uid 1000 — the `sandbox` user the AI's pi
-# subprocess + bash subprocesses run as in the dual-uid model
-# (pi-typst-test v1.1).
+# Egress firewall for the per-session container subnet (Phase 6
+# architecture: each chat spawns a `pi-session` Docker container in
+# the `pi-egress` bridge network). This ruleset is the kernel-level
+# enforcement that backs the userspace egress proxy at
+# web/backend/services/egress_proxy.py — together they implement:
 #
-# Why uid 1000 instead of uid 1100:
-#   The backend (FastAPI) still runs as uid 1100 and DOES need to
-#   reach the GCE metadata server so the Vertex SDK can fetch ADC
-#   tokens for `roles/aiplatform.user`. Firewalling 1100 broke that
-#   path. The AI's effective identity is now uid 1000 (set by the
-#   `setpriv --reuid 1000` wrapper in services/pi_session.py), so
-#   the firewall can be tightened around exactly that uid without
-#   breaking legitimate backend egress.
+#   1. EVERY TCP connection from a per-session container is forced
+#      through the backend's egress proxy at PI_EGRESS_PROXY_HOST:PORT
+#      (default 172.30.0.1:1080). Containers cannot route around it
+#      by `unset HTTPS_PROXY && curl evil.com` — the kernel rejects
+#      any packet not destined for the proxy's listen address.
 #
-# Closes:
-#   1. GCP metadata SSRF (169.254.169.254). Without this rule a
-#      prompt that bypasses services/policy.py's regex (sslip.io
-#      DNS, decimal IPs, Python urllib bypass, etc.) can hit the
-#      metadata server and steal a Vertex IAM token.
-#   2. AWS / ECS metadata equivalents (169.254.170.2).
-#   3. IPv6 link-local (fe80::/10).
+#   2. The proxy is the ONLY auth-injection site for Vertex AI; the
+#      per-session containers never carry credentials. Even a full
+#      `printenv` / `cat ~/.aws/credentials` from inside a container
+#      finds nothing to exfil.
 #
-# We DO NOT block general egress — pip/npm/git over HTTPS still
-# work. uid 1000 in the container == uid 1000 on the host (no user
-# namespace), so `skuid 1000` matches the real process uid.
+#   3. The cloud-metadata server (169.254.169.254) is hard-blocked
+#      from the container subnet. The backend keeps reaching it
+#      directly (host-network) so its ADC can mint Vertex tokens for
+#      the proxy.
 #
-# IMPORTANT: this rule must reflect the SANDBOX uid, not the
-# backend uid. If you ever change PI_SANDBOX_UID in
-# Dockerfile.backend or services/sandbox_layout.py, update the
-# `skuid` value here in lockstep.
+#   4. RFC1918 lateral movement (other containers on the host, the
+#      docker-internal bridges, the host's mgmt interfaces, etc.) is
+#      hard-blocked. The proxy IP is the SOLE allowed destination on
+#      the host's local network.
+#
+# Topology (created by deploy/systemd/pi-egress-network.service):
+#
+#       pi-egress docker network
+#           subnet:  172.30.16.0/20    (4096 IPs, plenty for the
+#                                       max-50-concurrent-chats sizing)
+#           gateway: 172.30.16.1
+#       backend container (host network)
+#           proxy listens on 172.30.16.1:1080 (the bridge gateway IP
+#           is reachable from every container in the network and is
+#           NOT routable from the public internet)
+#
+# Both gateway IP and subnet are configurable via env in
+# pi-egress-network.service so the operator can avoid collisions
+# with their own networks if 172.30.16.0/20 is already in use.
+#
+# Diagnostic commands (run on the VM as root):
+#
+#   nft list ruleset                           # show all chains+rules
+#   nft list chain inet pi_egress forward      # just our chain
+#   nft list counter inet pi_egress denied     # count of dropped pkts
+#   tcpdump -ni any 'host 169.254.169.254 and not host <backend-ip>' # spot leaks
+#
+# IMPORTANT — keep the IPs in sync with:
+#   - web/backend/services/pi_session.py (PI_EGRESS_PROXY_HOST/PORT)
+#   - web/backend/services/egress_proxy.py (default _HOST/_PORT)
+#   - deploy/Dockerfile.session (HTTPS_PROXY/HTTP_PROXY env)
+#   - deploy/systemd/pi-egress-network.service (docker network create
+#     subnet/gateway args)
+# If any of these drift the fleet either drops legitimate traffic
+# (proxy unreachable from container) or leaves a hole (proxy
+# bypassable). The pi-prepare.service post-condition prints all four
+# values side-by-side for easy spot-check after a deploy.
+
+# Subnet variables. nftables doesn't support ${ENV} substitution
+# directly; pi-prepare.service templates these at deploy time if the
+# operator overrides them via stack.env. Defaults below match the
+# pi-egress-network.service defaults.
+define pi_egress_subnet  = 172.30.16.0/20
+define pi_egress_gateway = 172.30.16.1
+define pi_egress_proxy_port = 1080
 
 table inet pi_egress {
-    chain output {
-        type filter hook output priority filter; policy accept;
 
-        # AWS / ECS metadata (cross-cloud belt-and-suspenders). We are
-        # NOT on AWS today, so blocking 169.254.170.2 has zero
-        # collateral risk and does still close the cross-cloud SSRF
-        # path if we ever migrate.
-        skuid 1000 ip daddr 169.254.170.2 drop
+    # Counter: how many packets we've dropped because they tried to
+    # bypass the proxy. Reset on `systemctl restart pi-firewall`.
+    counter denied { }
 
-        # IPv6 link-local — also unused on our network and a known
-        # carrier for cloud-metadata-style services. Keep it blocked.
-        skuid 1000 ip6 daddr fe80::/10 drop
+    # Counter: how many packets we forwarded through the proxy. Useful
+    # to confirm the rules are being hit at all (dockerd's own NAT
+    # rules can shadow ours if the priorities are wrong).
+    counter to_proxy { }
 
-        # ───────────────────────────────────────────────────────────────
-        # NOTE: GCE metadata (169.254.169.254 / 169.254.0.0/16 IPv4)
-        # is INTENTIONALLY ALLOWED for uid 1000.
-        #
-        # The dual-uid sandbox runs both legitimate `pi` and the AI's
-        # bash subprocesses as uid 1000 — we cannot differentiate
-        # between them at the kernel firewall layer (skuid is process-
-        # uid, not process-identity). Blocking 169.254.169.254 here
-        # blocks pi's own ADC token fetch alongside any rogue
-        # `curl http://metadata.google.internal/...` from the AI's bash.
-        # Without ADC, every `--provider anthropic-vertex` /
-        # `--provider google-vertex` chat dies at startup with
-        # "No API key found", which is what shipped to prod and
-        # immediately broke chat for every user.
-        #
-        # The trust boundary for the metadata token has therefore moved
-        # from "kernel firewall" to "GCP IAM scope on the VM service
-        # account". As long as the SA only has roles/aiplatform.user
-        # (and NOT roles/iam.serviceAccountTokenCreator,
-        # roles/storage.admin, roles/owner, etc.), a stolen token can
-        # at most spend a small amount of Vertex / Anthropic quota in
-        # our project — same blast radius as a paid pi prompt would
-        # already have. See deploy/HARDENING.md §6 (GCP IAM bindings)
-        # for the SA hardening checklist.
-        # ───────────────────────────────────────────────────────────────
+    # ── Chain: forward (container → outside world) ──────────────────
+    #
+    # Hooked into the FORWARD chain at filter priority because every
+    # packet from a container destined to anywhere off-host transits
+    # the host's forwarding plane (containers have their own netns,
+    # the host's bridge/router does the routing).
+    #
+    # Default policy: ACCEPT. We only DROP what's explicitly bad —
+    # otherwise we'd shadow dockerd's bridge rules and break unrelated
+    # traffic on this host. The deny set is tight: cloud-metadata,
+    # RFC1918-other-than-our-proxy-IP, AWS/IPv6 metadata, host's own
+    # IPs.
+    chain forward {
+        type filter hook forward priority filter; policy accept;
+
+        # Identify packets coming FROM the pi-egress subnet (= per-session
+        # containers). Anything we do here is scoped to those packets;
+        # the backend container (host network mode) is unaffected.
+        ip saddr $pi_egress_subnet jump pi_egress_filter
+    }
+
+    # ── Chain: pi_egress_filter ─────────────────────────────────────
+    chain pi_egress_filter {
+        # Hard-block cloud metadata IPv4 — the #1 credential-theft
+        # path on GCE/AWS. The backend (host network mode) still
+        # reaches 169.254.169.254 directly because its packets do
+        # not have the pi-egress source subnet.
+        ip daddr 169.254.0.0/16 counter name denied drop
+
+        # Hard-block AWS/ECS metadata (cross-cloud belt-and-suspenders).
+        # No-op today on GCP but closes the path if we ever migrate.
+        ip daddr 169.254.170.2 counter name denied drop
+
+        # Hard-block IPv6 link-local + multicast. Unused on our network.
+        ip6 daddr fe80::/10 counter name denied drop
+        ip6 daddr ff00::/8 counter name denied drop
+
+        # ALLOW packets to the proxy listener (gateway IP, port 1080).
+        # This is the ONE legitimate destination for traffic from the
+        # pi-egress subnet on the host's local plane.
+        ip daddr $pi_egress_gateway tcp dport $pi_egress_proxy_port counter name to_proxy accept
+
+        # DENY all other traffic to RFC1918 — stops a container from
+        # reaching:
+        #   - the host's mgmt interfaces (10.x / 192.168.x are common)
+        #   - other docker bridges (docker0 is 172.17.0.0/16, etc.)
+        #   - the operator's office network if running on a VM peered
+        #     into a VPC.
+        # 172.30.16.0/20 (our subnet itself) is implicitly excluded
+        # because the rule above allowed gateway:1080 first; container-
+        # to-container traffic INSIDE the same subnet is allowed for
+        # debugging (e.g. operator's `docker exec` from one session
+        # container to another) but the user-visible AI never has
+        # cause to use it.
+        ip daddr 10.0.0.0/8     counter name denied drop
+        ip daddr 192.168.0.0/16 counter name denied drop
+        ip daddr 172.16.0.0/12  counter name denied drop
+
+        # DENY all DNS to non-proxy resolvers. The proxy doesn't
+        # actually serve DNS — but containers shouldn't be doing DNS
+        # at all because all their HTTP traffic goes through HTTPS_PROXY.
+        # This rule catches `dig @8.8.8.8 something.evil.com` style
+        # exfil-via-DNS attempts. We allow port 53 to gateway IP only
+        # in case a user genuinely needs DNS for a `getent hosts`-style
+        # lookup; the proxy doesn't speak DNS so this currently dead-ends
+        # at "no answer" rather than "blocked", which is fine.
+        udp dport 53 ip daddr != $pi_egress_gateway counter name denied drop
+        tcp dport 53 ip daddr != $pi_egress_gateway counter name denied drop
+
+        # The default chain policy is accept, so anything that reaches
+        # this point (public internet IPs that aren't RFC1918 / metadata
+        # / DNS) was not denied. Most won't actually go through this
+        # chain since dockerd's NAT MASQUERADEs them via the host
+        # interface and they don't transit FORWARD when the proxy is
+        # in the path. This is mostly belt-and-suspenders for direct
+        # routes the operator might add (e.g. a VPN to the office).
+    }
+
+    # ── Chain: input (incoming connections to the host's pi-egress
+    #     interface) ──────────────────────────────────────────────
+    #
+    # Defends the proxy listener against direct attempts from outside
+    # the pi-egress subnet. The proxy already binds to 172.30.16.1
+    # which is not routable from the public internet (private bridge
+    # IP), but a misconfigured docker network (port published to
+    # 0.0.0.0) could expose it. Belt-and-suspenders: drop all packets
+    # to the proxy port that don't come from the pi-egress subnet.
+    chain input {
+        type filter hook input priority filter; policy accept;
+
+        # Allow legitimate proxy traffic from the pi-egress subnet.
+        ip saddr $pi_egress_subnet tcp dport $pi_egress_proxy_port accept
+
+        # Deny everyone else's attempts on the proxy port.
+        tcp dport $pi_egress_proxy_port counter name denied drop
     }
 }

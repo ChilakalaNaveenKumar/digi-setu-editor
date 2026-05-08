@@ -178,11 +178,17 @@ BILLING_ENABLED = bool(STRIPE_SECRET_KEY)
 #                              dir exceeds this many MB. The agent
 #                              has already written the file by the
 #                              time we notice (we can't unwrite), so
-#                              the gate is on the NEXT prompt — the
-#                              user gets a clear "your sandbox is
-#                              full, delete files or the chat" error.
-#                              Default 100 MB matches the per-chat
-#                              guidance we gave in deploy docs.
+#                              the gate is on the NEXT prompt.
+#                              Default 2048 MB (2 GiB). Generous
+#                              enough for most Typst projects + a
+#                              dataset, but caps the per-tenant cost
+#                              of a runaway agent. Power users who
+#                              need more headroom (multi-GB datasets,
+#                              installed toolchains, media work) are
+#                              steered toward the desktop client by
+#                              the over-quota error message — which
+#                              pitches the local app instead of
+#                              asking them to delete files.
 #   PROMPT_TIMEOUT_SECONDS     Wall-clock cap on a single pi turn.
 #                              When pi gets stuck in a tool loop or a
 #                              bash command hangs, we kill the entire
@@ -202,5 +208,5 @@ def _i_env(name: str, default: int) -> int:
         return default
 
 
-WORKSPACE_DISK_QUOTA_MB = _i_env("WORKSPACE_DISK_QUOTA_MB", 100)
+WORKSPACE_DISK_QUOTA_MB = _i_env("WORKSPACE_DISK_QUOTA_MB", 2048)
 PROMPT_TIMEOUT_SECONDS = _i_env("PROMPT_TIMEOUT_SECONDS", 900)

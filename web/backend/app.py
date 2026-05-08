@@ -49,6 +49,8 @@ _bootstrap_env()
 
 
 # ruff: noqa: E402  -- imports below intentionally follow _bootstrap_env()
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -73,10 +75,53 @@ from routes import (
     usage,
     workspaces,
 )
+from services import container_pool, egress_proxy
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """
+    Backend lifespan. On startup:
+      1. Sweep up any pi-session containers left running by a previous
+         backend instance that crashed without graceful shutdown
+         (services/container_pool.cleanup_orphaned_containers).
+      2. Spawn the egress proxy thread (services/egress_proxy) — the
+         single chokepoint between every per-session container and
+         the outside world.
+    On shutdown the egress proxy is torn down. We do NOT kill live
+    per-session containers on shutdown: PiSession.close() already
+    handles that on per-WS-disconnect, and a clean shutdown sequence
+    sends close() to every active session via the chat_ws router's
+    own teardown.
+
+    Failure to start the proxy is logged but does not abort backend
+    boot — local dev without /srv/pi/state writeable still needs the
+    rest of the API to come up. Per-session containers in that mode
+    fall back to the subprocess runtime where this proxy isn't on
+    the path anyway.
+    """
+    try:
+        await container_pool.cleanup_orphaned_containers()
+    except Exception as exc:
+        # Cleanup failures are non-fatal — orphans burn a little
+        # memory until the next manual `docker rm` but don't break
+        # new chats.
+        import sys as _sys
+        print(f"[lifespan] container_pool cleanup failed: {exc}", file=_sys.stderr)
+
+    egress_proxy.start_egress_proxy()
+    try:
+        yield
+    finally:
+        egress_proxy.stop_egress_proxy()
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="pi-typst-test web bridge", version="0.4.0")
+    app = FastAPI(
+        title="pi-typst-test web bridge",
+        version="0.4.0",
+        lifespan=_lifespan,
+    )
 
     app.add_middleware(
         CORSMiddleware,

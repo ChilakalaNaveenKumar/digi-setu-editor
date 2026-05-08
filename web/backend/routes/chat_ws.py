@@ -299,6 +299,7 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
         provider=pi_provider,
         permission_mode=permission_mode,
         permission_mode_file=permission_mode_file,
+        user_id=user_id,
     )
 
     # Tell the SPA which model actually got loaded (may differ from
@@ -312,6 +313,30 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
         "permission_mode": permission_mode,
         "workspace_id": sess_rec["workspace_id"],
     })
+
+    # Per-user concurrency cap + global capacity gate. No-op when the
+    # docker runtime isn't in use (subprocess fallback in laptop dev).
+    # See services/container_pool.py for the policy.
+    try:
+        from services import container_pool as _pool
+        await _pool.enforce_quotas(user_id)
+    except _pool.GlobalCapacityExceeded as exc:
+        await ws.send_json({
+            "type": "_bridge_error",
+            "code": "vm_capacity",
+            "message": (
+                "The VM is currently at maximum capacity. "
+                "Please try again in a minute."
+            ),
+            "detail": str(exc),
+        })
+        await ws.close(code=1013)  # Try Again Later
+        return
+    except Exception as exc:
+        print(f"[ws {session_id}] WARN container_pool quota check failed: {exc}", file=sys.stderr)
+        # Don't refuse the chat on a transient docker error; let
+        # PiSession.start() decide.
+
     try:
         await pi.start()
     except Exception as exc:
@@ -952,18 +977,36 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
                 if WORKSPACE_DISK_QUOTA_MB > 0:
                     used_mb = workspace_over_quota(workspace_path, WORKSPACE_DISK_QUOTA_MB)
                     if used_mb is not None:
+                        # When a hosted-tier user hits the workspace
+                        # cap they're almost always trying to install
+                        # heavyweight tooling (rust/go toolchains,
+                        # multi-GB datasets, media projects). Rather
+                        # than asking them to delete files and stay on
+                        # the web — where they'll just hit the same
+                        # ceiling on the next install — we steer them
+                        # to the desktop app, which uses their local
+                        # disk and has no quota. This is also the
+                        # signal we use to drive desktop-app adoption
+                        # for the ~5% of power users who'd otherwise
+                        # churn on a "your sandbox is full" wall.
+                        def _fmt(mb: float) -> str:
+                            return f"{mb / 1024:.1f} GB" if mb >= 1024 else f"{mb:.0f} MB"
+
                         await ws.send_json(
                             {
                                 "type": "_bridge_error",
                                 "message": (
-                                    f"This sandbox is at "
-                                    f"{used_mb:.0f} MB of {WORKSPACE_DISK_QUOTA_MB} MB. "
-                                    "Delete some files (or this whole "
-                                    "chat) and try again."
+                                    f"You hit the workspace storage limit "
+                                    f"({_fmt(used_mb)} of {_fmt(WORKSPACE_DISK_QUOTA_MB)}). "
+                                    "Use the local version instead "
+                                    "for better storage options that "
+                                    "run on your own machine — "
+                                    "https://digi-setu.com/download"
                                 ),
                                 "code": "storage_quota",
                                 "used_mb": round(used_mb, 1),
                                 "quota_mb": WORKSPACE_DISK_QUOTA_MB,
+                                "download_url": "https://digi-setu.com/download",
                             }
                         )
                         continue
