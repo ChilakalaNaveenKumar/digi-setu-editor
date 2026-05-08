@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<news>
+  <article id="a1">
+    <title>Typst 0.14 Released</title>
+    <author>Alice</author>
+    <content>
+      <p>The release adds new visualization features.</p>
+      <p>It also improves PDF accessibility.</p>
+    </content>
+  </article>
+  <article id="a2">
+    <title>Community Roundup</title>
+    <author>Bob</author>
+    <content>
+      <p>Three new packages this week.</p>
+    </content>
+  </article>
+</news>

@@ -1,0 +1,3 @@
+Hello from a plain text file!
+
+It can have multiple lines and any UTF-8 content: αβγ, 日本語, 🎉.

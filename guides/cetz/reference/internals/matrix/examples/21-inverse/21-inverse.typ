@@ -1,0 +1,10 @@
+#set page(width: 14cm, height: auto, margin: 8pt)
+#import "@preview/cetz:0.5.0"
+
+#cetz.canvas({
+  import cetz.draw: *
+  let m = cetz.matrix.transform-translate(2, 3, 0)
+  let i = cetz.matrix.inverse(m)
+  let r = cetz.matrix.round(i, precision: 3)
+  content((0, 0), [inverse(translate(2,3,0)) = #repr(r)])
+})

@@ -1,0 +1,9 @@
+{
+  "city": "Berlin",
+  "days": [
+    { "name": "Mon", "temp": 18, "weather": "sunny" },
+    { "name": "Tue", "temp": 14, "weather": "cloudy" },
+    { "name": "Wed", "temp": 11, "weather": "rainy" },
+    { "name": "Thu", "temp": 17, "weather": "sunny" }
+  ]
+}

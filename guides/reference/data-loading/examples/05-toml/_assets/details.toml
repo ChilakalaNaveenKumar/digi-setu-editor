@@ -1,0 +1,15 @@
+title = "Annual Report"
+version = "1.4.2"
+authors = ["Alice", "Bob", "Charlie"]
+
+[contact]
+email = "info@example.com"
+phone = "+49 30 1234567"
+
+[[sections]]
+name = "Overview"
+pages = 4
+
+[[sections]]
+name = "Financials"
+pages = 12
