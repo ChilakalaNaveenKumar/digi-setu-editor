@@ -5,11 +5,14 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const PI_PKG = process.argv[2];
+// Optional 2nd arg from apply.sh — the resolved pi-ai location
+// (handles the nested vs hoisted npm layout). Fall back to the
+// nested path for backwards compat with older callers / dev usage.
+const PI_AI = process.argv[3] ?? join(PI_PKG, "node_modules", "@mariozechner", "pi-ai");
 if (!PI_PKG) {
-  console.error("usage: node apply-edits.mjs <pi-coding-agent-dir>");
+  console.error("usage: node apply-edits.mjs <pi-coding-agent-dir> [pi-ai-dir]");
   process.exit(1);
 }
-const PI_AI = join(PI_PKG, "node_modules", "@mariozechner", "pi-ai");
 
 function patch(file, find, replace, label, sentinel) {
   const src = readFileSync(file, "utf8");
