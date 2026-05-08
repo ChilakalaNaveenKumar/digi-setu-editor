@@ -1,0 +1,908 @@
+/* diff2html base styles (MUST come before @tailwind per CSS @import rule).
+ * We override the dark color scheme further down to match our palette. */
+@import "diff2html/bundles/css/diff2html.min.css";
+/* KaTeX styles for inline + display math rendered in chat markdown. */
+@import "katex/dist/katex.min.css";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ────────────────────────────────────────────────────────────────────────
+ * Design tokens.
+ *
+ * Every UI color is a CSS custom property. Components NEVER hardcode hex.
+ * To swap palettes globally:
+ *   1. Add a new `.theme-<name>` block below with the same set of vars.
+ *   2. Replace `theme-notion` on <html> in main.ts with `theme-<name>`.
+ * That's it — entire app re-skins.
+ *
+ * `.dark` flips us to dark surfaces. `.theme-*` chooses the chromatic accent.
+ * Active default: notion teal.
+ *
+ * Tokens follow shadcn/ui naming so any shadcn-style component drops in.
+ * ──────────────────────────────────────────────────────────────────────── */
+
+/* Light fallback (kept thin — we force `.dark` in main.ts). */
+:root {
+  --radius: 0.5rem;
+  --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+    "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    "Liberation Mono", "Courier New", monospace;
+}
+
+/* ────────────────────────────────────────────────────────────────────────
+ * NEUTRAL DARK SURFACES (shared by every theme — only the accent changes)
+ * Warm-tinted grays for an Apple/Notion feel; pure neutrals read as cold.
+ * ──────────────────────────────────────────────────────────────────────── */
+.dark {
+  --background:        oklch(0.18 0.005 240);  /* app bg — warm slate */
+  --foreground:        oklch(0.95 0.005 240);  /* primary text — soft white */
+
+  --card:              oklch(0.22 0.005 240);  /* cards / panes */
+  --card-foreground:   oklch(0.95 0.005 240);
+
+  --popover:           oklch(0.24 0.005 240);
+  --popover-foreground: oklch(0.95 0.005 240);
+
+  --sidebar:           oklch(0.20 0.005 240);  /* file tree + chat sidebar */
+  --sidebar-foreground: oklch(0.95 0.005 240);
+  --sidebar-border:    oklch(0.28 0.005 240);
+
+  --secondary:         oklch(0.28 0.005 240);
+  --secondary-foreground: oklch(0.95 0.005 240);
+
+  --muted:             oklch(0.26 0.005 240);
+  --muted-foreground:  oklch(0.68 0.01 240);   /* secondary text */
+
+  --border:            oklch(0.30 0.005 240);  /* dividers */
+  --input:             oklch(0.30 0.005 240);  /* input borders */
+  --ring:              oklch(0.55 0.005 240);  /* focus ring fallback */
+
+  /* State colors — same across themes (these communicate meaning, not brand) */
+  --destructive:        oklch(0.65 0.20 25);   /* error red */
+  --destructive-foreground: oklch(0.98 0 0);
+  --success:            oklch(0.70 0.18 150);  /* check green */
+  --success-foreground: oklch(0.18 0 0);
+  --warning:            oklch(0.78 0.16 75);   /* in-progress amber */
+  --warning-foreground: oklch(0.18 0 0);
+
+  /* Editor surfaces (slightly different from cards for depth) */
+  --editor-bg:          oklch(0.16 0.005 240);
+  --editor-line:        oklch(0.45 0.01 240);  /* line numbers */
+  --editor-add:         oklch(0.65 0.18 150 / 0.18);
+  --editor-remove:      oklch(0.65 0.20 25 / 0.18);
+}
+
+/* ────────────────────────────────────────────────────────────────────────
+ * THEMES — each only defines the chromatic accent + brand-flavored hover.
+ * Add new themes here. Apply by toggling the class on <html>.
+ * ──────────────────────────────────────────────────────────────────────── */
+
+/* Notion teal — soft teal accent, productive doc-craft vibe (default). */
+.theme-notion {
+  --primary:           oklch(0.78 0.13 175);   /* teal-400 */
+  --primary-foreground: oklch(0.18 0 0);
+  --accent:            oklch(0.78 0.13 175 / 0.15);
+  --accent-foreground: oklch(0.85 0.13 175);
+  --user-bubble-bg:    oklch(0.78 0.13 175 / 0.08);
+  --user-bubble-border: oklch(0.78 0.13 175 / 0.30);
+  --rail-running:      var(--warning);
+  --rail-success:      var(--success);
+  --rail-error:        var(--destructive);
+  --rail-pending:      var(--border);
+}
+
+/* Linear violet — premium, calm, slight purple warmth. */
+.theme-linear {
+  --primary:           oklch(0.62 0.20 290);   /* violet-500 */
+  --primary-foreground: oklch(0.98 0 0);
+  --accent:            oklch(0.62 0.20 290 / 0.15);
+  --accent-foreground: oklch(0.78 0.18 290);
+  --user-bubble-bg:    oklch(0.62 0.20 290 / 0.10);
+  --user-bubble-border: oklch(0.62 0.20 290 / 0.30);
+  --rail-running:      var(--warning);
+  --rail-success:      var(--success);
+  --rail-error:        var(--destructive);
+  --rail-pending:      var(--border);
+}
+
+/* Cursor blue — familiar, technical, IDE-like. */
+.theme-cursor {
+  --primary:           oklch(0.62 0.20 250);   /* blue-500 */
+  --primary-foreground: oklch(0.98 0 0);
+  --accent:            oklch(0.62 0.20 250 / 0.15);
+  --accent-foreground: oklch(0.78 0.18 250);
+  --user-bubble-bg:    oklch(0.62 0.20 250 / 0.08);
+  --user-bubble-border: oklch(0.62 0.20 250 / 0.30);
+  --rail-running:      var(--warning);
+  --rail-success:      var(--success);
+  --rail-error:        var(--destructive);
+  --rail-pending:      var(--border);
+}
+
+/* Vercel monochromatic — almost no color. State-only accents. */
+.theme-vercel {
+  --primary:           oklch(0.95 0.005 240);  /* nearly white */
+  --primary-foreground: oklch(0.18 0 0);
+  --accent:            oklch(0.95 0.005 240 / 0.10);
+  --accent-foreground: oklch(0.95 0.005 240);
+  --user-bubble-bg:    oklch(0.95 0.005 240 / 0.04);
+  --user-bubble-border: oklch(0.95 0.005 240 / 0.18);
+  --rail-running:      var(--warning);
+  --rail-success:      var(--success);
+  --rail-error:        var(--destructive);
+  --rail-pending:      var(--border);
+}
+
+/* Stripe indigo — saturated, premium, fintech. */
+.theme-stripe {
+  --primary:           oklch(0.58 0.22 270);   /* indigo */
+  --primary-foreground: oklch(0.98 0 0);
+  --accent:            oklch(0.58 0.22 270 / 0.15);
+  --accent-foreground: oklch(0.75 0.18 270);
+  --user-bubble-bg:    oklch(0.58 0.22 270 / 0.10);
+  --user-bubble-border: oklch(0.58 0.22 270 / 0.30);
+  --rail-running:      var(--warning);
+  --rail-success:      var(--success);
+  --rail-error:        var(--destructive);
+  --rail-pending:      var(--border);
+}
+
+/* ────────────────────────────────────────────────────────────────────────
+ * Base typography + body
+ * ──────────────────────────────────────────────────────────────────────── */
+html,
+body,
+#app {
+  height: 100%;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Smooth thin scrollbars on every dark surface. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background-color: var(--border);
+  border-radius: 4px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background-color: var(--muted-foreground);
+}
+
+/* Hide the visible scrollbar but keep the element scrollable. Used by
+ * the desktop chat tab strip (Cursor-style: tabs scroll on wheel/swipe
+ * but the bar itself never paints, so the strip stays visually quiet
+ * even with many chats). Apply via class="chat-tabs-scroll". */
+.chat-tabs-scroll {
+  scrollbar-width: none;        /* Firefox */
+  -ms-overflow-style: none;     /* IE / legacy Edge */
+}
+.chat-tabs-scroll::-webkit-scrollbar {
+  display: none;                /* Chrome / Safari / WebView2 */
+}
+
+/* Shimmer (used by ThinkingBlock label while streaming). */
+@keyframes pi-shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.animate-shimmer {
+  background: linear-gradient(
+    90deg,
+    var(--muted-foreground) 0%,
+    var(--foreground) 50%,
+    var(--muted-foreground) 100%
+  );
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: pi-shimmer 2.6s ease-in-out infinite;
+}
+
+/* User-bubble token-driven gradient (replaces pi-web-ui's hardcoded oranges). */
+.user-bubble {
+  background: var(--user-bubble-bg);
+  border: 1px solid var(--user-bubble-border);
+}
+
+/* Permission-prompt attention pulse.
+ *
+ * Plays 3 cycles when a new permission card mounts, then settles. We
+ * pulse both a glowing outer ring and the border itself so the card
+ * registers in peripheral vision without resorting to a screen-blocking
+ * modal. Shorthand: "look here, the agent is waiting on you."
+ *
+ * `forwards` keeps the final frame so we don't snap back to the resting
+ * state mid-animation if the user is already mid-click. `prefers-reduced-
+ * motion` disables the pulse for anyone with motion sensitivity.
+ */
+@keyframes pi-permission-pulse {
+  0% {
+    box-shadow:
+      0 0 0 0 color-mix(in oklab, var(--warning) 0%, transparent),
+      0 10px 20px -10px rgb(0 0 0 / 0.4);
+    border-color: var(--border);
+  }
+  35% {
+    box-shadow:
+      0 0 0 6px color-mix(in oklab, var(--warning) 28%, transparent),
+      0 10px 20px -10px rgb(0 0 0 / 0.4);
+    border-color: color-mix(in oklab, var(--warning) 60%, var(--border));
+  }
+  70% {
+    box-shadow:
+      0 0 0 0 color-mix(in oklab, var(--warning) 0%, transparent),
+      0 10px 20px -10px rgb(0 0 0 / 0.4);
+    border-color: var(--border);
+  }
+  100% {
+    box-shadow:
+      0 0 0 0 color-mix(in oklab, var(--warning) 0%, transparent),
+      0 10px 20px -10px rgb(0 0 0 / 0.4);
+    border-color: var(--border);
+  }
+}
+
+.pi-permission-card {
+  animation: pi-permission-pulse 1.4s ease-out 3 both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pi-permission-card {
+    animation: none;
+  }
+}
+
+/* ────────────────────────────────────────────────────────────────────────
+ * Markdown rendering for chat (.pi-markdown).
+ *
+ * Goals:
+ *   • Code blocks are syntax-highlighted by Shiki with a clear lang label
+ *     and a hover copy-to-clipboard button.
+ *   • Tables look like documentation tables, not raw text columns.
+ *   • Task-list checkboxes render as actual rounded boxes.
+ *   • Math (KaTeX) inherits the chat foreground colour so display
+ *     formulas don't burn out white-on-grey.
+ *   • Headings have visible weight without dominating the chat line.
+ *   • Inline `code` reads as a chip — subtle bg, monospace, slight pad.
+ *   • Links use the accent colour AND open in a new tab.
+ *   • Token-driven — themes (notion / cobalt / …) reskin for free.
+ * ──────────────────────────────────────────────────────────────────────── */
+.pi-markdown {
+  color: var(--foreground);
+  font-size: 0.95rem;
+  line-height: 1.65;
+  letter-spacing: 0.005em;
+}
+
+.pi-markdown :is(h1, h2, h3, h4, h5, h6) {
+  color: var(--foreground);
+  font-weight: 600;
+  margin: 1.25em 0 0.4em;
+  line-height: 1.25;
+  letter-spacing: -0.01em;
+  /* So sub-section heads don't jam against the previous paragraph
+   * when the prose is dense. Top spacing is the lever; bottom stays
+   * tight so the heading reads as "owning" what follows. */
+}
+.pi-markdown :is(h1, h2, h3, h4, h5, h6):first-child { margin-top: 0; }
+.pi-markdown h1 {
+  font-size: 1.5rem;
+  font-weight: 700;
+  letter-spacing: -0.015em;
+}
+.pi-markdown h2 {
+  font-size: 1.22rem;
+  font-weight: 650;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.3em;
+  margin-top: 1.5em;
+}
+.pi-markdown h3 {
+  font-size: 1.08rem;
+  font-weight: 650;
+  color: var(--foreground);
+}
+.pi-markdown h4 {
+  font-size: 0.98rem;
+  font-weight: 600;
+  color: color-mix(in oklab, var(--foreground) 88%, transparent);
+}
+.pi-markdown h5,
+.pi-markdown h6 {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--muted-foreground);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.pi-markdown p { margin: 0.55em 0; }
+
+.pi-markdown strong { color: var(--foreground); font-weight: 650; }
+.pi-markdown em { color: var(--foreground); }
+
+.pi-markdown a {
+  color: var(--accent-foreground, var(--primary));
+  text-decoration: underline;
+  text-decoration-color: color-mix(in oklab, var(--accent-foreground, var(--primary)) 40%, transparent);
+  text-underline-offset: 2px;
+  transition: text-decoration-color 120ms ease;
+}
+.pi-markdown a:hover {
+  text-decoration-color: var(--accent-foreground, var(--primary));
+}
+
+/* Inline code chips. Tinted with a hint of the accent so identifiers
+ * (`Order #1357`, `claude-haiku-4-5`, `workspace/uploads/foo.png`) read
+ * as tokens you could click — same visual rhythm as Linear / GitHub
+ * comments. The colour-mix keeps it theme-driven (Notion teal, Cobalt
+ * blue, etc) without a per-theme override block. */
+.pi-markdown code {
+  font-family: var(--font-mono);
+  font-size: 0.86em;
+  padding: 0.12em 0.42em;
+  background: color-mix(in oklab, var(--primary) 12%, var(--card));
+  border: 1px solid color-mix(in oklab, var(--primary) 22%, var(--border));
+  color: color-mix(in oklab, var(--primary) 18%, var(--foreground));
+  border-radius: 4px;
+  word-break: break-word;
+  /* Slight bump so the chip's optical weight matches the surrounding
+   * body text. Without this the chip "shrinks" against tall-x fonts. */
+  line-height: 1.2;
+}
+/* Inside fenced code blocks (which Shiki paints token-by-token) we
+ * don't want the chip styling — just monospace + theme colours. */
+.pi-markdown pre code {
+  background: transparent !important;
+  border: 0 !important;
+  padding: 0 !important;
+  color: inherit !important;
+  border-radius: 0 !important;
+}
+
+/* Fenced code blocks */
+.pi-markdown pre {
+  position: relative;
+  background: var(--editor-bg, var(--card));
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  margin: 0.85em 0;
+}
+.pi-markdown pre > code,
+.pi-markdown pre.shiki-pre > code {
+  display: block;
+  padding: 0.85em 1em;
+  font-family: var(--font-mono);
+  font-size: 0.84em;
+  line-height: 1.55;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  overflow-x: auto;
+  white-space: pre;
+  color: var(--foreground);
+}
+/* Language label in the top-right corner of fenced blocks. */
+.pi-markdown pre[data-lang]::before {
+  content: attr(data-lang);
+  position: absolute;
+  top: 0.45em;
+  right: 0.7em;
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--muted-foreground);
+  padding: 0.05em 0.5em;
+  border-radius: 4px;
+  background: color-mix(in oklab, var(--background) 80%, transparent);
+  pointer-events: none;
+  user-select: none;
+  z-index: 1;
+}
+.pi-markdown pre[data-lang="text"]::before { display: none; }
+
+/* Hover-only copy button injected by the chat code-block enhancer (see
+ * components/CodeBlockCopyButton — wires up after each render). */
+.pi-markdown pre .pi-copy-btn {
+  position: absolute;
+  top: 0.4em;
+  right: 0.35em;
+  padding: 0.2em 0.5em;
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted-foreground);
+  background: color-mix(in oklab, var(--card) 80%, transparent);
+  border: 1px solid color-mix(in oklab, var(--border) 70%, transparent);
+  border-radius: 4px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms ease, color 120ms ease;
+  z-index: 2;
+}
+.pi-markdown pre:hover .pi-copy-btn { opacity: 1; }
+.pi-markdown pre .pi-copy-btn:hover { color: var(--foreground); }
+
+/* Lists.
+ *
+ * Tailwind's Preflight resets `ul/ol { list-style: none }` globally, so
+ * we must explicitly reassert the marker style on our prose. Using the
+ * `list-style-position: outside` default puts the bullet in the gutter
+ * rather than indenting body text on the second wrapped line. */
+.pi-markdown ul {
+  list-style-type: disc;
+  list-style-position: outside;
+  padding-left: 1.5em;
+  margin: 0.55em 0;
+}
+.pi-markdown ol {
+  list-style-type: decimal;
+  list-style-position: outside;
+  padding-left: 1.6em;
+  margin: 0.55em 0;
+}
+/* Nested lists use a slightly different glyph so depth is readable. */
+.pi-markdown ul ul { list-style-type: circle; margin: 0.2em 0; }
+.pi-markdown ul ul ul { list-style-type: square; }
+.pi-markdown ol ol { list-style-type: lower-alpha; margin: 0.2em 0; }
+.pi-markdown ol ol ol { list-style-type: lower-roman; }
+
+.pi-markdown li {
+  margin: 0.2em 0;
+  /* Explicit `display: list-item` survives any future global reset. */
+  display: list-item;
+}
+.pi-markdown li::marker {
+  color: color-mix(in oklab, var(--foreground) 50%, transparent);
+  font-variant-numeric: tabular-nums;
+}
+.pi-markdown li > p { margin: 0.2em 0; }
+.pi-markdown li > p:first-child { margin-top: 0; }
+.pi-markdown li > p:last-child { margin-bottom: 0; }
+
+/* GitHub-flavoured task lists */
+.pi-markdown li.task-list-item { list-style: none; padding-left: 0; }
+.pi-markdown li.task-list-item::marker { content: ""; }
+.pi-markdown li.task-list-item > input[type="checkbox"] {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 1em;
+  height: 1em;
+  margin-right: 0.5em;
+  vertical-align: -0.15em;
+  border: 1.5px solid var(--border);
+  border-radius: 3px;
+  background: var(--card);
+  cursor: default;
+  position: relative;
+}
+.pi-markdown li.task-list-item > input[type="checkbox"]:checked {
+  background: var(--primary, var(--accent-foreground));
+  border-color: var(--primary, var(--accent-foreground));
+}
+.pi-markdown li.task-list-item > input[type="checkbox"]:checked::after {
+  content: "";
+  position: absolute;
+  top: 0.05em; left: 0.25em;
+  width: 0.3em; height: 0.55em;
+  border: solid var(--primary-foreground, white);
+  border-width: 0 1.6px 1.6px 0;
+  transform: rotate(45deg);
+}
+
+/* Tables.
+ *
+ * Goal: render markdown tables the way GitHub / Linear do — strong
+ * header row, tabular-aligned numbers, hover-row, comfortable padding,
+ * subtle outer border, and rounded corners that match the rest of the
+ * chat surfaces.
+ *
+ * `border-collapse: collapse` zeroes out the per-cell border-radius
+ * (collapsed borders share edges, so corner rounding has nothing to
+ * round). To keep the rounded outer wrapper, we put the radius on the
+ * <table> itself and use `overflow: hidden` to clip the corners.
+ */
+.pi-markdown table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 0.95em 0;
+  font-size: 0.92em;
+  overflow: hidden;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: color-mix(in oklab, var(--card) 30%, var(--background));
+}
+.pi-markdown thead {
+  background: color-mix(in oklab, var(--card) 75%, var(--background));
+}
+.pi-markdown th {
+  text-align: left;
+  font-weight: 650;
+  padding: 0.55em 0.85em;
+  border-bottom: 1px solid var(--border);
+  color: var(--foreground);
+  letter-spacing: 0.005em;
+  white-space: nowrap;
+}
+.pi-markdown td {
+  padding: 0.55em 0.85em;
+  border-top: 1px solid color-mix(in oklab, var(--border) 55%, transparent);
+  vertical-align: top;
+}
+/* Numbers right-aligned with tabular figures so currency / counts
+ * line up cleanly. Heuristic: any cell whose content starts with a
+ * currency symbol, +/-, or digit gets the treatment via :has(). The
+ * progressive fallback for non-:has browsers is "left aligned numbers"
+ * which is still readable. */
+.pi-markdown td:has(> :only-child),
+.pi-markdown td {
+  font-variant-numeric: tabular-nums;
+}
+/* Right-align numeric columns. We can't introspect markdown's column
+ * intent reliably, so instead we lean on the agent: when it emits
+ * `| ---: |` markdown alignment, the renderer adds `style="text-align: right"`
+ * which we style accordingly. Our extra rule below keeps that sane.
+ */
+.pi-markdown td[align="right"],
+.pi-markdown th[align="right"] { text-align: right; }
+.pi-markdown td[align="center"],
+.pi-markdown th[align="center"] { text-align: center; }
+
+/* Subtle zebra-striping helps long ledgers / line-item tables. We
+ * use color-mix at very low alpha so it stays calm, never noisy. */
+.pi-markdown tbody tr:nth-child(even) {
+  background: color-mix(in oklab, var(--card) 25%, transparent);
+}
+.pi-markdown tbody tr:hover {
+  background: color-mix(in oklab, var(--primary) 10%, var(--card));
+}
+
+/* Tables that overflow horizontally get a scrollable shell. Markdown-it
+ * doesn't wrap them, so we approximate with `display: block` on small
+ * screens — keeps the table itself intact while preventing the chat
+ * column from blowing out. */
+@media (max-width: 720px) {
+  .pi-markdown table {
+    display: block;
+    overflow-x: auto;
+    white-space: nowrap;
+  }
+}
+
+/* Blockquote */
+.pi-markdown blockquote {
+  border-left: 3px solid color-mix(in oklab, var(--primary) 70%, transparent);
+  background: color-mix(in oklab, var(--card) 40%, transparent);
+  color: var(--muted-foreground);
+  padding: 0.4em 0.95em;
+  margin: 0.65em 0;
+  border-radius: 0 4px 4px 0;
+}
+.pi-markdown blockquote > p { margin: 0.2em 0; }
+
+/* Horizontal rule */
+.pi-markdown hr {
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin: 1.1em 0;
+}
+
+/* KaTeX — math inherits chat colours so display equations don't pop
+ * white-on-grey in dark mode. */
+.pi-markdown .katex { color: var(--foreground); font-size: 1em; }
+.pi-markdown .katex-display { margin: 0.85em 0; overflow-x: auto; overflow-y: hidden; }
+.pi-markdown .katex-display > .katex { font-size: 1.05em; }
+.pi-markdown .katex .mord, .pi-markdown .katex .mbin, .pi-markdown .katex .mrel,
+.pi-markdown .katex .mopen, .pi-markdown .katex .mclose, .pi-markdown .katex .minner,
+.pi-markdown .katex .mop, .pi-markdown .katex .mpunct {
+  color: inherit;
+}
+
+/* ────────────────────────────────────────────────────────────────────────
+ * diff2html palette + LAYOUT overrides.
+ *
+ * Why we override layout:
+ *   diff2html positions the line-number <td> with `position: absolute`.
+ *   It expects the immediate table to be the containing block (fragile)
+ *   but with our `.d2h-mount.relative` wrapper, all line-number cells
+ *   stack against the wrapper and end up at random offsets that overlap
+ *   source content (e.g. "import sy{1}s", "{8}class MathEngine").
+ *
+ *   Fix: convert the line-number cell back to a normal in-flow
+ *   `position: static; display: table-cell` cell with a fixed width, and
+ *   reset the corresponding `padding: 0 8em` on `.d2h-code-line` (which
+ *   only existed to leave room for the absolute element).
+ *
+ *   We also collapse the dual `line-num1 | line-num2` columns into a
+ *   single value: show line-num1 for deleted lines, line-num2 for
+ *   added/context. One number is plenty for a chat-card peek.
+ *
+ * All overrides scoped under .d2h-host so they don't leak.
+ * ──────────────────────────────────────────────────────────────────────── */
+
+.d2h-host {
+  overflow-x: auto;
+}
+
+.d2h-host .d2h-file-wrapper {
+  border: 0;
+  border-radius: 0;
+  margin: 0;
+  background: var(--editor-bg);
+}
+.d2h-host .d2h-file-header {
+  display: none;
+}
+.d2h-host .d2h-file-diff,
+.d2h-host .d2h-code-wrapper {
+  background: var(--editor-bg);
+  border: 0;
+}
+.d2h-host .d2h-diff-table {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.55;
+  background: var(--editor-bg);
+  color: var(--foreground);
+  table-layout: auto;
+}
+
+/* Hunk headers (@@ ... @@) — slim 6px divider, text fully hidden. */
+.d2h-host .d2h-info,
+.d2h-host td.d2h-info {
+  background: transparent;
+  color: transparent;
+  border: 0;
+  border-top: 1px solid var(--border);
+  height: 6px;
+  padding: 0;
+  font-size: 0;
+  line-height: 0;
+}
+.d2h-host .d2h-info * {
+  display: none;
+}
+
+/* ── Line-number cell: in-flow + sticky to left edge during h-scroll ─
+ *
+ * Width: 5em fits up to 4-digit line numbers (9999) with breathing room
+ * on both sides. CRITICAL: the background MUST be fully opaque (alpha=1)
+ * so when the user scrolls the diff horizontally, scrolled content can't
+ * bleed through under the sticky gutter. Do NOT mix with the row color
+ * tints (--editor-add / --editor-remove) — those have alpha=0.18 and
+ * produce a translucent gutter that leaks "lass" of "class" into view.
+ *
+ * Instead we use the opaque --gutter-bg / --gutter-bg-add / --gutter-bg-del
+ * tokens defined inline below (computed to roughly match the row tints
+ * but at full opacity). */
+.d2h-host td.d2h-code-linenumber,
+.d2h-host td.d2h-code-side-linenumber {
+  position: sticky !important;
+  left: 0;
+  z-index: 1;
+  display: table-cell !important;
+  width: 6em;
+  min-width: 6em;
+  max-width: 6em;
+  padding: 0 14px 0 10px;
+  text-align: right;
+  vertical-align: top;
+  color: var(--editor-line);
+  /* Uniform DARK opaque gutter — explicitly DARKER than --editor-bg so
+   * the column reads as a clear strip, never tinted by the row state.
+   * Per-state (add/del) overrides intentionally NOT defined: the +/-
+   * prefix in the content already conveys add/delete; tinting the gutter
+   * just adds noise and risks transparency issues. */
+  background-color: oklch(0.12 0.005 240);
+  border-right: 1px solid var(--border);
+  border-left: 0;
+  direction: ltr;
+  font-size: 10.5px;
+  box-shadow: 1px 0 0 0 var(--border);
+}
+
+/* Inner number divs (line-num1 = old, line-num2 = new). diff2html floats
+ * them; we want a plain right-aligned single value instead. */
+.d2h-host .line-num1,
+.d2h-host .line-num2 {
+  float: none !important;
+  display: inline !important;
+  width: auto !important;
+  padding: 0 !important;
+}
+/* Show new number on context+added lines, old number on deleted lines.
+ * One column is enough in a peek; keeps cards compact. */
+.d2h-host td.d2h-code-linenumber:not(.d2h-del) .line-num1 {
+  display: none !important;
+}
+.d2h-host td.d2h-code-linenumber.d2h-del .line-num2 {
+  display: none !important;
+}
+
+/* No per-state gutter tints. Gutter is uniformly dark across all rows.
+ * If you want add/del color hints, look at the +/- prefix in the content
+ * cell (.d2h-code-line-prefix) — keeping the gutter chromatically silent
+ * makes the diff easier to scan. */
+
+/* ── Code line cell: drop diff2html's 8em padding hack ───────────────── */
+.d2h-host .d2h-code-line,
+.d2h-host .d2h-code-side-line {
+  padding: 0 8px 0 14px !important;
+  width: auto !important;
+}
+.d2h-host .d2h-code-line-prefix {
+  display: inline-block;
+  width: 16px;
+  margin-right: 4px;
+  text-align: center;
+  opacity: 0.6;
+}
+
+/* ── Row colors ──────────────────────────────────────────────────────── */
+.d2h-host .d2h-cntx,
+.d2h-host td.d2h-cntx {
+  background: var(--editor-bg);
+  color: var(--foreground);
+}
+.d2h-host .d2h-del,
+.d2h-host td.d2h-del {
+  background: var(--editor-remove);
+  color: var(--foreground);
+}
+.d2h-host .d2h-ins,
+.d2h-host td.d2h-ins {
+  background: var(--editor-add);
+  color: var(--foreground);
+}
+/* NOTE: gutter (.d2h-code-linenumber) backgrounds are defined ABOVE with
+ * fully-opaque colors. Do NOT add color-mix(... transparent) overrides
+ * here — that produces a translucent gutter and content bleeds through
+ * during horizontal scroll. */
+.d2h-host .d2h-emptyplaceholder {
+  background: transparent;
+}
+
+/* Char-level highlighting inside changed lines. */
+.d2h-host del {
+  background: color-mix(in oklab, var(--destructive) 30%, transparent);
+  text-decoration: none;
+}
+.d2h-host ins {
+  background: color-mix(in oklab, var(--success) 30%, transparent);
+  text-decoration: none;
+}
+
+/* Truncation: clip + fade. */
+.d2h-host-truncated {
+  position: relative;
+}
+.d2h-host-truncated::after {
+  content: "";
+  position: absolute;
+  left: 0; right: 0; bottom: 0;
+  height: 36px;
+  background: linear-gradient(to bottom, transparent, var(--editor-bg));
+  pointer-events: none;
+}
+.d2h-host-streaming {
+  overflow-x: auto;
+}
+
+/* ────────────────────────────────────────────────────────────────────────
+ * Clerk dark-mode hard overrides.
+ *
+ * We pass `baseTheme: dark` to clerkPlugin AND to <UserButton>/<SignIn>,
+ * but in @clerk/vue 2.2.0 the UserButton's popover (rendered into a
+ * portal) sometimes doesn't pick up the appearance prop after a Vite
+ * hot-reload — you end up with a white popover sitting on top of our
+ * dark UI. These rules force every Clerk-emitted surface into the
+ * Notion palette, no matter what state the JS theme system is in.
+ *
+ * Class names follow the documented `cl-*` element targets:
+ * https://clerk.com/docs/components/customization/overview
+ * ──────────────────────────────────────────────────────────────────── */
+.cl-userButtonPopoverCard,
+.cl-card,
+.cl-modalContent,
+.cl-popoverBox,
+.cl-organizationSwitcherPopoverCard,
+.cl-userPreview,
+.cl-menuList,
+.cl-userButtonPopoverActionButton,
+.cl-userButtonPopoverFooter {
+  background-color: hsl(var(--popover)) !important;
+  color: hsl(var(--popover-foreground)) !important;
+  border-color: hsl(var(--border)) !important;
+}
+
+.cl-userPreviewMainIdentifier,
+.cl-userPreviewSecondaryIdentifier,
+.cl-userButtonPopoverActionButton,
+.cl-userButtonPopoverActionButtonText,
+.cl-formFieldLabel,
+.cl-headerTitle,
+.cl-headerSubtitle,
+.cl-formFieldInputShowPasswordButton,
+.cl-profileSectionTitleText,
+.cl-profileSectionTitle,
+.cl-navbarButton,
+.cl-navbarButtonText,
+.cl-pageScrollBox,
+.cl-formFieldRow {
+  color: hsl(var(--foreground)) !important;
+}
+
+.cl-userPreviewSecondaryIdentifier,
+.cl-formFieldHintText,
+.cl-headerSubtitle,
+.cl-footerActionText,
+.cl-userButtonPopoverActionButtonIcon {
+  color: hsl(var(--muted-foreground)) !important;
+}
+
+.cl-userButtonPopoverActionButton:hover,
+.cl-menuItem:hover,
+.cl-navbarButton:hover {
+  background-color: hsl(var(--muted)) !important;
+}
+
+.cl-formFieldInput,
+.cl-input,
+.cl-selectButton {
+  background-color: hsl(var(--background)) !important;
+  color: hsl(var(--foreground)) !important;
+  border-color: hsl(var(--border)) !important;
+}
+
+.cl-formButtonPrimary,
+.cl-buttonPrimary {
+  background-color: hsl(var(--primary)) !important;
+  color: hsl(var(--primary-foreground)) !important;
+}
+
+.cl-dividerLine {
+  background-color: hsl(var(--border)) !important;
+}
+
+/* Footer "Secured by Clerk" + "Development mode" sit on a striped
+   off-white tint by default — recolour them so they don't break the
+   dark surface continuity. */
+.cl-footer,
+.cl-internal-1tcjgl4,
+.cl-internal-uyu30o {
+  background: hsl(var(--popover)) !important;
+  background-image: none !important;
+}
+
+.cl-badge {
+  background-color: hsl(var(--muted)) !important;
+  color: hsl(var(--muted-foreground)) !important;
+}
+
+/* Backdrop for full-page modals (Manage Account, etc.) — keep dim. */
+.cl-modalBackdrop {
+  background-color: rgba(0, 0, 0, 0.6) !important;
+}

@@ -1,0 +1,31 @@
+{
+  "name": "pi-typst-test-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Tauri desktop shell for Digi Setu. Owns its own forked backend (desktop/backend) frozen via PyInstaller and frontend (desktop/frontend) built with Vite, plus a bundled Node + pi-coding-agent runtime.",
+  "scripts": {
+    "dev": "tauri dev",
+    "dev:frontend": "cd frontend && npm run dev",
+    "build": "tauri build",
+    "build:debug": "tauri build --debug",
+    "tauri": "tauri",
+    "sidecar:build": "bash sidecar/build_sidecar.sh",
+    "sidecar:build:win": "powershell -ExecutionPolicy Bypass -File sidecar/build_sidecar.ps1",
+    "pi-runtime:fetch": "bash pi-runtime/fetch-node.sh && bash pi-runtime/install-pi.sh",
+    "pi-runtime:fetch:win": "powershell -ExecutionPolicy Bypass -File pi-runtime/fetch-node.ps1 && powershell -ExecutionPolicy Bypass -File pi-runtime/install-pi.ps1",
+    "release:mac": "bash scripts/build-mac.sh",
+    "release:win": "powershell -ExecutionPolicy Bypass -File scripts/build-windows.ps1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.1.0"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.1.1",
+    "@tauri-apps/plugin-deep-link": "^2.0.1",
+    "@tauri-apps/plugin-dialog": "^2.0.1",
+    "@tauri-apps/plugin-fs": "^2.0.3",
+    "@tauri-apps/plugin-opener": "^2.0.0",
+    "@tauri-apps/plugin-os": "^2.0.0",
+    "@tauri-apps/plugin-shell": "^2.0.1"
+  }
+}

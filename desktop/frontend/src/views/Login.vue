@@ -1,0 +1,188 @@
+<!--
+  Login — flash redirector to Clerk's hosted sign-in page.
+
+  Per product decision we don't render Clerk's <SignIn /> widget
+  inline. The hosted page (e.g. https://certain-sunfish-59.accounts.dev
+  /sign-in for dev, https://accounts.<your-domain>.com/sign-in for prod)
+  carries Clerk's full styling, security headers, and branding — and we
+  want the user to experience that exact page rather than an embedded
+  copy.
+
+  Flow:
+    1. Router guard bounces unauthenticated users to /login?next=…
+    2. This view mounts, waits for Clerk to load.
+    3. If a session is already present (e.g. user opened /login
+       directly while signed in), we just push to `next`.
+    4. Otherwise we call clerk.redirectToSignIn({ redirectUrl }) which
+       full-page-navigates to Clerk's hosted sign-in. After successful
+       auth Clerk's `signInForceRedirectUrl` (configured in main.ts)
+       brings them back to "/", and the picker resolves their session.
+
+  Dev-mode fallback (auth_required=false): the backend has no Clerk
+  configured, so `redirectToSignIn` doesn't exist. We render a notice
+  and a "continue to picker" button instead.
+-->
+<script setup lang="ts">
+import { computed, onMounted, watch, ref } from "vue";
+import { useRoute, useRouter, RouterLink } from "vue-router";
+import { useClerk } from "@clerk/vue";
+
+import BrandHeader from "../components/BrandHeader.vue";
+import { isDesktop } from "../lib/native-bridge";
+import { startDesktopSignIn } from "../lib/desktop-auth";
+import { useConfigStore } from "../stores/config";
+
+const route = useRoute();
+const router = useRouter();
+const cfg = useConfigStore();
+const clerk = useClerk();
+
+const status = ref<"loading" | "redirecting" | "error" | "waiting-browser">("loading");
+const errMsg = ref("");
+
+const redirectUrl = computed(() => {
+  const next = route.query.next;
+  return typeof next === "string" && next.startsWith("/") ? next : "/";
+});
+
+async function handoff(): Promise<void> {
+  if (!cfg.authRequired) return;
+
+  // Desktop: bounce sign-in out to the system browser. The Tauri
+  // webview can't host Clerk's UI directly (anti-phishing, passkeys,
+  // autofill all break). After Clerk authenticates the user, the
+  // production web app's /desktop/sign-in page redirects to a
+  // pi-typst-test:// deep link, which the deep-link bridge installed
+  // in main.ts picks up and exchanges for a session.
+  if (isDesktop()) {
+    status.value = "waiting-browser";
+    try {
+      await startDesktopSignIn();
+    } catch (exc) {
+      console.error("[login] startDesktopSignIn failed", exc);
+      errMsg.value = exc instanceof Error ? exc.message : String(exc);
+      status.value = "error";
+    }
+    return;
+  }
+
+  const c = clerk.value;
+  if (!c) return;
+
+  // Already signed in? Skip Clerk and go straight to the picker /
+  // requested page.
+  if (c.session) {
+    await router.replace(redirectUrl.value);
+    return;
+  }
+
+  status.value = "redirecting";
+  try {
+    // Full-page navigate to Clerk's hosted sign-in page. After auth
+    // Clerk redirects back to `redirectUrl` (origin-absolute so it
+    // crosses the accounts.dev → app boundary cleanly).
+    await c.redirectToSignIn({
+      signInForceRedirectUrl: window.location.origin + redirectUrl.value,
+    });
+  } catch (exc) {
+    console.error("[login] redirectToSignIn failed", exc);
+    errMsg.value = exc instanceof Error ? exc.message : String(exc);
+    status.value = "error";
+  }
+}
+
+onMounted(() => {
+  void handoff();
+});
+
+// Clerk loads asynchronously after the plugin is installed; the ref
+// goes from null → instance once `clerk-js` finishes booting. Watch
+// for that and kick off the redirect the moment it's ready.
+watch(
+  () => clerk.value,
+  (v) => {
+    if (v) void handoff();
+  },
+);
+</script>
+
+<template>
+  <div class="flex min-h-screen flex-col bg-background text-foreground">
+    <BrandHeader
+      :show-account="false"
+      :show-feedback="false"
+      :links="[
+        { to: '/pricing', label: 'Pricing' },
+        { to: '/privacy', label: 'Privacy' },
+        { to: '/terms', label: 'Terms' },
+      ]"
+    />
+
+    <main class="flex flex-1 flex-col items-center justify-center px-6 py-12">
+      <div
+        v-if="cfg.authRequired"
+        class="flex flex-col items-center gap-3 text-sm text-muted-foreground"
+      >
+        <template v-if="status === 'error'">
+          <p class="font-medium text-destructive">
+            Couldn't redirect to Clerk.
+          </p>
+          <p class="font-mono text-[11px]">{{ errMsg }}</p>
+          <button
+            type="button"
+            class="mt-2 rounded-md border border-border bg-card px-3 py-1.5 text-xs font-medium text-foreground hover:border-primary/50"
+            @click="handoff"
+          >Try again</button>
+        </template>
+        <template v-else>
+          <span
+            class="inline-block h-5 w-5 animate-spin rounded-full border-2 border-muted-foreground/30 border-t-foreground"
+            aria-hidden="true"
+          />
+          <p>
+            <template v-if="status === 'redirecting'">
+              Redirecting to Clerk…
+            </template>
+            <template v-else-if="status === 'waiting-browser'">
+              Sign in in your browser, then return here. We're listening
+              for the redirect…
+            </template>
+            <template v-else>Loading…</template>
+          </p>
+          <button
+            v-if="status === 'waiting-browser'"
+            type="button"
+            class="mt-2 rounded-md border border-border bg-card px-3 py-1.5 text-xs font-medium text-foreground hover:border-primary/50"
+            @click="handoff"
+          >Reopen browser</button>
+        </template>
+      </div>
+
+      <div
+        v-else
+        class="w-full max-w-md rounded-lg border border-border bg-card p-6 text-sm text-foreground"
+      >
+        <p class="mb-2 font-medium">Auth is disabled on this server.</p>
+        <p class="mb-4 text-muted-foreground">
+          The backend is running without
+          <code class="font-mono text-[11px]">CLERK_SECRET_KEY</code>, so
+          every request resolves to the synthetic
+          <code class="font-mono text-[11px]">dev</code> user. Set the
+          <code class="font-mono text-[11px]">CLERK_*</code> env vars in
+          <code class="font-mono text-[11px]">web/backend/.env</code> and
+          restart uvicorn to enable real sign-in.
+        </p>
+        <RouterLink
+          :to="redirectUrl"
+          class="block w-full rounded-md bg-primary px-4 py-2 text-center text-sm font-semibold text-primary-foreground hover:opacity-90"
+        >
+          Continue to picker
+        </RouterLink>
+      </div>
+    </main>
+
+    <footer class="border-t border-border bg-card/40 px-6 py-4 text-center text-[11px] text-muted-foreground">
+      © {{ new Date().getFullYear() }} Digi Setu
+    </footer>
+  </div>
+</template>
