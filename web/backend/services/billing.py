@@ -330,14 +330,22 @@ def _now_iso_utc() -> str:
 #   * `journal_mode=WAL` because we read while writing — the credit
 #     gate runs `can_spend` on every chat WS receive, while sub-LLM
 #     tool calls run `note_cost` mid-turn from the same loop.
-_DB_PATH = Path(
-    os.environ.get(
-        "BILLING_DB_PATH",
-        # Default: alongside `web/data/registry.json` so all durable
-        # state lives in one folder we can ship to GCS.
-        str(Path(__file__).resolve().parents[2] / "data" / "billing.db"),
-    )
-).resolve()
+# Default lives alongside registry.json under config.DATA_ROOT so all
+# durable state ships to GCS together. In production
+# (PI_DATA_ROOT=/srv/pi/data) this resolves to /srv/pi/data/billing.db
+# on the persistent volume; in dev it stays under web/data/. The legacy
+# parents[2]/"data" derivation pinned this to /app/web/data which broke
+# the moment the container rootfs went read_only — never derive a
+# writable path from __file__ in container land.
+#
+# Operators can still override with BILLING_DB_PATH for one-off staging
+# instances that want their own DB on a different volume.
+_BILLING_DB_OVERRIDE = os.environ.get("BILLING_DB_PATH", "").strip()
+if _BILLING_DB_OVERRIDE:
+    _DB_PATH = Path(_BILLING_DB_OVERRIDE).expanduser().resolve()
+else:
+    from config import DATA_ROOT  # local import: avoids circular at module load
+    _DB_PATH = (DATA_ROOT / "billing.db").resolve()
 
 
 def _connect_db() -> sqlite3.Connection:
