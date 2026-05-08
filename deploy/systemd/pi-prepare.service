@@ -94,15 +94,25 @@ ExecStart=/usr/bin/install -d -m 0710 -o 1100 -g 1000 /srv/pi/data/shadows
 # is a no-op. The `-mindepth 1 -maxdepth 1` keeps the scope to
 # direct children (per-session dirs); -mindepth 2 then handles
 # everything BELOW each session dir.
+#
+# Symlink note: each workspace/<wsid>/ contains a handful of symlinks
+# (package.json, extensions/, guides/, AGENTS.md, .pi/) that point at
+# /app/... INSIDE the container. From the host's POV those targets do
+# not exist, so plain `chown 1000:1000` blows up with "cannot
+# dereference: No such file or directory" and the unit fails. The fix
+# is `chown -h` (lchown), which operates on the link itself rather
+# than its target. `chmod` only follows symlinks for non-directory
+# targets, so we restrict the chmod sweeps to real files/dirs via
+# `! -type l` to skip dangling links cleanly.
 ExecStart=/bin/bash -c "set -eux; \
   for parent in workspaces chats shadows; do \
     dir=/srv/pi/data/$parent; \
     [ -d $dir ] || continue; \
-    find $dir -mindepth 1 -maxdepth 1 -type d -exec chown 1000:1000 {} +; \
+    find $dir -mindepth 1 -maxdepth 1 -type d -exec chown -h 1000:1000 {} +; \
     find $dir -mindepth 1 -maxdepth 1 -type d -exec chmod 2770 {} +; \
-    find $dir -mindepth 2 -exec chown 1000:1000 {} +; \
+    find $dir -mindepth 2 -exec chown -h 1000:1000 {} +; \
     find $dir -mindepth 2 -type d -exec chmod 2770 {} +; \
-    find $dir -mindepth 2 -type f -exec chmod 0660 {} +; \
+    find $dir -mindepth 2 -type f ! -type l -exec chmod 0660 {} +; \
   done; \
   if [ -f /srv/pi/data/registry.json ]; then \
     chown 1100:1100 /srv/pi/data/registry.json; \
