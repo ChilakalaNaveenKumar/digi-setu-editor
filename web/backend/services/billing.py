@@ -355,6 +355,31 @@ def _connect_db() -> sqlite3.Connection:
         check_same_thread=False,
         isolation_level=None,  # autocommit; we control batching ourselves
     )
+    # Lock down to 0600 IMMEDIATELY after the file exists. SQLite creates
+    # new files with the process umask which is typically 0022 → 0644
+    # world-readable. In our dual-uid model the sandbox uid (1000) lives
+    # in the same container, so a world-readable billing.db means every
+    # AI bash subprocess can `cat` the entire spend ledger. The boot-time
+    # chmod in pi-prepare.service catches this on RESTART, but we need
+    # the safe mode from the moment the file appears.
+    #
+    # Same hardening applies to the WAL/SHM siblings created by SQLite
+    # in WAL mode; we attempt-and-ignore on those (they may not exist
+    # until the first checkpoint).
+    try:
+        os.chmod(_DB_PATH, 0o600)
+        for sibling in (_DB_PATH.with_suffix(_DB_PATH.suffix + "-wal"),
+                        _DB_PATH.with_suffix(_DB_PATH.suffix + "-shm")):
+            if sibling.exists():
+                os.chmod(sibling, 0o600)
+    except OSError as exc:
+        # On dev (where umask is whatever), warn but don't crash. In prod
+        # the chmod always succeeds because the file is owned by uid 1100
+        # which is our own uid.
+        import logging
+        logging.getLogger(__name__).warning(
+            "billing: chmod 0600 on %s failed: %s", _DB_PATH, exc
+        )
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")

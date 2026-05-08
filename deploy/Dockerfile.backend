@@ -241,10 +241,17 @@ ENV PYTHONUNBUFFERED=1 \
     PI_SANDBOX_UID=1000 \
     PI_SANDBOX_GID=1000
 
-# Drop privileges. The backend runs as `app` (uid 1100); /srv/pi
-# volumes are mounted with matching ownership by the systemd prepare
-# unit (see deploy/systemd/pi-prepare.service).
-USER app
+# Entrypoint that drops root → uid 1100 with CAP_{SETUID,SETGID,CHOWN,
+# FOWNER} preserved as ambient caps. We deliberately do NOT use the
+# Dockerfile `USER app` directive here: that would zero capabilities
+# at exec time (kernel rule for non-root execve without file caps),
+# which breaks our dual-uid sandbox because pi_session.py needs
+# CAP_SETUID at runtime to spawn pi as uid 1000 via setpriv. Letting
+# the entrypoint do the drop keeps caps in the ambient set across
+# the uid change. See deploy/entrypoint-drop-priv.sh for the full
+# rationale.
+COPY deploy/entrypoint-drop-priv.sh /usr/local/bin/entrypoint-drop-priv.sh
+RUN chmod 0555 /usr/local/bin/entrypoint-drop-priv.sh
 
 EXPOSE 8788
 
@@ -252,7 +259,9 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD curl -fsS http://127.0.0.1:8788/healthz >/dev/null || exit 1
 
 # tini reaps zombies cleanly when the agent kills bash/bg subprocesses.
-ENTRYPOINT ["/usr/bin/tini", "--"]
+# The drop-priv shim runs AFTER tini so PID 1 stays root (so it can
+# reap zombies from any uid) while the backend itself is uid 1100.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint-drop-priv.sh"]
 CMD ["python", "-m", "uvicorn", "main:app", \
      "--host", "0.0.0.0", "--port", "8788", \
      "--app-dir", "/app/web/backend", \
