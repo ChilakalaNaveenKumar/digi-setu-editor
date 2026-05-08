@@ -31,10 +31,27 @@ GID_APP=1100
 # sandbox plumbing. Listed alphabetically to make `diff` review easier.
 CAPS="+chown,+fowner,+setgid,+setuid"
 
+# IMPORTANT: --init-groups (NOT --clear-groups). The Dockerfile creates
+# `app` with `--groups sandbox`, so `app` is a SECONDARY member of the
+# sandbox group (gid 1000). That's what lets the backend read+write
+# per-session dirs (mode 2770, owner+group=1000) via group permission
+# while the AI's bash runs as primary uid 1000 inside those dirs.
+#
+# `--clear-groups` here would strip that secondary membership and the
+# backend would get EACCES on every workspace mkdir / chat write —
+# defeating the entire dual-uid model from the wrong direction.
+# `--init-groups` re-reads /etc/group for the new uid and re-applies
+# its secondary groups (so we end up with primary=1100 + secondary=1000).
+#
+# In contrast, the OTHER setpriv call site (pi_session.py spawning pi)
+# DOES use --clear-groups: pi must NOT inherit `app`'s secondary
+# membership in any group, otherwise the AI's bash could read backend-
+# private files via group permission. Different threat models, opposite
+# flags — both are correct for their context.
 exec /usr/bin/setpriv \
     --reuid="${UID_APP}" \
     --regid="${GID_APP}" \
-    --clear-groups \
+    --init-groups \
     --inh-caps="${CAPS}" \
     --ambient-caps="${CAPS}" \
     -- "$@"
