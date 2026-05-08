@@ -14,7 +14,6 @@
 # Secrets (loaded by docker-compose env_file from /opt/pi/stack.env):
 #   CLOUDFLARE_API_TOKEN   — scoped "Edit zone DNS" for digi-setu.com
 #   ACME_EMAIL             — Let's Encrypt account email
-
 {
 	email {$ACME_EMAIL}
 	acme_dns cloudflare {$CLOUDFLARE_API_TOKEN}
@@ -24,14 +23,104 @@
 	}
 }
 
-# Shared snippet: common headers + compression. Keep CSP loose enough
-# for the SPA's inline boot script + dynamic Iconify icon loads.
+# Shared snippet: hardened security headers + compression.
+#
+# CSP rationale (any change here affects EVERY route, so be surgical):
+#
+#   default-src 'self'         — deny everything not whitelisted below.
+#
+#   script-src 'self'          — only our own bundles. Vite builds
+#                                produce hashed external <script
+#                                type="module"> tags so we DON'T need
+#                                'unsafe-inline'. Clerk's vue plugin
+#                                makes XHR/WebSocket calls but does
+#                                NOT inject 3rd-party <script> tags
+#                                from another origin.
+#
+#   style-src 'self' 'unsafe-inline'
+#                              — Tailwind + Vue scoped styles emit
+#                                inline <style> blocks. Tightening
+#                                this requires a hash-allowlist for
+#                                every CSS payload Vite emits, which
+#                                breaks every release. Deferred.
+#
+#   img-src  'self' data: blob: https:
+#                              — user uploads (blob:), favicon
+#                                (data:), and remote image previews
+#                                in the chat (https:). Tighten to
+#                                explicit hosts once the upload story
+#                                stops fetching arbitrary URLs.
+#
+#   font-src 'self' data:      — Vite inlines small fonts as data:
+#                                URIs, larger ones served from /assets.
+#
+#   connect-src 'self' https://*.clerk.com https://*.clerk.accounts.dev
+#               https://*.clerk.dev https://api.stripe.com
+#                              — XHR + WS to ourselves (the wss://
+#                                handshake matches 'self' since the
+#                                origin is the same as the page),
+#                                Clerk session/user APIs, and Stripe's
+#                                JS SDK config endpoint. Stripe Checkout
+#                                itself happens via top-level redirect
+#                                (NOT in an iframe), so we don't need
+#                                frame-src for it.
+#
+#   frame-src 'self' https://js.stripe.com https://hooks.stripe.com
+#                              — reserved in case we ever embed Stripe
+#                                Elements. Today: no iframes are used.
+#
+#   frame-ancestors 'none'     — refuse to be embedded ANYWHERE.
+#                                Replaces the legacy X-Frame-Options.
+#
+#   base-uri 'self'            — block <base href="https://evil.tld/">
+#                                injection that would relativize all
+#                                /assets/ URLs to a remote host.
+#
+#   form-action 'self'         — every <form> POST stays on-origin.
+#                                Clerk sign-in is a top-level redirect
+#                                to clerk.digi-setu.com, NOT a form
+#                                POST from our page, so this is fine.
+#
+#   upgrade-insecure-requests  — auto-upgrade any rogue http:// URL
+#                                that sneaks in through user content.
+#
+# Permissions-Policy turns OFF every powerful API the app doesn't
+# touch. If a browser plugin / 0-day tries to grab the camera, the
+# browser will refuse before the API even responds.
+#
+# Cross-Origin-* headers harden the page's process isolation so a
+# Spectre-style side-channel can't read our memory from a sibling
+# origin. We're a 1-origin app, so the strictest values are safe.
 (common_headers) {
 	header {
-		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		# HTTPS-only for 2 years, includes all subdomains, and is
+		# eligible for the Chromium HSTS preload list (submit at
+		# https://hstspreload.org once the cert is live).
+		Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+
+		# Content-Security-Policy. ONE line per directive for
+		# readability — Caddy concatenates with `;` itself when
+		# emitting the header.
+		Content-Security-Policy "default-src 'self'; script-src 'self' https://*.clerk.com https://*.clerk.accounts.dev https://*.clerk.dev; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self' https://*.clerk.com https://*.clerk.accounts.dev https://*.clerk.dev https://api.stripe.com; frame-src 'self' https://js.stripe.com https://hooks.stripe.com; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; upgrade-insecure-requests"
+
+		# Permissions-Policy: deny every powerful browser API we
+		# don't use. The () empty allow-list = "deny everywhere,
+		# including this origin".
+		Permissions-Policy "accelerometer=(), ambient-light-sensor=(), autoplay=(), battery=(), camera=(), display-capture=(), document-domain=(), encrypted-media=(), execution-while-not-rendered=(), execution-while-out-of-viewport=(), fullscreen=(self), geolocation=(), gyroscope=(), keyboard-map=(), magnetometer=(), microphone=(), midi=(), navigation-override=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), sync-xhr=(), usb=(), web-share=(), xr-spatial-tracking=()"
+
+		# Cross-origin isolation. COOP+CORP make the browser
+		# treat us as a 1-origin app — a clicked-through tab on
+		# evil.tld can't open a window into our session, and a
+		# remote <img src="https://digi-setu.com/api/secret">
+		# can't be embedded by another origin.
+		Cross-Origin-Opener-Policy "same-origin"
+		Cross-Origin-Resource-Policy "same-site"
+
+		# Legacy / explicit hardening.
 		X-Content-Type-Options "nosniff"
 		Referrer-Policy "strict-origin-when-cross-origin"
-		X-Frame-Options "SAMEORIGIN"
+		X-Frame-Options "DENY"
+		X-Permitted-Cross-Domain-Policies "none"
 		-Server
 	}
 	encode zstd gzip

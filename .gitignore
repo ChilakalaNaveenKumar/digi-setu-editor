@@ -19,6 +19,12 @@ web/frontend/.env
 web/frontend/.env.local
 web/frontend/.env.*.local
 
+# Production stack.env is generated locally and shipped to the VM via
+# `remote-deploy.sh stack`. Holds Clerk + Stripe + Cloudflare keys so
+# it must NEVER be committed. Only the `.example` template is tracked.
+deploy/stack.env
+deploy/stack.env.local
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Dependencies
 # ─────────────────────────────────────────────────────────────────────────────

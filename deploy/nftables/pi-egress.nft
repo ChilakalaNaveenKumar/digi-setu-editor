@@ -1,0 +1,45 @@
+# /etc/nftables.d/pi-egress.nft (deployed by remote-deploy.sh)
+#
+# Egress firewall for uid 1000 — the `sandbox` user the AI's pi
+# subprocess + bash subprocesses run as in the dual-uid model
+# (pi-typst-test v1.1).
+#
+# Why uid 1000 instead of uid 1100:
+#   The backend (FastAPI) still runs as uid 1100 and DOES need to
+#   reach the GCE metadata server so the Vertex SDK can fetch ADC
+#   tokens for `roles/aiplatform.user`. Firewalling 1100 broke that
+#   path. The AI's effective identity is now uid 1000 (set by the
+#   `setpriv --reuid 1000` wrapper in services/pi_session.py), so
+#   the firewall can be tightened around exactly that uid without
+#   breaking legitimate backend egress.
+#
+# Closes:
+#   1. GCP metadata SSRF (169.254.169.254). Without this rule a
+#      prompt that bypasses services/policy.py's regex (sslip.io
+#      DNS, decimal IPs, Python urllib bypass, etc.) can hit the
+#      metadata server and steal a Vertex IAM token.
+#   2. AWS / ECS metadata equivalents (169.254.170.2).
+#   3. IPv6 link-local (fe80::/10).
+#
+# We DO NOT block general egress — pip/npm/git over HTTPS still
+# work. uid 1000 in the container == uid 1000 on the host (no user
+# namespace), so `skuid 1000` matches the real process uid.
+#
+# IMPORTANT: this rule must reflect the SANDBOX uid, not the
+# backend uid. If you ever change PI_SANDBOX_UID in
+# Dockerfile.backend or services/sandbox_layout.py, update the
+# `skuid` value here in lockstep.
+
+table inet pi_egress {
+    chain output {
+        type filter hook output priority filter; policy accept;
+
+        # Cloud-metadata endpoints — ANY of these would hand out
+        # an IAM token to anyone who can curl them.
+        skuid 1000 ip  daddr 169.254.0.0/16 drop
+        skuid 1000 ip6 daddr fe80::/10      drop
+
+        # AWS / ECS metadata (cross-cloud belt-and-suspenders).
+        skuid 1000 ip  daddr 169.254.170.2 drop
+    }
+}

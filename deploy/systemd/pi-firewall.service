@@ -1,0 +1,61 @@
+# /etc/systemd/system/pi-firewall.service
+#
+# Kernel-level egress firewall for uid 1100 (the `app` user the
+# pi-backend container runs as, and that the AI's bash subprocess
+# inherits in v1).
+#
+# What this closes:
+#
+#   1. GCP metadata server SSRF. Without this rule, a clever prompt
+#      that bypasses services/policy.py's regex (sslip.io DNS, decimal
+#      IPs, Python urllib bypass, etc.) can hit 169.254.169.254 and
+#      walk away with a Vertex IAM token. With this rule, the kernel
+#      drops every packet uid 1100 sends to 169.254.0.0/16 — no regex
+#      to bypass.
+#
+#   2. AWS / ECS metadata equivalents (169.254.170.2).
+#
+#   3. IPv6 link-local.
+#
+# We DO NOT block all egress for uid 1100 — that would break:
+#   - `pip install`, `npm install` (registry traffic on 443)
+#   - `git clone https://github.com/…`
+#   - any user-supplied URL the agent legitimately fetches
+#
+# uid 1100 inside the container = uid 1100 on the host (docker-compose
+# host networking, no user namespace). The kernel's `skuid 1100`
+# matches the actual process uid.
+#
+# Verification AFTER this unit is active:
+#
+#   sudo nft list ruleset | grep pi_egress
+#   sudo docker exec pi-backend curl -m 3 -fsS http://169.254.169.254/ \
+#       ; echo "exit=$?"
+#   # → curl: (28) Connection timed out  exit=28  ← rule works
+#
+# Reload after editing /etc/nftables.d/pi-egress.nft:
+#
+#   sudo systemctl reload pi-firewall
+
+[Unit]
+Description=pi-typst-test — egress firewall (block metadata server for uid 1100)
+Before=pi.service
+After=network-pre.target nftables.service
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# Apply the ruleset. -f reads from disk and atomically swaps it in
+# (no packet drop window between old and new rules).
+ExecStart=/usr/sbin/nft -f /etc/nftables.d/pi-egress.nft
+
+# Reload swaps the ruleset without dropping packets.
+ExecReload=/usr/sbin/nft -f /etc/nftables.d/pi-egress.nft
+
+# Stop = drop our table only (leaves any operator-added rules alone).
+ExecStop=/usr/sbin/nft delete table inet pi_egress
+
+[Install]
+WantedBy=multi-user.target pi.service

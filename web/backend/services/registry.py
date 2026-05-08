@@ -38,6 +38,7 @@ from typing import Any, Optional
 # Single source of truth for layout — services/ never hardcodes paths now.
 # In Cloud Run, PI_DATA_ROOT points DATA_ROOT at a writable tmpfs (/tmp/pi-data).
 from config import DATA_ROOT, DEV_USER_ID, PROJECT_ROOT  # noqa: E402
+from services.sandbox_layout import stamp_sandbox_dir  # noqa: E402
 
 REGISTRY_PATH = DATA_ROOT / "registry.json"
 WORKSPACES_ROOT = DATA_ROOT / "workspaces"
@@ -130,16 +131,25 @@ class Registry:
         wsid = _safe_id("ws_")
         path = WORKSPACES_ROOT / wsid
         path.mkdir(parents=True, exist_ok=False)
+        # Stamp ownership BEFORE creating subdirs so SGID + the new gid
+        # propagate to every child. Without this, `pi --mode rpc`
+        # (running as the sandbox uid) would hit EACCES the moment it
+        # tried to write a file into the workspace.
+        stamp_sandbox_dir(path)
         # Inside the sandbox, the agent writes into a "workspace/" subdir
         # (the existing AGENTS.md tells it to). Pre-create it so the first
         # `bash ls` doesn't surprise the agent.
-        (path / "workspace").mkdir(exist_ok=True)
+        ws_subdir = path / "workspace"
+        ws_subdir.mkdir(exist_ok=True)
+        stamp_sandbox_dir(ws_subdir)
         # Pre-create workspace/uploads/ so the user-attachment flow has a
         # canonical drop target. The system prompt instructs the agent to
         # look there for files the user shared in the chat (paste, drop,
         # paperclip). Keeping it under workspace/ means the agent's
         # default "list workspace" walk catches uploads automatically.
-        (path / "workspace" / "uploads").mkdir(exist_ok=True)
+        uploads = ws_subdir / "uploads"
+        uploads.mkdir(exist_ok=True)
+        stamp_sandbox_dir(uploads)
         self._wire_sandbox_symlinks(path)
 
         record = {
@@ -538,9 +548,15 @@ class Registry:
 
     # ── path helpers ──────────────────────────────────────────────────────
     def session_chat_dir(self, sid: str) -> Path:
-        """Where pi's --session-dir points. Per-session, never shared."""
+        """Where pi's --session-dir points. Per-session, never shared.
+
+        pi runs as the sandbox uid in production, so the directory it
+        writes its JSONL into has to be sandbox-writable. We stamp it
+        2770 1000:1000 — same model as workspaces.
+        """
         path = DATA_ROOT / "chats" / sid
         path.mkdir(parents=True, exist_ok=True)
+        stamp_sandbox_dir(path)
         return path
 
     def workspace_path(self, wsid: str) -> Path:
@@ -566,6 +582,10 @@ class Registry:
         else:
             uploads = base / "workspace" / "uploads"
         uploads.mkdir(parents=True, exist_ok=True)
+        # Re-stamp on every call so legacy uploads/ dirs created before
+        # the dual-uid migration get pulled into compliance the first
+        # time they're touched after upgrade.
+        stamp_sandbox_dir(uploads)
         return uploads
 
     # ── sandbox bootstrap ─────────────────────────────────────────────────

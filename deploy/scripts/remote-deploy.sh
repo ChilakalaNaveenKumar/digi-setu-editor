@@ -144,6 +144,7 @@ ensure_remote_dirs() {
 sudo install -d -m 0700 /opt/pi
 sudo install -d -m 0755 /opt/pi/caddy
 sudo install -d -m 0755 /opt/pi/systemd
+sudo install -d -m 0755 /opt/pi/nftables
 sudo install -d -m 0755 /opt/pi/scripts
 U=\$(id -un); G=\$(id -gn)
 sudo chown -R \"\${U}:\${G}\" /opt/pi
@@ -168,7 +169,10 @@ push_stack() {
   scp_remote "${DEPLOY_DIR}/caddy/Dockerfile"                    "${REMOTE_ROOT}/caddy/Dockerfile"
   scp_remote "${DEPLOY_DIR}/systemd/pi.service"                  "${REMOTE_ROOT}/systemd/pi.service"
   scp_remote "${DEPLOY_DIR}/systemd/pi-prepare.service"          "${REMOTE_ROOT}/systemd/pi-prepare.service"
+  scp_remote "${DEPLOY_DIR}/systemd/pi-firewall.service"         "${REMOTE_ROOT}/systemd/pi-firewall.service"
+  scp_remote "${DEPLOY_DIR}/nftables/pi-egress.nft"              "${REMOTE_ROOT}/nftables/pi-egress.nft"
   scp_remote "${DEPLOY_DIR}/scripts/cutover-from-typst-agent.sh" "${REMOTE_ROOT}/scripts/cutover-from-typst-agent.sh"
+  scp_remote "${DEPLOY_DIR}/scripts/backup-to-gcs.sh"            "${REMOTE_ROOT}/scripts/backup-to-gcs.sh"
 
   # stack.env — only push if the operator generated it locally. Otherwise
   # we expect it to already exist on the VM (rotated via gcloud secrets).
@@ -183,11 +187,32 @@ push_stack() {
   fi
 
   ssh_remote "set -e
+# Install systemd units.
 sudo install -m 0644 ${REMOTE_ROOT}/systemd/pi.service          /etc/systemd/system/pi.service
 sudo install -m 0644 ${REMOTE_ROOT}/systemd/pi-prepare.service  /etc/systemd/system/pi-prepare.service
+sudo install -m 0644 ${REMOTE_ROOT}/systemd/pi-firewall.service /etc/systemd/system/pi-firewall.service
+
+# Install nftables ruleset (drop the metadata server for uid 1100).
+sudo install -d -m 0755 /etc/nftables.d
+sudo install -m 0644 ${REMOTE_ROOT}/nftables/pi-egress.nft /etc/nftables.d/pi-egress.nft
+
+# Make sure nftables is installed (firewall unit needs the binary).
+if ! command -v nft >/dev/null 2>&1; then
+  sudo apt-get update -qq
+  sudo apt-get install -y --no-install-recommends nftables
+fi
+
+# Make scripts executable.
 sudo chmod +x ${REMOTE_ROOT}/scripts/cutover-from-typst-agent.sh
+sudo chmod +x ${REMOTE_ROOT}/scripts/backup-to-gcs.sh
+
 sudo systemctl daemon-reload
-sudo systemctl enable pi-prepare.service pi.service
+sudo systemctl enable pi-prepare.service pi-firewall.service pi.service
+
+# Start the firewall NOW so the metadata-server hole is closed even
+# before pi.service (re)starts. nftables rules apply immediately.
+sudo systemctl restart pi-firewall.service
+sudo nft list ruleset | grep -A 6 'table inet pi_egress' | head -10
 "
 }
 

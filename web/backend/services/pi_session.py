@@ -26,8 +26,129 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Optional
 
 from config import DATA_ROOT, PROJECT_ROOT  # noqa: E402
+from services.sandbox_layout import (  # noqa: E402
+    SANDBOX_UID, SANDBOX_GID, stamp_sandbox_dir, is_active as sandbox_active,
+)
 
 SESSIONS_ROOT = DATA_ROOT / "chats"
+
+# Path to the setpriv binary (util-linux). Installed by Dockerfile.backend.
+# Pinned absolute so a hostile $PATH manipulation can't redirect it.
+_SETPRIV = "/usr/bin/setpriv"
+
+
+# ── Env allow-list ───────────────────────────────────────────────────────
+# pi spawns bash, npm, git, typst, etc. as direct subprocesses; every one
+# of them inherits pi's environment, which is whatever WE pass via
+# `env=self._env` to asyncio.create_subprocess_exec. So the env we pass
+# pi is the env the AI's bash sees when it runs `env` or `printenv`.
+#
+# The container (docker-compose.yml) loads /opt/pi/stack.env via env_file
+# AND sets explicit `environment:` keys, so the backend process starts
+# with the FULL set of operator secrets in os.environ:
+#
+#   CLERK_SECRET_KEY, CLERK_WEBHOOK_SECRET, CLERK_PUBLISHABLE_KEY
+#   STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, STRIPE_PRICE_*
+#   CLOUDFLARE_API_TOKEN, ACME_EMAIL
+#   ADMIN_EMAILS, ADMIN_USER_IDS
+#
+# A naive `env=os.environ` would let the AI dump every one of those with
+# a single `bash` call. We replace it with a strict allow-list: anything
+# not on the list is removed, even if a future config knob forgets to
+# add itself to the deny rules.
+#
+# DO NOT add a secret to the allow-list without thinking through "is it
+# OK for the AI's bash to read this?". Items here today fall into three
+# buckets:
+#
+#   1. Linux fundamentals (PATH, HOME, USER, …) — bash/git/npm need them.
+#   2. Vertex / Gemini auth — pi's HTTP client + the typst-tools.ts
+#      extension's sub-LLM calls need them. Vertex uses ADC (no
+#      JSON key), so the only secret here is GEMINI_API_KEY which is
+#      project-scoped.
+#   3. pi's own runtime config (PI_*).
+#   4. Typst font/cache paths.
+_PI_ENV_ALLOW: frozenset[str] = frozenset({
+    # Linux essentials.
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM",
+    "LANG", "LANGUAGE", "TZ", "TMPDIR", "PWD",
+    "LC_ALL", "LC_CTYPE", "LC_MESSAGES",
+    # Node / npm — pi is a Node CLI; npm needs these to find its cache.
+    "NODE_ENV", "NODE_PATH", "NPM_CONFIG_CACHE",
+    # Vertex AI — ADC is picked up from the GCE metadata server (no
+    # JSON key file), so only the project / location need to flow.
+    "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION",
+    "GOOGLE_GENAI_USE_VERTEXAI",
+    "GOOGLE_APPLICATION_CREDENTIALS",  # honored only when set explicitly
+    # Gemini fallback (used by the typst-tools.ts sub-LLM web_search /
+    # search_docs router when Vertex 429s). Project-scoped key, but
+    # still a credential — the AI's bash CAN read it. This is the
+    # one allow-list item to consider stripping later if you decide
+    # the Vertex-only path is sufficient.
+    "GEMINI_API_KEY",
+    # Typst.
+    "TYPST_FONT_PATHS", "TYPST_PACKAGE_CACHE_PATH",
+    "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME",
+    "FONTCONFIG_PATH",
+})
+
+
+# Explicit deny — even if a key matches a wildcard prefix below, these
+# always get stripped. Belt-and-suspenders for the most-sensitive ones.
+_PI_ENV_DENY: frozenset[str] = frozenset({
+    "CLERK_SECRET_KEY",
+    "CLERK_WEBHOOK_SECRET",
+    "CLERK_PUBLISHABLE_KEY",
+    "STRIPE_SECRET_KEY",
+    "STRIPE_WEBHOOK_SECRET",
+    "STRIPE_PRICE_STARTER",
+    "STRIPE_PRICE_PRO",
+    "STRIPE_PRICE_MAX",
+    "STRIPE_PUBLISHABLE_KEY",
+    "CLOUDFLARE_API_TOKEN",
+    "ACME_EMAIL",
+    "JWT_SECRET",
+    "JWT_PRIVATE_KEY",
+    "ADMIN_EMAILS",
+    "ADMIN_USER_IDS",
+    "DATABASE_URL", "DB_PASSWORD",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+})
+
+
+# Wildcard prefixes that are allowed THROUGH unless on the explicit
+# deny list. PI_* covers all of pi's runtime knobs (PI_PROVIDER,
+# PI_MODEL, PI_PERMISSION_MODE, PI_TYPST_*, …).
+_PI_ENV_ALLOW_PREFIXES: tuple[str, ...] = ("PI_",)
+
+
+def _scrub_env_for_pi(full_env: dict[str, str]) -> dict[str, str]:
+    """
+    Filter `full_env` down to only keys pi (and its bash subprocesses)
+    are allowed to see.
+
+    Rule order:
+      1. Drop everything in _PI_ENV_DENY.
+      2. Keep everything in _PI_ENV_ALLOW.
+      3. Keep keys whose name starts with any _PI_ENV_ALLOW_PREFIXES
+         entry, UNLESS the full key is in _PI_ENV_DENY.
+      4. Drop everything else.
+
+    This means a freshly-added secret like NEW_PROVIDER_API_KEY does
+    NOT leak by default — you have to add it to the allow-list
+    explicitly, with a comment justifying why bash should see it.
+    """
+    out: dict[str, str] = {}
+    for key, value in full_env.items():
+        if key in _PI_ENV_DENY:
+            continue
+        if key in _PI_ENV_ALLOW:
+            out[key] = value
+            continue
+        if any(key.startswith(p) for p in _PI_ENV_ALLOW_PREFIXES):
+            out[key] = value
+    return out
 
 
 def _load_env_sh() -> dict[str, str]:
@@ -114,8 +235,18 @@ class PiSession:
         # folder under web/data/chats/ when caller doesn't supply one.
         self.session_dir = Path(session_dir) if session_dir else SESSIONS_ROOT / session_id
         self.session_dir.mkdir(parents=True, exist_ok=True)
+        # Stamp 2770 1000:1000 so the sandbox-uid pi can write its
+        # JSONL without EACCES, while the backend still reaches it
+        # via secondary-group membership for backups / audit reads.
+        stamp_sandbox_dir(self.session_dir)
 
-        env = _load_env_sh()
+        # Source env.sh first (gives us PI_PROVIDER, PI_MODEL defaults +
+        # all pi runtime knobs), THEN scrub down to the allow-list so
+        # CLERK_SECRET_KEY, STRIPE_SECRET_KEY, CLOUDFLARE_API_TOKEN, etc.
+        # are NOT inherited by pi (and therefore not by bash). See the
+        # _PI_ENV_ALLOW / _PI_ENV_DENY sets at module top.
+        full_env = _load_env_sh()
+        env = _scrub_env_for_pi(full_env)
         # Per-session overrides win over env.sh defaults.
         self._provider = provider or env.get("PI_PROVIDER", "anthropic-vertex")
         self._model = model or env.get("PI_MODEL", "claude-opus-4-7")
@@ -162,7 +293,9 @@ class PiSession:
         if self._proc is not None:
             return
 
-        cmd = [
+        # Base argv for pi --mode rpc. Built first so the setpriv prefix
+        # below can be prepended cleanly.
+        pi_argv = [
             "pi",
             "--mode", "rpc",
             "--provider", self._provider,
@@ -176,6 +309,48 @@ class PiSession:
             # permission_request WS events.
             "--extension", "./extensions/permission.ts",
         ]
+
+        # ── Sandbox drop ───────────────────────────────────────────
+        # When PI_SANDBOX_UID is set (production), we wrap the pi
+        # invocation in `setpriv` so pi (and every bash subprocess
+        # the AI spawns) runs as uid 1000, distinct from the backend's
+        # uid 1100. The backend keeps unrestricted access to
+        # billing.db / registry.json / users/, the AI gets nothing.
+        #
+        # Flags:
+        #   --reuid / --regid       drop to the sandbox identity
+        #   --clear-groups          discard supplementary groups so
+        #                           the AI's bash isn't accidentally
+        #                           a member of `app` via inheritance
+        #   --no-new-privs          set PR_SET_NO_NEW_PRIVS so any
+        #                           subsequent execve cannot gain new
+        #                           privileges via setuid bits. Pairs
+        #                           with the container's
+        #                           `security_opt: no-new-privileges:true`.
+        #
+        # If the sandbox isn't active (laptop dev, or container missing
+        # CAP_SETUID), we run pi directly under the backend uid the
+        # same way v1.0 did. The `sandbox_active()` probe takes care
+        # of detecting a missing capability so we don't blow up at
+        # exec time with a confusing "setpriv: permission denied".
+        if sandbox_active():
+            cmd = [
+                _SETPRIV,
+                "--reuid", str(SANDBOX_UID),
+                "--regid", str(SANDBOX_GID),
+                "--clear-groups",
+                "--no-new-privs",
+                *pi_argv,
+            ]
+            # Override HOME so $HOME points at the sandbox user's
+            # tmpfs home (mounted at /home/sandbox by the compose
+            # file). Without this, pi/npm/git would still try
+            # /home/app and hit EACCES.
+            self._env["HOME"] = "/home/sandbox"
+            self._env["USER"] = "sandbox"
+            self._env["LOGNAME"] = "sandbox"
+        else:
+            cmd = pi_argv
 
         # asyncio.StreamReader defaults to a 64 KB line limit. pi RPC events
         # routinely exceed that (e.g. tool_execution_end for a `write` of a
@@ -196,6 +371,8 @@ class PiSession:
             f"[pi_session {self.session_id}] spawned pid={self._proc.pid} "
             f"provider={self._provider} model={self._model} "
             f"permission_mode={self._permission_mode} "
+            f"sandbox={'on' if sandbox_active() else 'off'} "
+            f"sandbox_uid={SANDBOX_UID if sandbox_active() else 'shared'} "
             f"cwd={self.workspace_path} chats={self.session_dir}",
             file=sys.stderr,
         )

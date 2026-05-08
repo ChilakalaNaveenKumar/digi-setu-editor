@@ -49,6 +49,7 @@ from services.models_registry import (
 from services.audit import record as audit_record
 from services.pi_session import PiSession
 from services.policy import check_bash, scrub_secrets
+from services.sandbox_layout import stamp_sandbox_dir
 from services.rate_limit import RateLimiter
 from services.registry import Registry
 from services.session_locks import session_locks
@@ -234,6 +235,12 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
     if not workspace_path.exists():
         try:
             workspace_path.mkdir(parents=True, exist_ok=True)
+            # Stamp the dual-uid sandbox ownership so pi (running as
+            # the sandbox uid) can write into this re-created tree.
+            # Without this, the AI's first `bash echo > foo.md` would
+            # raise EACCES and the session would be effectively read-
+            # only until the user manually fixed permissions.
+            stamp_sandbox_dir(workspace_path)
             print(
                 f"[ws {session_id}] re-created missing workspace dir "
                 f"{workspace_path} (registry was stale)",

@@ -4,11 +4,15 @@
  * Routes (history mode so the URL shows real paths, not `#`-hashes):
  *
  *   /                  Home — picker (web flat list, or desktop workspace list)
+ *   /sessions          Alias for / — Clerk's hosted sign-in redirects here
+ *                      after auth (configured in the Clerk dashboard).
  *   /workspaces/:wsid  Desktop drilled into one workspace's chat list
  *   /chat/:sid         Active chat session (the IDE shell)
  *   /login             Clerk <SignIn /> mount point
  *   /pricing           Public plans page (sign-in required to upgrade)
- *   /privacy           Static privacy policy
+ *   /privacy           Static privacy policy (/privacy-policy is also routed
+ *                      here because Clerk's "legal documents" URL field
+ *                      points there).
  *   /terms             Static terms / output ownership
  *
  * `/chat/:sid` is the only persistable URL inside the app — bookmark it
@@ -27,8 +31,14 @@ import { createRouter, createWebHistory, type RouteRecordRaw } from "vue-router"
 
 import { useConfigStore } from "./stores/config";
 
+// Routes that bypass the Clerk auth guard. `sessions` stays public
+// because Clerk lands here right after sign-in and the auth cookie
+// hasn't necessarily been written by the time the guard runs (race
+// window during the OAuth round trip). The picker itself works
+// gracefully whether the user is signed in or not.
 const PUBLIC_ROUTES = new Set([
   "login",
+  "sessions",
   "privacy",
   "terms",
   "pricing",
@@ -39,6 +49,14 @@ const routes: RouteRecordRaw[] = [
   {
     path: "/",
     name: "picker",
+    component: () => import("./views/Picker.vue"),
+  },
+  {
+    // Clerk's Account Portal sends users to /sessions after sign-in /
+    // sign-up (see dashboard → User redirects). Alias to the picker
+    // so we don't have to maintain a separate component.
+    path: "/sessions",
+    name: "sessions",
     component: () => import("./views/Picker.vue"),
   },
   {
@@ -67,6 +85,12 @@ const routes: RouteRecordRaw[] = [
     path: "/privacy",
     name: "privacy",
     component: () => import("./views/Privacy.vue"),
+  },
+  {
+    // Clerk's "Privacy Policy URL" field points to /privacy-policy
+    // (see dashboard → Customization → Legal). Alias to the same view.
+    path: "/privacy-policy",
+    redirect: "/privacy",
   },
   {
     path: "/terms",

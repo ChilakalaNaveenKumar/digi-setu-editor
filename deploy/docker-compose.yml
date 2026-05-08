@@ -11,9 +11,15 @@
 #
 # Services:
 #   backend  — FastAPI + pi (Node) + watchdog. Listens on 127.0.0.1:8788.
-#              Runs as uid 1100 (`app`); mediates every workspace
-#              read/write. The AI's bash tool stays inside the
-#              workspace folder under /srv/pi/data/workspaces/<wsid>/.
+#              The container has TWO non-root users:
+#                * uid 1100 (`app`)     — FastAPI backend, mediates
+#                                         every workspace read/write.
+#                * uid 1000 (`sandbox`) — pi --mode rpc + AI's bash.
+#                                         Spawned by setpriv from the
+#                                         backend at every chat start.
+#              Workspace dirs are 2770 1000:1000 (sandbox owns, backend
+#              reaches via secondary group). billing.db / registry.json /
+#              users/ stay 0600|0700 1100:1100 — invisible to the AI.
 #
 #   caddy    — TLS + static SPA + reverse proxy. Built locally so the
 #              caddy-dns/cloudflare module is baked in. Binds 80/443
@@ -47,12 +53,28 @@ services:
       PI_DATA_ROOT: /srv/pi/data
 
       # Vertex AI — provider + model defaults. Override per-deploy via
-      # stack.env if you want to A/B different models.
+      # stack.env if you want to A/B different models. NOTE: the Vertex
+      # billing project (`frontend-472812`) is intentionally NOT the
+      # same as the Artifact Registry project (`digi-setu-dev`); see
+      # stack.env.example for the rationale.
       PI_PROVIDER: anthropic-vertex
       PI_MODEL: ${PI_MODEL:-claude-sonnet-4-6}
       PI_VERTEX_ANTHROPIC_LOCATION: global
-      GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-digi-setu-dev}
+      GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-frontend-472812}
       GOOGLE_CLOUD_LOCATION: ${GOOGLE_CLOUD_LOCATION:-global}
+
+      # AI Studio fallback for Vertex 429s + tools whose router model
+      # isn't on Vertex (e.g. gemini-3-flash-preview). Empty = disabled.
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+
+      # Pin search_docs to gemini-3-flash-preview by default. The typst
+      # corpus exceeds Claude Haiku 4.5's 200k context window.
+      PI_TYPST_ROUTER_MODEL: ${PI_TYPST_ROUTER_MODEL:-gemini-3-flash-preview}
+
+      # Admin allow-list: bypass the credit cap for the operator(s).
+      # Comma-separated emails (case-insensitive). See backend/config.py.
+      ADMIN_EMAILS: ${ADMIN_EMAILS:-}
+      ADMIN_USER_IDS: ${ADMIN_USER_IDS:-}
 
       # Auth (Clerk). Leaving CLERK_SECRET_KEY empty puts the backend in
       # open dev mode (every request → user_id="dev"); fine for the
@@ -103,13 +125,19 @@ services:
       # backend/config.py (100 MB / 900 s). See stack.env.example.
       WORKSPACE_DISK_QUOTA_MB: ${WORKSPACE_DISK_QUOTA_MB:-}
       PROMPT_TIMEOUT_SECONDS: ${PROMPT_TIMEOUT_SECONDS:-}
+    env_file:
+      # All non-default values that came from `stack.env` get loaded
+      # here. The explicit `environment:` block above wins for vars
+      # the compose schema cares about (image, ports), but anything
+      # we didn't enumerate (e.g. RL_*, BILLING_*) flows through.
+      - /opt/pi/stack.env
     volumes:
-      # Per-deployment secrets the backend reads at boot but the AI
-      # must never see (auth.db, JWT key, etc.). Backend opens these
-      # before privilege drop wouldn't help — it already runs as `app`,
-      # so the volume is mounted with mode 0750 root:app and the AI's
-      # bash subprocess (which inherits uid 1100 in v1) can `cat` it
-      # transitively. Phase 5 fixes this with the runuser drop.
+      # Per-deployment secrets the backend reads at boot. /srv/pi/state
+      # is mounted 0700 root:root and the auth.db / JWT key inside it
+      # are 0600 1100:1100. The AI's bash runs as uid 1000 (the
+      # sandbox user added in v1.1) so it cannot traverse into the
+      # state dir or read its contents — the kernel rejects with
+      # EACCES before any application logic runs.
       - /srv/pi/state:/srv/pi/state
       # Workspaces, chats, shadows, registry. Owned by uid 1100 so the
       # backend (app user) can RW everything.
@@ -120,6 +148,97 @@ services:
       timeout: 5s
       start_period: 30s
       retries: 3
+
+    # ── Container hardening ────────────────────────────────────────
+    # Defence-in-depth around the v1 single-uid model. None of these
+    # replace the runuser sandbox planned for Phase 5, but they take
+    # away easy wins from a hostile prompt.
+    security_opt:
+      # Refuse to honour any setuid bit the AI might find / drop. Pairs
+      # with the Dockerfile's USER app drop — even if the AI somehow
+      # invokes a setuid binary, the kernel won't grant new privileges.
+      - "no-new-privileges:true"
+    cap_drop:
+      # Drop the entire 41-cap baseline first.
+      - ALL
+    cap_add:
+      # Add back the minimum needed for the dual-uid sandbox model:
+      #
+      #   CHOWN   — the backend (uid 1100) creates new workspace /
+      #             chat / shadow dirs and then chown's them to
+      #             1000:1000 so the sandbox can rw them. Without
+      #             this, every new session would be unreachable
+      #             from the AI's bash.
+      #
+      #   FOWNER  — chmod on a file the process doesn't own (we
+      #             chmod 2770 on the freshly-chowned dir; without
+      #             FOWNER the kernel rejects the second op since
+      #             the first chown made root the new owner... no
+      #             wait, we chown to 1000:1000 from uid 1100, so
+      #             the file is now owned by 1000 not 1100, and
+      #             chmod from 1100 needs FOWNER). Belt-and-
+      #             suspenders for related metadata ops too.
+      #
+      #   SETUID  — `setpriv --reuid 1000` requires CAP_SETUID. The
+      #             backend uses this every time it spawns pi.
+      #             Without it, every chat session creation fails
+      #             with EPERM at the setpriv layer.
+      #
+      #   SETGID  — same story for `setpriv --regid 1000` and
+      #             `--clear-groups`. Required.
+      #
+      # We do NOT add CAP_SYS_ADMIN, CAP_NET_ADMIN, CAP_DAC_OVERRIDE,
+      # CAP_SYS_PTRACE, etc. Those are the ones a hostile AI would
+      # need to break out of the sandbox — they stay dropped.
+      - CHOWN
+      - FOWNER
+      - SETUID
+      - SETGID
+    pids_limit: 1024
+    # Stops a fork-bomb prompt (`:(){ :|:& };:`) from eating PID space
+    # for the whole VM (host networking = host PID space — recovery
+    # would need a reboot otherwise).
+
+    mem_limit: 4g
+    memswap_limit: 4g
+    # Cap memory at 4 GiB. pi keeps the chat history in memory; this
+    # is enough for 3-4 deep Opus chats running concurrently. If you
+    # see OOM kills in `docker logs` bump this up — but ALSO add the
+    # WORKSPACE_DISK_QUOTA_MB limit on the user side so we're not
+    # paying for a 16 GiB VM to host one runaway prompt.
+
+    ulimits:
+      # Caps the per-process file-descriptor count. fd exhaustion is
+      # the most common DoS shape against an async server (open lots
+      # of WebSockets and never finish handshaking). 4096 is plenty
+      # for ~250 concurrent chats; real upper bound for this VM is
+      # /proc/sys/fs/file-max.
+      nofile:
+        soft: 4096
+        hard: 4096
+
+    read_only: true
+    # Lock the rootfs READ-ONLY. The backend writes only to the bind-
+    # mounted /srv/pi/data and /srv/pi/state volumes (writable above);
+    # everything else (/, /usr, /etc, /app) is RO. Stops "AI plants a
+    # binary in /usr/local/bin" persistence.
+    tmpfs:
+      # /tmp must be writable for typst's compile, npm temp files,
+      # python bytecode caches, etc. tmpfs means the writes are
+      # ephemeral RAM-backed (gone on container restart, never on
+      # disk). 256 MB cap so it doesn't eat the mem_limit.
+      - /tmp:size=256m,mode=1777
+      # /home/app needs to be writable too (npm config cache, node
+      # temp, .gitconfig). Same ephemeral story.
+      - /home/app:size=64m,mode=0700,uid=1100,gid=1100
+      # /home/sandbox is the sandbox user's $HOME (uid 1000). Pi
+      # itself, and every bash subprocess the AI spawns, default
+      # to writing dotfiles + npm/node caches under $HOME. We
+      # ALSO override XDG_CACHE_HOME → /srv/pi/data/.cache (which
+      # is a real bind-mounted volume), so persistent caching
+      # still works for typst packages; this tmpfs covers
+      # transient writes only.
+      - /home/sandbox:size=64m,mode=0700,uid=1000,gid=1000
 
   caddy:
     build:
@@ -142,3 +261,20 @@ services:
     depends_on:
       backend:
         condition: service_started
+
+    # Harden Caddy too. Caddy DOES need CAP_NET_BIND_SERVICE for the
+    # 80/443 listen and CAP_NET_RAW for the underlying syscall; drop
+    # everything else.
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    pids_limit: 256
+    mem_limit: 512m
+    memswap_limit: 512m
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 4096
