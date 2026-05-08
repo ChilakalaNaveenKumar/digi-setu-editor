@@ -46,12 +46,29 @@ WORKSPACES_ROOT = DATA_ROOT / "workspaces"
 # Files the agent expects to see in its cwd (pi auto-loads extensions from
 # package.json, the agent reads AGENTS.md and .pi/APPEND_SYSTEM.md, etc.).
 # These get symlinked into every new sandbox at create time.
+#
+# `node_modules` is symlinked too because pi's extension loader (tsx)
+# does NOT realpath symlinks before module resolution — when it loads
+# `extensions/typst-tools.ts` from the workspace cwd it walks UP from
+# the workspace dir looking for node_modules, NOT from /app/. Without
+# this symlink the very first `require('@google/genai')` inside the
+# extension throws MODULE_NOT_FOUND and pi crashes at boot, taking the
+# whole chat WS down with "bridge is down or pi crashed".
+#
+# Safety: the symlink only grants ACCESS to /app/node_modules contents.
+# Nothing in node_modules is a secret (it's all public npm packages),
+# and pi already needs read access there anyway to function. The AI's
+# bash CAN now `ls workspace/../node_modules/...` but that just lists
+# the same JS files pi loaded itself. Real secrets stay in
+# /opt/pi/stack.env (not in image) and are scrubbed from the env
+# passed to pi by services/pi_session.py:_scrub_env_for_pi.
 SANDBOX_SYMLINKS = (
     "package.json",
     "extensions",
     "guides",
     "AGENTS.md",
     ".pi",
+    "node_modules",
 )
 
 
