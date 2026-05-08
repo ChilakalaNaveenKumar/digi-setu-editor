@@ -17,11 +17,11 @@
 -->
 <script setup lang="ts">
 import { computed } from "vue";
-import { useSessionStore } from "../../stores/session";
+import { useTerminalsStore } from "../../stores/terminals";
 import type { ToolCall } from "../../types/rpc";
 
 const props = defineProps<{ call: ToolCall }>();
-const store = useSessionStore();
+const terminals = useTerminalsStore();
 
 interface ProcessArgs {
   action?: unknown;
@@ -122,14 +122,14 @@ const resultText = computed(() => props.call.result?.text ?? "");
 
 function focusTerminalForProcess(processId: string): void {
   // Open the terminal pane and select this process's bg entry. The
-  // TerminalPane watches `terminalFocusedBgId` and switches its sidebar
+  // TerminalPane watches `focusedBgId` and switches its sidebar
   // selection accordingly.
-  store.setTerminalExpanded(true);
-  store.terminalFocusedBgId = processId;
+  terminals.setExpanded(true);
+  terminals.focusedBgId = processId;
 }
 
 function killProcess(processId: string): void {
-  void store.killBackgroundProcess(processId);
+  void terminals.killBackgroundProcess(processId);
 }
 </script>
 

@@ -1,0 +1,63 @@
+{
+  // Hide runtime / build / dependency junk from the file explorer.
+  // These are real folders on disk (so .gitignore alone won't make
+  // them disappear from the sidebar) — this list is what makes the
+  // tree feel like a clean checkout no matter how many chats exist.
+  "files.exclude": {
+    "**/.git": true,
+    "**/.DS_Store": true,
+    "**/__pycache__": true,
+    "**/*.pyc": true,
+    "**/.pytest_cache": true,
+    "**/.mypy_cache": true,
+    "**/.ruff_cache": true,
+    "**/node_modules": true,
+    "**/.venv": true,
+    "**/venv": true,
+    "**/.vite": true,
+    "**/.cache": true,
+    "**/*.tsbuildinfo": true,
+
+    // Runtime data — workspaces, chats, billing.db, registry, users.
+    // Lives on the VM disk + nightly GCS backup, never on dev laptop.
+    "web/data": true,
+    "data": true,
+    "runs": true,
+    "logs": true,
+
+    // Build output
+    "web/frontend/dist": true,
+    "web/frontend/dist-ssr": true
+  },
+
+  // Keep these out of Ctrl+Shift+F results too. ripgrep already
+  // respects .gitignore but VS Code search has its own list.
+  "search.exclude": {
+    "**/node_modules": true,
+    "**/.venv": true,
+    "**/__pycache__": true,
+    "**/.pytest_cache": true,
+    "web/data": true,
+    "data": true,
+    "runs": true,
+    "logs": true,
+    "web/frontend/dist": true,
+    "**/package-lock.json": true,
+    "**/*.lock": true
+  },
+
+  // Don't burn CPU watching directories that change constantly
+  // (chat JSONL appends, billing.db WAL, hot-reload caches).
+  "files.watcherExclude": {
+    "**/.git/objects/**": true,
+    "**/.git/subtree-cache/**": true,
+    "**/node_modules/**": true,
+    "**/.venv/**": true,
+    "**/__pycache__/**": true,
+    "web/data/**": true,
+    "data/**": true,
+    "runs/**": true,
+    "logs/**": true,
+    "**/.vite/**": true
+  }
+}

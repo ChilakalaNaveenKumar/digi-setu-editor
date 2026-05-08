@@ -12,10 +12,18 @@
 TYPST_AGENT_ENV="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)/../refernecs/typst-agent/backend/.env"
 
 if [[ -f "$TYPST_AGENT_ENV" ]]; then
+  # IMPORTANT: we deliberately DO NOT import TYPST_AGENT_ROUTER_MODEL or
+  # TYPST_AGENT_COMPACT_MODEL anymore. The legacy typst-agent .env points
+  # those at gemini-3.1-flash-lite-preview, which silently leaks into
+  # PI_TYPST_ROUTER_MODEL via the fallback chain below and degrades
+  # search_docs answers (Flash-Lite hand-waves on niche packages).
+  # search_docs MUST run on Haiku unless an operator explicitly exports
+  # PI_TYPST_ROUTER_MODEL themselves; the right place to override it is
+  # web/backend/.env, not the legacy file.
   while IFS='=' read -r key value; do
     case "$key" in
       ""|\#*) continue ;;
-      GOOGLE_GENAI_USE_VERTEXAI|GOOGLE_CLOUD_PROJECT|GOOGLE_CLOUD_LOCATION|TYPST_AGENT_MODEL|TYPST_AGENT_ROUTER_MODEL|TYPST_AGENT_COMPACT_MODEL)
+      GOOGLE_GENAI_USE_VERTEXAI|GOOGLE_CLOUD_PROJECT|GOOGLE_CLOUD_LOCATION|TYPST_AGENT_MODEL)
         value="${value%\"}"; value="${value#\"}"
         value="${value%\'}"; value="${value#\'}"
         existing="$(printenv "$key" 2>/dev/null || true)"
@@ -32,22 +40,42 @@ export GOOGLE_GENAI_USE_VERTEXAI="${GOOGLE_GENAI_USE_VERTEXAI:-true}"
 export GOOGLE_CLOUD_PROJECT="${GOOGLE_CLOUD_PROJECT:-frontend-472812}"
 export GOOGLE_CLOUD_LOCATION="${GOOGLE_CLOUD_LOCATION:-global}"
 
+# ── Custom typst fonts ─────────────────────────────────────────────────────
+# Typst auto-discovers fonts from $TYPST_FONT_PATHS (colon-separated). We
+# bundle ~80 professional fonts in web/backend/fonts/ so the agent can
+# recommend Inter / Lato / Merriweather / FiraCode / Font Awesome / Symbols
+# Nerd / etc. without depending on the host having them installed. Without
+# this export, `typst compile` silently substitutes Linux Libertine for
+# everything and the doc looks wrong.
+PI_TYPST_FONTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)/web/backend/fonts"
+if [[ -d "$PI_TYPST_FONTS_DIR" ]]; then
+  if [[ -z "${TYPST_FONT_PATHS:-}" ]]; then
+    export TYPST_FONT_PATHS="$PI_TYPST_FONTS_DIR"
+  elif [[ ":${TYPST_FONT_PATHS}:" != *":${PI_TYPST_FONTS_DIR}:"* ]]; then
+    export TYPST_FONT_PATHS="${PI_TYPST_FONTS_DIR}:${TYPST_FONT_PATHS}"
+  fi
+fi
+unset PI_TYPST_FONTS_DIR
+
 # ── Map typst-agent model names → pi env vars ─────────────────────────────
 # search_docs uses PI_TYPST_ROUTER_MODEL (read inside typst-tools.ts).
-# DEFAULT: claude-haiku-4-5 on Vertex. Costs ~10× more per call than the old
-# Gemini Flash Lite default, but gets ~90% off via Anthropic prompt caching
-# on follow-up lookups (the corpus block is marked `cache_control: ephemeral`),
-# AND gives substantially better answers for "explain how this codly/touying
-# feature actually works" — which Flash-Lite often hand-waves on.
-# To revert to Flash-Lite for cost: `export PI_TYPST_ROUTER_MODEL=gemini-3.1-flash-lite-preview`.
-export PI_TYPST_ROUTER_MODEL="${PI_TYPST_ROUTER_MODEL:-${TYPST_AGENT_ROUTER_MODEL:-claude-haiku-4-5}}"
-
-# style_guide uses PI_TYPST_DESIGN_MODEL (read inside typst-tools.ts).
-# Flash by default — fast & cheap (~$0.015 per design call). If outputs come
-# back generic / the agent keeps reaching for the same palette, flip to Pro
-# either globally (export below) or per-call (pass model="gemini-3.1-pro-preview"
-# into style_guide).
-export PI_TYPST_DESIGN_MODEL="${PI_TYPST_DESIGN_MODEL:-gemini-3-flash-preview}"
+# DEFAULT: gemini-3-flash-preview on Vertex.
+#
+# Why not Haiku 4.5 anymore: the core Typst corpus (`reference/` + `tutorial/`
+# + `guides/`) is ~210k tokens, which exceeds Haiku's 200k context window
+# and blows up search_docs("typst", …) with a 400. The third-party package
+# corpora (cetz, codly, fletcher, …) all fit comfortably, but we don't want
+# the agent's first instinct — "look up base Typst" — to be a guaranteed
+# failure. Gemini 3 Flash has a 1M context window and costs roughly 6× less
+# per million output tokens than Haiku, and Vertex Gemini does implicit
+# prefix caching so repeated lookups still get a discount.
+#
+# We INTENTIONALLY do not chain through TYPST_AGENT_ROUTER_MODEL. The legacy
+# typst-agent .env still points that var at Flash-Lite (old, smaller model)
+# for backwards-compat with the ADK agent. If you want a different router
+# model, override PI_TYPST_ROUTER_MODEL directly in web/backend/.env or your
+# shell.
+export PI_TYPST_ROUTER_MODEL="${PI_TYPST_ROUTER_MODEL:-gemini-3-flash-preview}"
 
 # web_search uses PI_TYPST_WEB_SEARCH_MODEL. 2.5-flash bills grounding per
 # *prompt* (predictable). The 3.x series bills per *query* and Gemini fans one
@@ -84,6 +112,5 @@ if [[ "${PI_TYPST_ENV_VERBOSE:-0}" == "1" ]]; then
   echo "  PI_PROVIDER           = $PI_PROVIDER"
   echo "  PI_MODEL              = $PI_MODEL"
   echo "  PI_TYPST_ROUTER_MODEL     = $PI_TYPST_ROUTER_MODEL"
-  echo "  PI_TYPST_DESIGN_MODEL     = $PI_TYPST_DESIGN_MODEL"
   echo "  PI_TYPST_WEB_SEARCH_MODEL = $PI_TYPST_WEB_SEARCH_MODEL"
 fi

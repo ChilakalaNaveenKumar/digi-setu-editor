@@ -1,0 +1,81 @@
+# Caddy configuration for the pi-typst-test deployment on
+# digi-setu.com (replaces the legacy typst-agent Caddyfile).
+#
+# Responsibilities:
+#   1. Terminate TLS for digi-setu.com + www (Let's Encrypt DNS-01
+#      against Cloudflare so we don't need port 80 reachable).
+#   2. Serve the static Vue 3 SPA at the apex.
+#   3. Reverse-proxy /api/* to FastAPI on 127.0.0.1:8788 (strip the
+#      /api prefix to match the dev Vite proxy contract).
+#   4. Forward /ws/* (WebSocket — chat + terminal streams) with HTTP/1.1
+#      Upgrade preserved and 24h timeouts so the long-lived sockets
+#      don't get cut by Caddy's idle defaults.
+#
+# Secrets (loaded by docker-compose env_file from /opt/pi/stack.env):
+#   CLOUDFLARE_API_TOKEN   — scoped "Edit zone DNS" for digi-setu.com
+#   ACME_EMAIL             — Let's Encrypt account email
+
+{
+	email {$ACME_EMAIL}
+	acme_dns cloudflare {$CLOUDFLARE_API_TOKEN}
+
+	servers {
+		trusted_proxies static private_ranges
+	}
+}
+
+# Shared snippet: common headers + compression. Keep CSP loose enough
+# for the SPA's inline boot script + dynamic Iconify icon loads.
+(common_headers) {
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		X-Frame-Options "SAMEORIGIN"
+		-Server
+	}
+	encode zstd gzip
+}
+
+# Long-running streaming endpoints (/ws/* WebSockets, /api/* SSE-like).
+# `flush_interval -1` flushes every write — without it Caddy buffers
+# event-stream responses and the UI looks frozen during a chat turn.
+(stream_proxy) {
+	reverse_proxy 127.0.0.1:8788 {
+		flush_interval -1
+		transport http {
+			read_timeout 24h
+			write_timeout 24h
+		}
+	}
+}
+
+digi-setu.com, www.digi-setu.com {
+	import common_headers
+
+	# Backend health straight through so uptime probes hit FastAPI.
+	handle /healthz {
+		reverse_proxy 127.0.0.1:8788
+	}
+
+	# WebSocket: chat (`/ws/sessions/{sid}`) + interactive terminals
+	# (`/ws/terminal/{tid}`). Caddy auto-detects the Upgrade header.
+	handle /ws/* {
+		import stream_proxy
+	}
+
+	# Everything API-shaped under /api/* goes to FastAPI. We don't
+	# strip the prefix because backend routes are already declared as
+	# `/api/...` in the FastAPI routers.
+	handle /api/* {
+		reverse_proxy 127.0.0.1:8788
+	}
+
+	# Static SPA. `try_files` falls through to index.html so Vue Router
+	# wins on hard refreshes of /chat/<sid> etc.
+	handle {
+		root * /srv/pi/www
+		try_files {path} /index.html
+		file_server
+	}
+}

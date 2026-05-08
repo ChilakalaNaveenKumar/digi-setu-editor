@@ -13,10 +13,10 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { storeToRefs } from "pinia";
-import { useSessionStore } from "../stores/session";
+import { useUiStore } from "../stores/ui";
 
-const store = useSessionStore();
-const { confirmDialog } = storeToRefs(store);
+const ui = useUiStore();
+const { confirmDialog } = storeToRefs(ui);
 
 const open = computed(() => confirmDialog.value !== null);
 const confirmBtn = ref<HTMLButtonElement | null>(null);
@@ -30,10 +30,10 @@ watch(open, async (yes) => {
 });
 
 function onConfirm(): void {
-  store.resolveConfirm(true);
+  ui.resolveConfirm(true);
 }
 function onCancel(): void {
-  store.resolveConfirm(false);
+  ui.resolveConfirm(false);
 }
 function onBackdropClick(): void {
   // Backdrop click cancels (matches macOS / VS Code behaviour).

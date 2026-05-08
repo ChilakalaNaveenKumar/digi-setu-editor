@@ -1,0 +1,40 @@
+# /etc/systemd/system/pi.service
+#
+# Wraps the docker-compose stack so the VM boots into a running
+# pi-typst-test deployment. scripts/remote-deploy.sh installs this
+# file and runs `systemctl daemon-reload && systemctl enable --now pi`.
+#
+# Replaces the legacy `typst-agent.service` on the same VM. Both
+# services bind 80/443 via Caddy on host networking, so only one can
+# be up at a time — `cutover-from-typst-agent.sh` swaps them safely.
+
+[Unit]
+Description=pi-typst-test hosted stack — backend + caddy
+Documentation=https://digi-setu.com
+After=network-online.target docker.service pi-prepare.service
+Wants=network-online.target
+Requires=docker.service pi-prepare.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/pi
+EnvironmentFile=/opt/pi/stack.env
+
+# pull+build+up handles first boot & image rotations; --remove-orphans
+# tidies up containers when a service is removed from compose.
+ExecStartPre=/usr/bin/docker compose --env-file /opt/pi/stack.env -f /opt/pi/docker-compose.yml pull --ignore-buildable
+ExecStartPre=/usr/bin/docker compose --env-file /opt/pi/stack.env -f /opt/pi/docker-compose.yml build
+ExecStart=/usr/bin/docker compose --env-file /opt/pi/stack.env -f /opt/pi/docker-compose.yml up -d --remove-orphans
+ExecStop=/usr/bin/docker compose --env-file /opt/pi/stack.env -f /opt/pi/docker-compose.yml down
+
+# `systemctl reload pi` does a rolling pull+up — never down.
+ExecReload=/usr/bin/docker compose --env-file /opt/pi/stack.env -f /opt/pi/docker-compose.yml pull --ignore-buildable
+ExecReload=/usr/bin/docker compose --env-file /opt/pi/stack.env -f /opt/pi/docker-compose.yml up -d --remove-orphans
+
+TimeoutStartSec=600
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

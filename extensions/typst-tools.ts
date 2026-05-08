@@ -7,8 +7,6 @@
  *
  * Tools registered here are only the things bash CAN'T do — i.e. side-LLM calls
  * and network access:
- *   - style_guide    → MANDATORY first call for any new design. Calls Flash to
- *                       author workspace/style/style.typ.
  *   - search_docs    → routes a brief to a Flash-Lite responder loaded with the
  *                       full corpus for one indexed package (typst | cetz |
  *                       fletcher | quill | codly | circuiteria | touying).
@@ -37,6 +35,8 @@ import { GoogleGenAI } from "@google/genai";
 import { AnthropicVertex } from "@anthropic-ai/vertex-sdk";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
+
+import { normalizeAnthropicUsage, normalizeGeminiUsage } from "./usage.js";
 
 const exec = promisify(execFile);
 
@@ -91,8 +91,11 @@ const PACKAGES: PackageSpec[] = [
 const PACKAGE_BY_KEY = new Map(PACKAGES.map((p) => [p.key, p]));
 const VALID_CORPORA = new Set<string>(["typst", ...PACKAGES.map((p) => p.key)]);
 
-const ROUTER_MODEL = process.env.PI_TYPST_ROUTER_MODEL ?? "claude-haiku-4-5";
-const DESIGN_MODEL = process.env.PI_TYPST_DESIGN_MODEL ?? "gemini-3-flash-preview";
+// Default to Gemini 3 Flash because the core Typst corpus is ~210k tokens,
+// past Haiku 4.5's 200k window. Operators can still pin Haiku via
+// PI_TYPST_ROUTER_MODEL=claude-haiku-4-5 if they only ever query third-party
+// packages (cetz/codly/fletcher/…), all of which fit comfortably in 200k.
+const ROUTER_MODEL = process.env.PI_TYPST_ROUTER_MODEL ?? "gemini-3-flash-preview";
 
 // Anthropic-on-Vertex region for the search_docs responder. Default "global"
 // because Claude Haiku 4.5 is GA there. Override via PI_VERTEX_ANTHROPIC_LOCATION.
@@ -181,9 +184,12 @@ function buildResponderParts(query: string, corpusDump: string, corpus: string):
 	const rules = `Another agent will read your reply and use it to write and compile a real Typst artifact. So your reply IS the answer, not a routing memo.
 
 Rules:
-- Be dense and concrete. Show the exact import lines and 5-30 line copy-paste examples.
-- Cite the doc paths you pulled from at the bottom under "Sources:" (one per line, repo-relative paths like guides/touying/themes/02-metropolis.md).
+- Go deep. Don't give an overview — give a full, in-depth explanation. Cover what the relevant symbols do, what each parameter means, and how the pieces compose.
+- Show 2-3 fully-formed copy-paste examples (15-60 lines each). Each example should target a different real use case, not three variations of the same thing. Walk through at least one of them inline so the reader sees why each line is there.
+- Call out non-obvious behaviours, common pitfalls, parameter combinations that matter, and edge cases (units, defaults, scope, layout interactions).
+- Use the exact symbol names and import lines from the corpus. If the question touches multiple packages, say which package owns each symbol.
 - If the corpus genuinely doesn't cover the question, say so plainly in one line; don't invent API.
+- Do NOT print a "Sources" section, a citations footer, or any list of doc paths. The agent doesn't need them.
 - No preamble. No "great question". Just the answer.`;
 
 	return { persona, rules, corpus: corpusDump, query };
@@ -316,246 +322,6 @@ export default function (pi: ExtensionAPI) {
 	// `typst compile --root . --format png main.typ main-{n}.png` then `read`
 	// each png to actually look at the rendered pages before declaring done.
 
-	// ── style_guide ────────────────────────────────────────────────────────
-	pi.registerTool({
-		name: "style_guide",
-		label: "Generate Typst Style Guide",
-		description: [
-			"MANDATORY first action when creating any new Typst document.",
-			"Calls a side-LLM (the 'design worker') to author workspace/style/style.typ — a single Typst file defining colors, fonts, sizes, mood, and layout intent for the document(s) you are about to write.",
-			"Inputs:",
-			"  topic         — what the document is about (audience, purpose, tone). Be specific.",
-			"  hints         — optional user preferences. Pass the user's words verbatim if they expressed any (about look, mood, references, palette, anything). Leave empty if they didn't.",
-			"  available_fonts — optional. If you've already called list_fonts, pass the (filtered) list so the worker can only pick installed fonts. If omitted, the tool fetches them itself.",
-			"After this tool succeeds, every .typ you write must start with `#import \"style/style.typ\": *` and use the variables defined there (primary, secondary, body-font, mood, hero-style, etc.) instead of hardcoded values.",
-			"Re-call when the user asks to redesign — pass their request verbatim through `hints`. Overwrites style.typ.",
-		].join("\n"),
-		promptSnippet:
-			"style_guide(topic, hints?) — MANDATORY first call before writing any new document; produces workspace/style/style.typ with colors/fonts/mood that all .typ files must import",
-		parameters: Type.Object({
-			topic: Type.String({
-				description: "What the document is about. Include audience, purpose, tone (e.g. 'quarterly review deck for fintech executive board').",
-			}),
-			hints: Type.Optional(
-				Type.String({ description: "User preferences for mood/colors/style. Pass verbatim if the user said any." }),
-			),
-			available_fonts: Type.Optional(
-				Type.Array(Type.String(), {
-					description: "Optional list of installed font family names. If omitted, the tool runs `typst fonts` itself.",
-				}),
-			),
-			model: Type.Optional(
-				Type.String({
-					description: `Optional model override. Defaults to PI_TYPST_DESIGN_MODEL env var (currently ${DESIGN_MODEL}). Pass "gemini-3.1-pro-preview" if Flash output keeps coming back generic.`,
-				}),
-			),
-		}),
-		execute: async (_id, params, signal) => {
-			type StyleDetails = {
-				ok: boolean;
-				path?: string;
-				bytes?: number;
-				model?: string;
-				elapsedMs?: number;
-				error?: string;
-			};
-
-			const styleDir = path.join(cwd, "workspace", "style");
-			const stylePath = path.join(styleDir, "style.typ");
-			const t0 = Date.now();
-
-			let fonts = params.available_fonts;
-			if (!fonts || fonts.length === 0) {
-				try {
-					const { stdout } = await exec("typst", ["fonts"], { signal, cwd, maxBuffer: 4 * 1024 * 1024 });
-					fonts = stdout.split("\n").map((l) => l.trim()).filter(Boolean);
-				} catch (err: unknown) {
-					const msg = err instanceof Error ? err.message : String(err);
-					return {
-						content: [{ type: "text" as const, text: `style_guide: failed to enumerate fonts via 'typst fonts': ${msg}` }],
-						details: { ok: false, error: `font enumeration failed: ${msg}` } as StyleDetails,
-						isError: true,
-					};
-				}
-			}
-
-			const fontList = fonts.slice(0, 200).join(", ");
-			const chosenModel = params.model ?? DESIGN_MODEL;
-
-			const systemInstruction = [
-				"You are a senior art director with a strong, opinionated visual eye. You design documents that look like they belong in a design portfolio.",
-				"Your one and only output is the raw contents of a Typst file (style.typ). No prose, no markdown fences, no explanation outside the file's own comment headers.",
-				"You decide the entire visual identity. The variable names below are a fixed contract (the writing agent depends on them); the VALUES are entirely yours.",
-				"Take a real position. A safe, generic, 'professional' design is a worse outcome than a strong design that someone might disagree with.",
-			].join("\n");
-
-			const prompt = `# Brief
-TOPIC: ${params.topic.trim()}
-USER HINTS (verbatim): ${params.hints?.trim() || "(none — you have full creative freedom)"}
-
-# Available fonts (you may ONLY use these family names)
-${fontList}
-
-# Step 1 — Brainstorm (in your head, do NOT output)
-Mentally sketch three substantially different visual directions for this brief. They should differ on at least TWO of:
-  - brightness (light / dark / mid-tone)
-  - color temperature (warm / cool / neutral / mixed)
-  - saturation (muted / vivid)
-  - typographic mood (serif / sans / mixed / display)
-  - density (airy / compact / journal-dense)
-
-Do not list out generic moodboard tropes — invent directions that come from THIS topic and audience specifically. Pick the ONE that fits best and commit to it. If you find yourself defaulting to whatever palette feels "safe" for the topic, pick a different one.
-
-# Step 2 — Author the Typst file (this IS your output)
-
-The file shape below is the contract with the writing agent — variable names are fixed, every VALUE marked <…> is yours. Use any Typst color form: \`rgb("#…")\`, \`rgb(r, g, b)\`, \`oklch(...)\`, named colors (any of the std-lib names), or \`color.lighten()/darken()\`. Use any installed font.
-
-\`\`\`
-// AUTO-GENERATED by style_guide tool. Re-run style_guide to change.
-//
-// MOOD:        <one short kebab-case label that captures THIS design. Invent it. Do not reuse a label you've seen before.>
-// AUDIENCE:    <one short line>
-// REASONING:   <3-5 lines explaining (a) the direction you picked, (b) why it suits THIS topic and audience specifically, (c) at least one direction you deliberately rejected and why>
-//
-// HERO_STYLE:    <one short kebab-case label describing the title-area treatment you intend. Invent it.>
-// SECTION_STYLE: <one short kebab-case label for how body sections should look. Invent it.>
-// CHART_STYLE:   <one short kebab-case label for the chart aesthetic. Invent it.>
-
-// ── Colors — variable names are fixed, values are yours. ──
-#let primary    = <COLOR_PRIMARY>     // the most prominent color in the document (can be background, brand color, ink — your call)
-#let secondary  = <COLOR_SECONDARY>   // a supporting color that complements primary
-#let accent     = <COLOR_ACCENT>      // the one color that draws the eye — used sparingly for emphasis, links, key numbers, dataviz callouts
-#let background = <COLOR_BACKGROUND>  // page fill
-#let surface    = <COLOR_SURFACE>     // card / panel / table-header fill (offset from background for depth)
-#let foreground = <COLOR_FOREGROUND>  // body text — must have strong contrast against background
-#let text-muted = <COLOR_TEXT_MUTED>  // captions, axis labels — readable but visually de-emphasized
-
-// ── Typography (font family strings — pick from the installed list above) ──
-#let body-font     = "<FONT_BODY>"
-#let heading-font  = "<FONT_HEADING>"
-#let mono-font     = "<FONT_MONO>"
-
-// ── Sizes — pick what suits your fonts and the topic. ──
-#let body-size       = <SIZE_BODY>      // any Typst length, e.g. 9pt, 10.5pt, 12pt
-#let heading-weight  = <WEIGHT_HEADING> // 100..900 in steps of 100
-#let line-height     = <LINE_HEIGHT>    // a number; typically between 1.2 and 1.8
-
-// ── Style intent (string copies of the comments above; read by the writing agent) ──
-#let mood          = "<SAME AS MOOD ABOVE>"
-#let hero-style    = "<SAME AS HERO_STYLE ABOVE>"
-#let section-style = "<SAME AS SECTION_STYLE ABOVE>"
-#let chart-style   = "<SAME AS CHART_STYLE ABOVE>"
-
-// ── Chart palette: an ARRAY of colors for CeTZ / Fletcher data series. ──
-// Pick however many entries this design wants — 3 to 10 is the sensible range.
-// 3 if the document mostly does pairwise comparisons. More if it has dashboards
-// or multi-series charts. Each color must be visually distinct from its neighbours
-// AND readable over background.
-#let chart-palette = (<DATA_COLOR_1>, <DATA_COLOR_2>, <DATA_COLOR_N…>)
-\`\`\`
-
-# Rules
-- Output ONLY the Typst source. No prose before or after. No \`\`\`typst fences around it.
-- Every \`<…>\` slot must be filled with a real value. No placeholders left.
-- The four MOOD/HERO/SECTION/CHART string values must match their comment-header counterparts exactly.
-- Fonts must come from the installed list. If your ideal font isn't there, pick the closest installed family.
-- foreground must be readable on background. accent must be readable on both background and surface.
-- chart-palette is a Typst array \`(c1, c2, ...)\` of at least 3 colors; no maximum.
-- Take a real position. Generic "safe" designs are a worse outcome than a strong design someone might disagree with.`;
-
-			let raw: string;
-			try {
-				const client = getGenai();
-				const res = await client.models.generateContent({
-					model: chosenModel,
-					contents: prompt,
-					config: {
-						temperature: 0.95,
-						maxOutputTokens: 4_000,
-						systemInstruction,
-					},
-				});
-				raw = (res.text ?? "").trim();
-			} catch (err: unknown) {
-				const msg = err instanceof Error ? err.message : String(err);
-				return {
-					content: [{ type: "text" as const, text: `style_guide: design model ${chosenModel} failed: ${msg}` }],
-					details: { ok: false, error: msg, model: chosenModel } as StyleDetails,
-					isError: true,
-				};
-			}
-
-			let body = raw.replace(/^```(?:typst)?\s*\n/, "").replace(/\n```\s*$/, "").trim();
-			if (!body) {
-				return {
-					content: [{ type: "text" as const, text: `style_guide: design model returned empty content` }],
-					details: { ok: false, error: "empty response", model: chosenModel } as StyleDetails,
-					isError: true,
-				};
-			}
-			if (!body.endsWith("\n")) body += "\n";
-
-			await fs.mkdir(styleDir, { recursive: true });
-			await fs.writeFile(stylePath, body, "utf8");
-
-			const testTypPath = path.join(styleDir, ".style-test.typ");
-			const testContent =
-				`#import "style.typ": primary, secondary, body-font, heading-font, mood, hero-style\n` +
-				`#set page(width: 100pt, height: 50pt)\n` +
-				`#set text(font: body-font)\n` +
-				`#text(fill: primary)[ok]\n`;
-			await fs.writeFile(testTypPath, testContent, "utf8");
-
-			let compileError: string | null = null;
-			try {
-				await exec("typst", ["compile", "--root", cwd, testTypPath, "/dev/null"], {
-					signal,
-					cwd,
-					maxBuffer: 2 * 1024 * 1024,
-				});
-			} catch (err: unknown) {
-				const e = err as { stderr?: string; stdout?: string; message?: string };
-				compileError = (e.stderr || e.stdout || e.message || String(err)).trim();
-			} finally {
-				await fs.unlink(testTypPath).catch(() => {});
-			}
-
-			const elapsed = Date.now() - t0;
-
-			if (compileError) {
-				const compact = compileError.split("\n").slice(0, 30).join("\n");
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text:
-								`style_guide: wrote workspace/style/style.typ (${body.length} bytes) BUT it does not compile:\n${compact}\n\n` +
-								`The file was kept on disk so you can inspect it. Either edit it, or call style_guide again with clearer hints.`,
-						},
-					],
-					details: {
-						ok: false,
-						path: "workspace/style/style.typ",
-						bytes: body.length,
-						model: chosenModel,
-						elapsedMs: elapsed,
-						error: `compile failed: ${compact}`,
-					} as StyleDetails,
-					isError: true,
-				};
-			}
-
-			const moodMatch = body.match(/^\/\/\s*MOOD:\s*(.+)$/m);
-			const heroMatch = body.match(/^\/\/\s*HERO_STYLE:\s*(.+)$/m);
-			const summary = `Wrote workspace/style/style.typ (${body.length} bytes, ${elapsed}ms, model: ${chosenModel}). Mood: ${moodMatch?.[1]?.trim() ?? "?"}, hero: ${heroMatch?.[1]?.trim() ?? "?"}. Compile-tested OK. All .typ files you write next must \`#import "style/style.typ": *\`.`;
-
-			return {
-				content: [{ type: "text" as const, text: summary }],
-				details: { ok: true, path: "workspace/style/style.typ", bytes: body.length, model: chosenModel, elapsedMs: elapsed } as StyleDetails,
-			};
-		},
-	});
-
 	// ── search_docs ────────────────────────────────────────────────────────
 	pi.registerTool({
 		name: "search_docs",
@@ -574,7 +340,7 @@ The file shape below is the contract with the writing agent — variable names a
 			"Returns the responder's freeform markdown answer plus the doc paths it cited.",
 		].join("\n"),
 		promptSnippet:
-			"search_docs(query, package) — Flash-Lite responder loaded with full corpus for one package; returns dense answer + cited paths",
+			"search_docs(query, package) — responder LLM loaded with the full corpus for one package; returns an in-depth answer.",
 		parameters: Type.Object({
 			query: Type.String({ description: "Concrete brief. Include symbol names, error text, what you're trying to build." }),
 			package: Type.Union(
@@ -591,6 +357,9 @@ The file shape below is the contract with the writing agent — variable names a
 			),
 		}),
 		execute: async (_id, params) => {
+			// `usage` is the contract the host ledger expects: same field names
+			// as pi's message_end.usage so estimate_prompt_cost can be reused
+			// verbatim. `model` lets the ledger price it correctly per provider.
 			type SearchDetails = {
 				ok: boolean;
 				package?: string;
@@ -598,6 +367,13 @@ The file shape below is the contract with the writing agent — variable names a
 				elapsedMs?: number;
 				fallback?: string;
 				error?: string;
+				usage?: {
+					input: number;
+					output: number;
+					cacheRead: number;
+					cacheWrite: number;
+					model: string;
+				};
 			};
 			if (!VALID_CORPORA.has(params.package)) {
 				const details: SearchDetails = { ok: false, error: `invalid package ${params.package}` };
@@ -658,12 +434,12 @@ The file shape below is the contract with the writing agent — variable names a
 						.map((b) => (b as { text: string }).text)
 						.join("\n")
 						.trim();
-					inputTok = res.usage?.input_tokens ?? 0;
-					outputTok = res.usage?.output_tokens ?? 0;
 					// biome-ignore lint/suspicious/noExplicitAny: cache fields not on typed Usage yet
-					const u = res.usage as any;
-					cacheRead = u?.cache_read_input_tokens ?? 0;
-					cacheWrite = u?.cache_creation_input_tokens ?? 0;
+					const norm = normalizeAnthropicUsage(res.usage as any);
+					inputTok = norm.input;
+					outputTok = norm.output;
+					cacheRead = norm.cacheRead;
+					cacheWrite = norm.cacheWrite;
 				} else {
 					// ── Gemini path: implicit prefix cache, single concatenated prompt.
 					const prompt = buildResponderPrompt(params.query, corpusText, params.package);
@@ -677,9 +453,14 @@ The file shape below is the contract with the writing agent — variable names a
 						},
 					});
 					raw = (res.text ?? "").trim();
-					inputTok = res.usageMetadata?.promptTokenCount ?? 0;
-					outputTok = res.usageMetadata?.candidatesTokenCount ?? 0;
-					cacheRead = res.usageMetadata?.cachedContentTokenCount ?? 0;
+					// normalizeGeminiUsage handles the prompt-vs-cached subtraction
+					// and folds reasoning tokens into output so the host ledger
+					// can't double-count them. See helper docstring.
+					const norm = normalizeGeminiUsage(res.usageMetadata);
+					inputTok = norm.input;
+					outputTok = norm.output;
+					cacheRead = norm.cacheRead;
+					cacheWrite = norm.cacheWrite;
 				}
 
 				if (!raw) {
@@ -690,17 +471,33 @@ The file shape below is the contract with the writing agent — variable names a
 						isError: true,
 					};
 				}
+				// `cited` is still parsed (so the audit trail under
+				// `details.cited` keeps working for ops debugging), but we
+				// never render it back into the chat: the Sources footer
+				// is noise the agent doesn't need and the user doesn't
+				// want to see.
 				const { answer, cited } = splitAnswerAndSources(raw);
 				const elapsed = Date.now() - t0;
 				const tokInfo =
 					cacheRead || cacheWrite
 						? `in=${inputTok} (cached_read=${cacheRead}${cacheWrite ? ` cached_write=${cacheWrite}` : ""}) out=${outputTok}`
 						: `in=${inputTok} out=${outputTok}`;
-				const header = `Package: ${params.package} · model: ${ROUTER_MODEL} · ${elapsed}ms · ${cited.length} sources · ${tokInfo}`;
-				const sources = cited.length ? `\n\nSources:\n${cited.map((p) => `- ${p}`).join("\n")}` : "";
-				const details: SearchDetails = { ok: true, package: params.package, cited, elapsedMs: elapsed };
+				const header = `Package: ${params.package} · model: ${ROUTER_MODEL} · ${elapsed}ms · ${tokInfo}`;
+				const details: SearchDetails = {
+					ok: true,
+					package: params.package,
+					cited,
+					elapsedMs: elapsed,
+					usage: {
+						input: inputTok,
+						output: outputTok,
+						cacheRead,
+						cacheWrite,
+						model: ROUTER_MODEL,
+					},
+				};
 				return {
-					content: [{ type: "text" as const, text: `${header}\n\n${answer}${sources}` }],
+					content: [{ type: "text" as const, text: `${header}\n\n${answer}` }],
 					details,
 				};
 			} catch (err: unknown) {
@@ -772,6 +569,8 @@ The file shape below is the contract with the writing agent — variable names a
 			}),
 		}),
 		execute: async (_id, params) => {
+			// `usage` follows the same contract as search_docs so the host
+			// ledger bills the user for the grounded-search LLM call.
 			type WebSearchDetails = {
 				ok: boolean;
 				model?: string;
@@ -779,6 +578,13 @@ The file shape below is the contract with the writing agent — variable names a
 				sources?: { uri: string; title?: string }[];
 				elapsedMs?: number;
 				error?: string;
+				usage?: {
+					input: number;
+					output: number;
+					cacheRead: number;
+					cacheWrite: number;
+					model: string;
+				};
 			};
 
 			const q = params.query.trim();
@@ -852,9 +658,24 @@ The file shape below is the contract with the writing agent — variable names a
 					sources.map((s) => (s.title ? `- [${s.title}](${s.uri})` : `- ${s.uri}`)).join("\n")
 				: "";
 
+			const wsUsage = normalizeGeminiUsage(res.usageMetadata);
+
 			return {
 				content: [{ type: "text" as const, text: `${headerParts.join("\n")}\n\n${body}${sourcesBlock}` }],
-				details: { ok: true, model: WEB_SEARCH_MODEL, queries, sources, elapsedMs: elapsed } as WebSearchDetails,
+				details: {
+					ok: true,
+					model: WEB_SEARCH_MODEL,
+					queries,
+					sources,
+					elapsedMs: elapsed,
+					usage: {
+						input: wsUsage.input,
+						output: wsUsage.output,
+						cacheRead: wsUsage.cacheRead,
+						cacheWrite: wsUsage.cacheWrite,
+						model: WEB_SEARCH_MODEL,
+					},
+				} as WebSearchDetails,
 			};
 		},
 	});

@@ -1,0 +1,30 @@
+# Don't bloat the backend build context with frontend assets, tests,
+# dev caches, or git history.
+.git
+.gitignore
+**/.DS_Store
+**/__pycache__
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+**/.venv
+**/.cache
+**/.cursor
+
+# Frontend build output never goes into the backend image (Caddy
+# serves it from the host volume).
+web/frontend/node_modules
+web/frontend/dist
+web/frontend/.vite
+
+# Backend dev artefacts.
+web/backend/.venv
+web/backend/.pytest_cache
+web/backend/__pycache__
+web/data
+
+# Misc.
+deploy/scripts
+deploy/Dockerfile.frontend
+*.log
+patches/backups

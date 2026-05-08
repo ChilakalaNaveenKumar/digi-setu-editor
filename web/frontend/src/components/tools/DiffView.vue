@@ -15,6 +15,7 @@
 -->
 <script setup lang="ts">
 import { html as d2hHtml } from "diff2html";
+import { ColorSchemeType } from "diff2html/lib/types";
 import { computed, onUnmounted, ref, watch } from "vue";
 
 const props = withDefaults(
@@ -81,7 +82,7 @@ function renderNow(): void {
       drawFileList: false,
       matching: "lines",
       outputFormat: "line-by-line",
-      colorScheme: "dark",
+      colorScheme: ColorSchemeType.DARK,
     });
   } catch (exc) {
     console.warn("[DiffView] diff2html failed", exc);

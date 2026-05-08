@@ -2,9 +2,10 @@
   MessageList — vertical chat column.
 
   We tried virtualizing this with `vue-virtual-scroller`'s DynamicScroller
-  but it caused real layout bugs: the per-message UsageChip (which arrives
-  AFTER text streaming completes) ended up scrolled below the visible area
-  because the scroller's measurement raced with our scroll-to-bottom call.
+  but it caused real layout bugs: late-arriving message footers (e.g. the
+  prior UsageChip, error banners, tool cards that hydrate post-stream)
+  ended up scrolled below the visible area because the scroller's
+  measurement raced with our scroll-to-bottom call.
   Reverted to a simple `v-for` list — same approach the reference codebase
   (pi-mono-main `MessageList`) uses with great results. We can re-add
   virtualization when we actually have thousands of messages and have
@@ -80,7 +81,7 @@ onMounted(() => {
   <div class="relative flex h-full min-h-0 w-full flex-col">
     <div
       ref="scroller"
-      class="flex-1 overflow-y-auto px-3 pb-4"
+      class="flex-1 overflow-y-auto px-5 pb-6 pt-3"
       @scroll="onScroll"
     >
       <div

@@ -10,14 +10,16 @@
   far more legible.
 -->
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, nextTick, onMounted, onUpdated, ref } from "vue";
 import { renderMarkdown } from "../lib/markdown";
+import { enhanceCodeBlocks } from "../lib/code-block-enhance";
 import type { AssistantMessage } from "../types/rpc";
 import ThinkingBlock from "./ThinkingBlock.vue";
 import ToolCardDispatch from "./tools/ToolCardDispatch.vue";
-import UsageChip from "./UsageChip.vue";
 
 const props = defineProps<{ message: AssistantMessage }>();
+
+const root = ref<HTMLElement | null>(null);
 
 /**
  * If the very last part is `text` and the message is still streaming,
@@ -31,10 +33,20 @@ const lastPart = computed(() => {
 function htmlOf(text: string): string {
   return text.trim() ? renderMarkdown(text) : "";
 }
+
+// Wire copy buttons onto every fenced code block on first paint AND on
+// every streamed update. enhanceCodeBlocks() is idempotent (uses a
+// data-attr marker) so calling it on every `onUpdated` is cheap.
+onMounted(() => {
+  void nextTick(() => enhanceCodeBlocks(root.value));
+});
+onUpdated(() => {
+  void nextTick(() => enhanceCodeBlocks(root.value));
+});
 </script>
 
 <template>
-  <div class="my-3 px-1">
+  <div ref="root" class="my-5 px-1">
     <template v-for="part in message.parts" :key="part.id">
       <ThinkingBlock
         v-if="part.kind === 'thinking'"
@@ -61,8 +73,6 @@ function htmlOf(text: string): string {
       v-if="!message.done && lastPart?.kind === 'text' && lastPart.text.length > 0"
       class="ml-0.5 inline-block h-4 w-2 align-text-bottom bg-foreground animate-pulse"
     />
-
-    <UsageChip :usage="message.usage" />
 
     <div
       v-if="message.error"

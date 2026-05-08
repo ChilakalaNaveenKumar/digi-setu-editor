@@ -22,13 +22,15 @@
 -->
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
-import { isBackgroundCommand, useSessionStore } from "../../stores/session";
+import { useChatStore } from "../../stores/chat";
+import { isBackgroundCommand, useTerminalsStore } from "../../stores/terminals";
 import { getHighlighter } from "../../lib/highlighter";
 import type { ToolCall } from "../../types/rpc";
 
 const props = defineProps<{ call: ToolCall }>();
 
-const store = useSessionStore();
+const chat = useChatStore();
+const terminals = useTerminalsStore();
 
 /** True when the command will likely fork a long-running background process. */
 const isBackground = computed(() => isBackgroundCommand(command.value));
@@ -220,7 +222,14 @@ async function copyOutput(): Promise<void> {
 }
 
 function openInTerminal(): void {
-  store.focusTerminal(props.call.id);
+  // Pin this bash call into the terminal pane (it isn't there by
+  // default — the user opted in by clicking this menu item), then
+  // expand the pane and focus the new entry. The watch in
+  // TerminalPane.vue picks up `focusedToolCallId` and selects the
+  // matching tab.
+  terminals.pinBashCall(props.call.id);
+  terminals.setExpanded(true);
+  terminals.focusToolCall(props.call.id);
   closeMenu();
 }
 
@@ -228,11 +237,11 @@ function stopRunning(): void {
   // pi RPC abort kills the WHOLE turn (and SIGKILL on the bash process
   // group). It's the only stop hook pi exposes, but for the user this is
   // the expected behaviour: "stop what the agent is doing right now".
-  store.abort();
+  chat.abort();
 }
 
 function rerun(): void {
-  store.rerunBashCommand(command.value);
+  terminals.rerunBashCommand(command.value);
   closeMenu();
 }
 

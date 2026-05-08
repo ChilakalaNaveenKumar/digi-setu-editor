@@ -11,12 +11,12 @@
 -->
 <script setup lang="ts">
 import { computed } from "vue";
-import { useSessionStore } from "../../stores/session";
+import { useFilesStore } from "../../stores/files";
 import type { ToolCall } from "../../types/rpc";
 import CompactToolChip from "./CompactToolChip.vue";
 
 const props = defineProps<{ call: ToolCall }>();
-const store = useSessionStore();
+const files = useFilesStore();
 
 interface ReadArgs {
   path?: unknown;
@@ -72,7 +72,7 @@ const main = computed(() => `${displayPath.value}${lineRange.value}`);
 
 function open(): void {
   if (!inWorkspace.value) return;
-  void store.openFile(fullPath.value);
+  void files.openFile(fullPath.value);
 }
 </script>
 

@@ -1,0 +1,53 @@
+# /etc/systemd/system/pi-prepare.service
+#
+# One-shot unit that runs BEFORE pi.service on every boot.
+# Materialises the on-disk layout under /srv/pi with the
+# ownership + mode the docker-compose volumes expect:
+#
+#   /srv/pi/state    0700 root:root      auth.db, JWT key (root-only)
+#   /srv/pi/data     0700 1100:1100      registry.json, workspaces, chats, shadows
+#   /srv/pi/www      0755 root:root      SPA bundle (RO into Caddy)
+#   /srv/caddy/{data,config}             Caddy state
+#   /opt/pi          0700 root:root      compose + stack.env (root-only)
+#
+# uid 1100 inside the backend container is the `app` user defined in
+# Dockerfile.backend. We chown by NUMBER (not by name) on the host so
+# the script is idempotent across boots and doesn't depend on a host
+# `app` user existing.
+
+[Unit]
+Description=pi-typst-test — prepare /srv/pi layout
+Before=pi.service
+After=local-fs.target
+RequiresMountsFor=/srv
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# State — root-only. Host the bearer-token JWT key + auth.db here.
+ExecStart=/usr/bin/install -d -m 0700 -o 0    -g 0    /srv/pi/state
+
+# Workspaces / chats / shadows — owned by uid 1100 so the backend
+# (which runs as the `app` user inside the container) can RW everything.
+# In v1.1 we'll subdivide /srv/pi/data/users/<uid>/ with mode 0700
+# 1000:1000 so a runuser-dropped bash sandbox can only see its own
+# tenant's tree.
+ExecStart=/usr/bin/install -d -m 0700 -o 1100 -g 1100 /srv/pi/data
+ExecStart=/usr/bin/install -d -m 0700 -o 1100 -g 1100 /srv/pi/data/workspaces
+ExecStart=/usr/bin/install -d -m 0700 -o 1100 -g 1100 /srv/pi/data/chats
+ExecStart=/usr/bin/install -d -m 0700 -o 1100 -g 1100 /srv/pi/data/shadows
+
+# SPA bundle (Caddy mounts read-only).
+ExecStart=/usr/bin/install -d -m 0755 -o 0    -g 0    /srv/pi/www
+
+# Caddy state.
+ExecStart=/usr/bin/install -d -m 0700 -o 0    -g 0    /srv/caddy/data
+ExecStart=/usr/bin/install -d -m 0700 -o 0    -g 0    /srv/caddy/config
+
+# Deployment manifests + secrets stay root-only. stack.env is created
+# by remote-deploy.sh from local secrets.
+ExecStart=/usr/bin/install -d -m 0700 -o 0    -g 0    /opt/pi
+
+[Install]
+WantedBy=pi.service

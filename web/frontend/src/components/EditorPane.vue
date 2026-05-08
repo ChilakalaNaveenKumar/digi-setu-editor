@@ -29,15 +29,20 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { storeToRefs } from "pinia";
 import { Icon } from "@iconify/vue";
-import { useSessionStore } from "../stores/session";
+import { useFilesStore } from "../stores/files";
+import { useSnapshotsStore } from "../stores/snapshots";
+import { useUiStore } from "../stores/ui";
 import { highlightLines, langForPath } from "../lib/highlighter";
 import DiffView from "./tools/DiffView.vue";
 import CodeEditor from "./CodeEditor.vue";
 import EditorTabs from "./EditorTabs.vue";
 import FilePreview from "./FilePreview.vue";
 
-const store = useSessionStore();
-const { currentFile, editorReview } = storeToRefs(store);
+const files = useFilesStore();
+const snapshots = useSnapshotsStore();
+const ui = useUiStore();
+const { currentFile } = storeToRefs(files);
+const { editorReview } = storeToRefs(snapshots);
 
 const inReview = computed(() => editorReview.value !== null);
 /**
@@ -87,7 +92,7 @@ function onDirty(next: boolean): void {
   // Mirror the dirty flag onto the corresponding tab so the strip can
   // show a ● indicator and prompt before close.
   const p = currentFile.value?.path;
-  if (p) store.setTabDirty(p, next);
+  if (p) files.setTabDirty(p, next);
 }
 
 async function onSave(content: string): Promise<void> {
@@ -96,7 +101,7 @@ async function onSave(content: string): Promise<void> {
   saving.value = true;
   saveError.value = null;
   try {
-    await store.saveFile(path, content);
+    await files.saveFile(path, content);
   } catch (exc) {
     saveError.value = exc instanceof Error ? exc.message : String(exc);
   } finally {
@@ -121,7 +126,7 @@ watch(
 function closeFile(): void {
   // closeCurrentFile() routes through closeTab() which already runs the
   // dirty-state confirm; nothing more to do here.
-  store.closeCurrentFile();
+  files.closeCurrentFile();
 }
 
 const copyFlash = ref<"content" | "path" | null>(null);
@@ -150,20 +155,20 @@ async function copyPath(): Promise<void> {
 async function deleteOpenFile(): Promise<void> {
   const f = currentFile.value;
   if (!f?.path) return;
-  const ok = await store.confirm({
+  const ok = await ui.confirm({
     title: "Delete file?",
     description: `"${f.path}" will be deleted from the workspace. This cannot be undone.`,
     confirmLabel: "Delete",
     variant: "destructive",
   });
   if (!ok) return;
-  await store.deletePath(f.path);
+  await files.deletePath(f.path);
 }
 
 /** Esc to exit review mode — matches Cursor's keymap. */
 function onKeydown(e: KeyboardEvent): void {
   if (e.key === "Escape" && inReview.value) {
-    store.exitReviewMode();
+    snapshots.exitReviewMode();
   }
 }
 onMounted(() => window.addEventListener("keydown", onKeydown));
@@ -376,7 +381,7 @@ watch(
           type="button"
           class="rounded-sm border border-border bg-background px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
           title="Back to file (Esc)"
-          @click="store.exitReviewMode()"
+          @click="snapshots.exitReviewMode()"
         >
           ← back
         </button>

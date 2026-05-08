@@ -18,13 +18,19 @@
   Audio      → <audio controls>
   Video      → <video controls>
 
-  All previews fetch via /api/files/raw which streams with the right
-  Content-Type — nothing is read into JS memory.
+  All previews fetch via /api/workspaces/{wsid}/files/raw which streams with
+  the right Content-Type — nothing is read into JS memory. The store builds
+  the URL via `rawFileUrl()` so the active workspace id stays implicit.
 -->
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { Icon } from "@iconify/vue";
 import panzoom, { type PanZoom } from "panzoom";
+
+import { useUiStore } from "../stores/ui";
+import { useWorkspaceStore } from "../stores/workspace";
+
+import AnnotateOverlay from "./AnnotateOverlay.vue";
 
 const props = defineProps<{
   path: string;
@@ -37,6 +43,9 @@ const emit = defineEmits<{
   (e: "toggle-svg-mode", showAsCode: boolean): void;
 }>();
 
+const workspace = useWorkspaceStore();
+const ui = useUiStore();
+
 // Cache-buster: when the file path changes (or e.g. after a save) we want
 // the browser to refetch the bytes instead of using a stale cached copy.
 const bust = ref(Date.now());
@@ -44,9 +53,7 @@ watch(
   () => props.path,
   () => (bust.value = Date.now()),
 );
-const rawUrl = computed(
-  () => `/api/files/raw?path=${encodeURIComponent(props.path)}&t=${bust.value}`,
-);
+const rawUrl = computed(() => `${workspace.rawFileUrl(props.path)}&t=${bust.value}`);
 
 // PDF viewer URL fragment.
 //   navpanes=0    → collapse the thumbnail sidebar by default.
@@ -222,6 +229,61 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
 function toggleSvgMode(): void {
   emit("toggle-svg-mode", !props.showAsCode);
 }
+
+// ── Annotate / send-feedback ────────────────────────────────────────────
+//
+// Clicking "Annotate" opens a full-screen modal where the user drags one
+// rectangle around what they want feedback on. A sticky-note pops up
+// next to the box for the comment + extra attachments (paperclip, paste,
+// drop). Hitting Send inside the modal does everything: composites the
+// screenshot, uploads it (and any extras) into workspace/uploads/, drops
+// the agent paths into the composer's pendingAttachments, and fires the
+// comment as a chat message (or queues it if pi is busy). All this
+// component does is wire the open/close lifecycle.
+const annotateOpen = ref(false);
+const annotateImageUrl = ref<string | null>(null);
+const annotatePdfUrl = ref<string | null>(null);
+const annotateSubtitle = ref<string | undefined>(undefined);
+const annotateDefaultName = ref<string>("annotation.png");
+
+const canAnnotate = computed(
+  () =>
+    props.kind === "image" ||
+    (props.kind === "svg" && !props.showAsCode) ||
+    props.kind === "pdf",
+);
+
+function _baseName(p: string): string {
+  const last = p.split("/").pop() || "annotation";
+  return last.replace(/\.[^.]+$/, "").replace(/\s+/g, "_");
+}
+
+function startAnnotate(): void {
+  if (!workspace.activeId) {
+    ui.toastError("Annotate", new Error("no active workspace"));
+    return;
+  }
+  const base = _baseName(props.path);
+  if (props.kind === "pdf") {
+    annotatePdfUrl.value = rawUrl.value;
+    annotateImageUrl.value = null;
+    annotateSubtitle.value = "PDF";
+  } else {
+    annotateImageUrl.value = rawUrl.value;
+    annotatePdfUrl.value = null;
+    annotateSubtitle.value = props.kind;
+  }
+  annotateDefaultName.value = `${base}.annot`;
+  annotateOpen.value = true;
+}
+
+function onAnnotateSent(): void {
+  annotateOpen.value = false;
+}
+
+function onAnnotateCancel(): void {
+  annotateOpen.value = false;
+}
 </script>
 
 <template>
@@ -239,6 +301,15 @@ function toggleSvgMode(): void {
         <span>PDF preview</span>
         <span class="text-[10px] opacity-60">· toolbar inside viewer · Ctrl/⌘ + scroll to zoom</span>
       </div>
+      <button
+        type="button"
+        class="flex items-center gap-1 rounded border border-border bg-background px-2 py-0.5 text-[11px] font-medium hover:border-warning/40 hover:bg-warning/10 hover:text-warning"
+        title="Mark up any page of this PDF and attach to your next message"
+        @click="startAnnotate"
+      >
+        <Icon icon="codicon:edit" class="h-3.5 w-3.5" />
+        Annotate
+      </button>
     </div>
 
     <!-- Toolbar (zoom + svg toggle for images / svg) -->
@@ -255,6 +326,16 @@ function toggleSvgMode(): void {
         <span class="text-[10px] opacity-60">· scroll = zoom · drag = pan · 0/F = reset</span>
       </div>
       <div class="flex items-center gap-0.5">
+        <button
+          v-if="canAnnotate"
+          type="button"
+          class="mr-2 flex items-center gap-1 rounded-sm border border-border bg-background px-1.5 py-0.5 text-[11px] font-medium hover:border-warning/40 hover:bg-warning/10 hover:text-warning"
+          title="Mark up this file and attach to your next message"
+          @click="startAnnotate"
+        >
+          <Icon icon="codicon:edit" class="h-3 w-3" />
+          Annotate
+        </button>
         <button
           v-if="kind === 'svg'"
           type="button"
@@ -344,6 +425,18 @@ function toggleSvgMode(): void {
         class="max-h-full max-w-full"
       ></video>
     </div>
+
+    <!-- Annotation overlay (modal). Only rendered when active so the
+         heavy canvas + pdfjs runtime aren't paid for on every preview. -->
+    <AnnotateOverlay
+      v-if="annotateOpen"
+      :image-url="annotateImageUrl ?? undefined"
+      :pdf-url="annotatePdfUrl ?? undefined"
+      :default-name="annotateDefaultName"
+      :subtitle="annotateSubtitle"
+      @sent="onAnnotateSent"
+      @cancel="onAnnotateCancel"
+    />
   </div>
 </template>
 

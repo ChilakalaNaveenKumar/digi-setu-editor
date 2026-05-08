@@ -1,0 +1,127 @@
+# pi-typst-test backend image for the hosted deployment (digi-setu.com).
+#
+# Mirrors the layout of the legacy typst-agent stack but adapted to the
+# pi-coding-agent runtime: FastAPI (Python) is the public surface and pi
+# itself is a Node CLI we shell out to per chat session.
+#
+# Threat model recap (v1, BEFORE the runuser sandbox lands in v1.1):
+#   * the AI runs as the same uid as the backend ("app", uid 1100). All
+#     filesystem-touching tools (write/edit/read/bash) are bounded by
+#     the workspace path the agent's `cwd` was set to.
+#   * /opt/pi/stack.env (deployed secrets) is mounted 0600 root and the
+#     backend opens it once at boot via systemd EnvironmentFile, then
+#     drops to uid 1100 — the AI literally cannot read it.
+#   * /srv/pi/state (auth.db, JWT key, registry.json) is 0700 root and
+#     the backend mediates every read.
+#
+# Phase-5 (web hardening): swap the workspace cwd execve into a runuser
+# drop the same way typst-agent does so even an `ls /` from inside the
+# AI shows nothing it shouldn't.
+#
+# Contents:
+#   - Python 3.11 (slim-bookworm) + uvicorn + watchdog
+#   - Node 22 (the pi-coding-agent runtime)
+#   - The repo's package.json deps + the pi vertex-anthropic patch
+#   - tini (PID 1, reaps zombies — the agent forks bash + bg processes)
+#   - git (shadow-git per workspace), curl, ca-certs
+
+ARG PYTHON_VERSION=3.11.10
+ARG NODE_MAJOR=22
+
+FROM python:${PYTHON_VERSION}-slim-bookworm AS runtime
+
+ARG NODE_MAJOR
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# OS packages — kept in one RUN to keep the layer monolithic and clean
+# the apt lists at the end so the image stays small.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        gnupg \
+        tini \
+ && curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - \
+ && apt-get install -y --no-install-recommends nodejs \
+ && rm -rf /var/lib/apt/lists/*
+
+# ── App user ─────────────────────────────────────────────────────────
+# uid 1100 deliberately ≠ 1000 (typst). When we move to a per-tenant
+# runuser sandbox in v1.1, the sandbox uid stays at 1000 like
+# typst-agent and the backend service stays at 1100 — the kernel checks
+# "uid 1000 ≠ uid 1100" without us having to maintain ACLs.
+RUN groupadd --system --gid 1100 app \
+ && useradd  --system --uid 1100 --gid 1100 --home-dir /home/app --create-home --shell /usr/sbin/nologin app
+
+WORKDIR /app
+
+# ── Python deps ───────────────────────────────────────────────────────
+COPY web/backend/requirements.txt ./web/backend/requirements.txt
+RUN pip install --no-cache-dir -r web/backend/requirements.txt
+
+# ── pi-coding-agent + project npm tree ────────────────────────────────
+# package.json declares pi as a devDependency, so we keep dev deps so
+# `pi --extension ./extensions/typst-tools.ts` resolves to the same
+# version as the operator runs locally. node_modules ends up at /app/
+# node_modules just like in dev.
+COPY package.json package-lock.json* ./
+RUN npm install --no-audit --no-fund \
+ && ln -sf /app/node_modules/.bin/pi /usr/local/bin/pi
+
+# ── Provider patches ──────────────────────────────────────────────────
+# The anthropic-vertex provider patch lives in patches/. Apply it once
+# at build time so every container boot inherits the patched provider.
+# The script honours PI_PKG_GLOBAL — point it at our local install.
+COPY patches/ ./patches/
+RUN PI_PKG_GLOBAL=/app/node_modules/@mariozechner/pi-coding-agent \
+    bash patches/apply.sh \
+ && pi --version >/dev/null
+
+# ── Source + extension assets ─────────────────────────────────────────
+# These end up at /app/{extensions,guides,AGENTS.md,.pi,scripts,web} —
+# the same layout dev runs against, so PROJECT_ROOT calculations in
+# config.py / pi_session.py give the same answer.
+COPY extensions/ ./extensions/
+COPY guides/ ./guides/
+COPY AGENTS.md ./AGENTS.md
+COPY .pi/ ./.pi/
+COPY scripts/ ./scripts/
+COPY web/backend/ ./web/backend/
+
+# Lock the deployed code down. The backend (uid 1100) reads it; pi
+# subprocesses inherit that uid for now (v1) but in v1.1 the runuser
+# drop means uid 1000 is on the read-list ONLY for /srv/pi/users.
+RUN chown -R root:app /app \
+ && find /app -type d -exec chmod 0750 {} + \
+ && find /app -type f -exec chmod 0640 {} + \
+ && chmod 0755 /usr/local/bin/pi
+
+# ── Runtime env ──────────────────────────────────────────────────────
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app/web/backend \
+    PI_MODE=web \
+    PI_DATA_ROOT=/srv/pi/data \
+    PI_PROVIDER=anthropic-vertex \
+    PI_MODEL=claude-sonnet-4-6 \
+    PI_VERTEX_ANTHROPIC_LOCATION=global \
+    HOST=0.0.0.0 \
+    PORT=8788
+
+# Drop privileges. The backend runs as `app` (uid 1100); /srv/pi
+# volumes are mounted with matching ownership by the systemd prepare
+# unit (see deploy/systemd/pi-prepare.service).
+USER app
+
+EXPOSE 8788
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD curl -fsS http://127.0.0.1:8788/healthz >/dev/null || exit 1
+
+# tini reaps zombies cleanly when the agent kills bash/bg subprocesses.
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["python", "-m", "uvicorn", "main:app", \
+     "--host", "0.0.0.0", "--port", "8788", \
+     "--app-dir", "/app/web/backend", \
+     "--proxy-headers", "--forwarded-allow-ips=*"]

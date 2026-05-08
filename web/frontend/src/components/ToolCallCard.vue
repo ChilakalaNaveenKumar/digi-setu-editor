@@ -1,12 +1,12 @@
 <!--
   ToolCallCard — generic chat-side card for any tool call.
-    pending  → muted left rail
-    running  → warning (amber) left rail + pulsing dot
-    success  → success (green) left rail
-    error    → destructive (red) left rail
-  Per-tool renderers (BashCard, EditCard, etc.) come in the next slice and
-  will replace this generic card by tool name. For now everything routes
-  through here so we have a stable visual baseline.
+
+  Status is conveyed by an inline coloured badge ("running…", "done",
+  "error") next to the tool name; we deliberately removed the chunky
+  left rail (`border-l-4 border-l-success/...`) because it dominated
+  the chat visually and competed with the agent's actual prose. The
+  per-tool cards (BashToolCard, EditToolCard, …) follow the same
+  borderless convention.
 -->
 <script setup lang="ts">
 import { computed, ref } from "vue";
@@ -15,19 +15,6 @@ import type { ToolCall } from "../types/rpc";
 const props = defineProps<{ call: ToolCall }>();
 
 const expanded = ref(false);
-
-const railClass = computed(() => {
-  switch (props.call.status) {
-    case "running":
-      return "border-l-warning";
-    case "success":
-      return "border-l-success";
-    case "error":
-      return "border-l-destructive";
-    default:
-      return "border-l-border";
-  }
-});
 
 const statusBadge = computed(() => {
   switch (props.call.status) {
@@ -62,10 +49,7 @@ const argsSummary = computed(() => {
 
 <template>
   <div
-    :class="[
-      'my-2 rounded-md border border-border border-l-4 bg-card px-3 py-2 font-mono text-xs shadow-sm',
-      railClass,
-    ]"
+    class="my-2 rounded-md border border-border bg-card px-3 py-2 font-mono text-xs shadow-sm"
   >
     <div class="flex items-baseline gap-2">
       <button

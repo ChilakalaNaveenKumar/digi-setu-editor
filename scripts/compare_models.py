@@ -37,12 +37,11 @@ CASES = [
         "id": "01_tools_loaded",
         "title": "List custom tools (instruction following, no tool calls)",
         "prompt": (
-            "List the four custom Typst tools you have available, just by "
+            "List the three custom Typst tools you have available, just by "
             "name, comma-separated, on one line. Do not call any of them."
         ),
         # Actual tools exposed by extensions/typst-tools.ts:
-        "expect_match": r"style_guide.*search_docs.*list_fonts.*list_packages|"
-                        r"search_docs.*list_fonts.*list_packages.*style_guide",
+        "expect_match": r"search_docs.*list_fonts.*list_packages",
         "expect_max_tool_calls": 0,
     },
     {

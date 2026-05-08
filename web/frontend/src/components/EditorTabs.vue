@@ -8,11 +8,11 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { storeToRefs } from "pinia";
 import { Icon } from "@iconify/vue";
-import { useSessionStore } from "../stores/session";
+import { useFilesStore } from "../stores/files";
 import { iconForPath } from "../lib/file-icons";
 
-const store = useSessionStore();
-const { openTabs, activeTabPath } = storeToRefs(store);
+const files = useFilesStore();
+const { openTabs, activeTabPath } = storeToRefs(files);
 
 function basename(p: string): string {
   const i = p.lastIndexOf("/");
@@ -76,14 +76,14 @@ function activate(path: string): void {
   // Re-open if (a) it's a different tab, OR (b) currentFile didn't make
   // it (e.g. after a refresh: tabs restore from localStorage but file
   // content + kind don't, so the editor body would otherwise be blank).
-  const cur = store.currentFile;
+  const cur = files.currentFile;
   if (path === activeTabPath.value && cur && cur.path === path) return;
-  void store.openFile(path);
+  void files.openFile(path);
 }
 
 async function close(path: string, e: MouseEvent): Promise<void> {
   e.stopPropagation();
-  await store.closeTab(path);
+  await files.closeTab(path);
 }
 
 // ── Right-click: simple inline menu (close others / close all) ────────
@@ -119,7 +119,7 @@ function openOverflowMenu(e: MouseEvent): void {
 
 function pickFromOverflow(path: string): void {
   closeMenu();
-  void store.openFile(path);
+  void files.openFile(path);
 }
 
 function openMenu(e: MouseEvent, path: string): void {
@@ -135,16 +135,16 @@ function closeMenu(): void {
 function ctxClose(): void {
   const p = menu.value.path;
   closeMenu();
-  if (p) void store.closeTab(p);
+  if (p) void files.closeTab(p);
 }
 function ctxCloseOthers(): void {
   const p = menu.value.path;
   closeMenu();
-  if (p) void store.closeOtherTabs(p);
+  if (p) void files.closeOtherTabs(p);
 }
 function ctxCloseAll(): void {
   closeMenu();
-  void store.closeAllTabs();
+  void files.closeAllTabs();
 }
 
 const hasTabs = computed(() => openTabs.value.length > 0);

@@ -40,17 +40,26 @@ import {
   ref,
   watch,
 } from "vue";
-import { isBackgroundCommand, useSessionStore } from "../stores/session";
+import { useChatStore } from "../stores/chat";
+import { isBackgroundCommand, useTerminalsStore } from "../stores/terminals";
+import { useUiStore } from "../stores/ui";
 import type { ToolCall } from "../types/rpc";
 import XtermView from "./XtermView.vue";
 
-const store = useSessionStore();
+const chat = useChatStore();
+const terminals = useTerminalsStore();
+const ui = useUiStore();
 
-// Hydrate shell profiles + existing PTYs on mount so the "+" picker has
-// data immediately.
+// Hydrate shell profiles on mount so the "+" picker has data immediately.
+//
+// We do NOT call `refreshUserTerminals()` here on purpose — the user
+// explicitly asked the terminal pane to stay passive (no auto-spawn,
+// no auto-list). The "+" button in the sidebar is the only path that
+// brings a PTY into the pane. Re-enable on demand from the sidebar
+// header (a small "↻ load existing" button) if we ever need to surface
+// pre-existing PTYs again.
 onMounted(() => {
-  void store.loadShellProfiles();
-  void store.refreshUserTerminals();
+  void terminals.loadShellProfiles();
 });
 
 // ── New terminal picker (the + button + dropdown) ─────────────────────
@@ -60,28 +69,28 @@ function toggleShellPicker(): void {
 }
 async function newTerminal(shellPath?: string): Promise<void> {
   showShellPicker.value = false;
-  const t = await store.createUserTerminal(shellPath);
+  const t = await terminals.createUserTerminal(shellPath);
   if (t) selectedId.value = `pty:${t.id}`;
 }
 async function killSelectedPty(): Promise<void> {
   const e = selectedEntry.value;
   if (!e || e.kind !== "pty") return;
-  const ok = await store.confirm({
+  const ok = await ui.confirm({
     title: "Close terminal?",
     description: `Kill the ${e.label} session (PID ${e.pty.pid}) and remove it from the sidebar.`,
     confirmLabel: "Close terminal",
     variant: "destructive",
   });
   if (!ok) return;
-  await store.killUserTerminal(e.pty.id);
+  await terminals.killUserTerminal(e.pty.id);
 }
 
 const collapsed = computed({
-  get: () => !store.terminalExpanded,
-  set: (v: boolean) => store.setTerminalExpanded(!v),
+  get: () => !terminals.expanded,
+  set: (v: boolean) => terminals.setExpanded(!v),
 });
 
-const entries = computed(() => store.terminalEntries);
+const entries = computed(() => terminals.entries);
 
 const runningCount = computed(
   () =>
@@ -111,36 +120,48 @@ const ptyEntries = computed(() =>
 // ── selection ────────────────────────────────────────────────────────
 const selectedId = ref<string | null>(null);
 
+// Auto-selection on every new entry was making the panel feel like it
+// was hijacking attention — every time the agent ran a bash command,
+// the sidebar selection would jump and the user's chosen terminal
+// would scroll out of view. Now we ONLY auto-select when the panel
+// has nothing selected at all (first entry ever), or when the user's
+// previously-selected entry was removed.
 watch(
   () => entries.value.length,
-  (n, prev) => {
-    if (n > 0 && (prev ?? 0) < n) {
+  (n) => {
+    if (n === 0) {
+      selectedId.value = null;
+      return;
+    }
+    if (
+      selectedId.value === null ||
+      !entries.value.some((e) => e.id === selectedId.value)
+    ) {
       selectedId.value = entries.value[n - 1]!.id;
     }
-    if (n === 0) selectedId.value = null;
   },
 );
 
 // Bridge from chat-card "Open in Terminal Pane" → select the matching
 // bash entry (focused id is a tool-call id; entry id is `bash:<tcId>`).
 watch(
-  () => store.terminalFocusedToolCallId,
+  () => terminals.focusedToolCallId,
   (tcId) => {
     if (!tcId) return;
     const hit = entries.value.find(
       (e) => e.kind === "bash" && e.call.id === tcId,
     );
     if (hit) selectedId.value = hit.id;
-    setTimeout(() => store.clearTerminalFocus(), 2000);
+    setTimeout(() => terminals.clearFocus(), 2000);
   },
 );
 
 // Bridge from process card "open" OR auto-open when a new bg process
-// starts. The store sets `terminalFocusedBgId` which we mirror onto
-// our selection. We clear it after consuming so a future re-click can
+// starts. The store sets `focusedBgId` which we mirror onto our
+// selection. We clear it after consuming so a future re-click can
 // re-trigger.
 watch(
-  () => store.terminalFocusedBgId,
+  () => terminals.focusedBgId,
   (bgId) => {
     if (!bgId) return;
     const hit = entries.value.find(
@@ -148,7 +169,7 @@ watch(
     );
     if (hit) selectedId.value = hit.id;
     setTimeout(() => {
-      store.terminalFocusedBgId = null;
+      terminals.focusedBgId = null;
     }, 2000);
   },
 );
@@ -177,23 +198,22 @@ function commandFor(call: ToolCall): string {
 function removeEntry(entryId: string): void {
   const tcId = entryId.startsWith("bash:") ? entryId.slice(5) : null;
   if (!tcId) return;
-  store.removeBashCall(tcId);
+  terminals.removeBashCall(tcId);
   if (selectedId.value === entryId) {
     const next = entries.value.filter((e) => e.id !== entryId);
     selectedId.value = next.length > 0 ? next[next.length - 1]!.id : null;
   }
 }
 
-const autoOpenedOnce = ref(false);
-watch(
-  () => entries.value.length,
-  (n) => {
-    if (n > 0 && !autoOpenedOnce.value) {
-      autoOpenedOnce.value = true;
-      collapsed.value = false;
-    }
-  },
-);
+// Previously: auto-expanded the panel on the first bash/bg entry. The
+// user explicitly asked us NOT to do that — the terminal panel is a
+// developer affordance, not something that should pop up because the
+// agent ran a single bash call. The panel now stays in whatever state
+// the user left it (collapsed by default; expanded if they clicked
+// the header to expand). To force-open from another component (e.g.
+// the chat card's "Open in Terminal" button), call
+// `terminals.setExpanded(true)` explicitly — that path is
+// user-initiated and is allowed.
 
 // ── sticky-bottom autoscroll for the output region ────────────────────
 const outputScroller = ref<HTMLDivElement | null>(null);
@@ -385,16 +405,16 @@ const selectedTruncation = computed<{
 
 // ── actions wired to the store ────────────────────────────────────────
 function stopCurrentBash(): void {
-  store.abort();
+  chat.abort();
 }
 
 function toggleWrap(): void {
-  store.toggleTerminalWrap();
+  terminals.toggleWrap();
 }
 
 function killBg(): void {
   const e = selectedBg.value;
-  if (e) void store.killBackgroundProcess(e.process.id);
+  if (e) void terminals.killBackgroundProcess(e.process.id);
 }
 </script>
 
@@ -429,12 +449,12 @@ function killBg(): void {
           {{ runningCount }} running
         </span>
         <span
-          v-if="store.activeBackgroundCount > 0"
+          v-if="terminals.activeBackgroundCount > 0"
           class="flex items-center gap-1 rounded-sm bg-primary/15 px-1.5 py-0.5 text-[10px] text-primary"
           title="Active background sessions (pi-interactive-shell). Click to expand the panel."
         >
           <span class="inline-block h-1.5 w-1.5 rounded-full bg-primary"></span>
-          {{ store.activeBackgroundCount }} bg
+          {{ terminals.activeBackgroundCount }} bg
         </span>
       </button>
 
@@ -443,8 +463,8 @@ function killBg(): void {
         <button
           type="button"
           class="rounded-sm px-1.5 py-0.5 text-[10px] hover:bg-accent hover:text-foreground"
-          :class="store.terminalWrap && 'bg-accent text-foreground'"
-          :title="store.terminalWrap ? 'Disable line wrap' : 'Enable line wrap'"
+          :class="terminals.wrap && 'bg-accent text-foreground'"
+          :title="terminals.wrap ? 'Disable line wrap' : 'Enable line wrap'"
           @click="toggleWrap"
         >↵ wrap</button>
         <button
@@ -530,7 +550,7 @@ function killBg(): void {
                 v-if="selectedOutput"
                 :class="[
                   'px-3 py-2 font-mono text-[11.5px] leading-[1.5] text-foreground/90',
-                  store.terminalWrap ? 'whitespace-pre-wrap break-words' : 'whitespace-pre',
+                  terminals.wrap ? 'whitespace-pre-wrap break-words' : 'whitespace-pre',
                 ]"
               >{{ selectedOutput }}</pre>
               <div
@@ -604,7 +624,7 @@ function killBg(): void {
                 v-if="selectedOutput"
                 :class="[
                   'px-3 py-2 font-mono text-[11.5px] leading-[1.5] text-foreground/90',
-                  store.terminalWrap ? 'whitespace-pre-wrap break-words' : 'whitespace-pre',
+                  terminals.wrap ? 'whitespace-pre-wrap break-words' : 'whitespace-pre',
                 ]"
               >{{ selectedOutput }}</pre>
               <div
@@ -730,14 +750,14 @@ function killBg(): void {
               shell profile
             </div>
             <button
-              v-for="p in store.shellProfiles"
+              v-for="p in terminals.shellProfiles"
               :key="p.id"
               type="button"
               class="block w-full px-3 py-1.5 text-left text-[12px] hover:bg-accent"
               @click="newTerminal(p.path)"
             >
               <span class="font-mono">{{ p.label }}</span>
-              <span v-if="p.isDefault === 'true'" class="ml-2 text-[10px] text-muted-foreground">(default)</span>
+              <span v-if="p.isDefault" class="ml-2 text-[10px] text-muted-foreground">(default)</span>
               <div class="text-[10px] text-muted-foreground">{{ p.path }}</div>
             </button>
           </div>
@@ -825,7 +845,7 @@ function killBg(): void {
                 type="button"
                 class="opacity-0 group-hover/row:opacity-100 focus:opacity-100 inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:bg-destructive/20 hover:text-destructive"
                 title="Close terminal"
-                @click.stop="store.killUserTerminal(e.pty.id)"
+                @click.stop="terminals.killUserTerminal(e.pty.id)"
               >
                 <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round">
                   <path d="M4 4l8 8M12 4l-8 8"/>

@@ -9,6 +9,9 @@
       "./extensions/typst-tools.ts"
     ]
   },
+  "scripts": {
+    "test": "tsx --test extensions/*.test.ts"
+  },
   "dependencies": {
     "@anthropic-ai/vertex-sdk": "^0.16.0",
     "@google/genai": "^1.0.0",

@@ -20,6 +20,8 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import "@xterm/xterm/css/xterm.css";
 
+import { buildWebSocketUrl } from "../api/client";
+
 const props = defineProps<{
   terminalId: string;
   closed?: boolean;
@@ -41,10 +43,12 @@ let resizeObs: ResizeObserver | null = null;
 // flood the websocket with hundreds of resize frames.
 let resizeTimer: number | null = null;
 
-function buildWsUrl(id: string): string {
-  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-  // Vite dev server proxies /ws/* to FastAPI on :8000.
-  return `${proto}//${window.location.host}/ws/terminal/${encodeURIComponent(id)}`;
+function buildWsUrl(id: string): Promise<string> {
+  // Vite dev server proxies /ws/* to FastAPI on :8000. The Clerk
+  // session token is appended as `?clerk_token=…` by buildWebSocketUrl
+  // so the upgrade authenticates without relying on cross-origin
+  // cookies during local development.
+  return buildWebSocketUrl(`/ws/terminal/${encodeURIComponent(id)}`);
 }
 
 function fitAndSend(): void {
@@ -123,37 +127,47 @@ function setupTerminal(): void {
 }
 
 function connect(): void {
-  ws = new WebSocket(buildWsUrl(props.terminalId));
-  ws.onopen = () => {
-    status.value = "open";
-    // Defer fitAndSend; xterm DOM may still be settling.
-    requestAnimationFrame(fitAndSend);
-  };
-  ws.onmessage = (e) => {
-    if (typeof e.data !== "string") return;
-    let msg: { type?: string; data?: string };
-    try {
-      msg = JSON.parse(e.data);
-    } catch {
-      return;
-    }
-    if (msg.type === "output" && typeof msg.data === "string") {
-      term?.write(msg.data);
-    } else if (msg.type === "ready") {
+  void buildWsUrl(props.terminalId).then((url) => {
+    const sock = new WebSocket(url);
+    ws = sock;
+    sock.onopen = () => {
       status.value = "open";
-    } else if (msg.type === "exit") {
-      status.value = "exited";
-      term?.write("\r\n\x1b[2m[process exited]\x1b[0m\r\n");
-      emit("exit");
-    }
-  };
-  ws.onerror = () => {
-    status.value = "error";
-    errorMsg.value = "WebSocket error";
-  };
-  ws.onclose = () => {
-    if (status.value !== "exited") status.value = "exited";
-  };
+      // Defer fitAndSend; xterm DOM may still be settling.
+      requestAnimationFrame(fitAndSend);
+    };
+    sock.onmessage = (e) => {
+      if (typeof e.data !== "string") return;
+      let msg: { type?: string; data?: string };
+      try {
+        msg = JSON.parse(e.data);
+      } catch {
+        return;
+      }
+      if (msg.type === "output" && typeof msg.data === "string") {
+        term?.write(msg.data);
+      } else if (msg.type === "ready") {
+        status.value = "open";
+      } else if (msg.type === "exit") {
+        status.value = "exited";
+        term?.write("\r\n\x1b[2m[process exited]\x1b[0m\r\n");
+        emit("exit");
+      }
+    };
+    sock.onerror = () => {
+      status.value = "error";
+      errorMsg.value = "WebSocket error";
+    };
+    sock.onclose = (e) => {
+      // 4401 = "auth required". Keep status as "error" so the user sees
+      // something went wrong and can re-authenticate via the picker.
+      if (e.code === 4401) {
+        status.value = "error";
+        errorMsg.value = "Not signed in";
+        return;
+      }
+      if (status.value !== "exited") status.value = "exited";
+    };
+  });
 }
 
 onMounted(() => {

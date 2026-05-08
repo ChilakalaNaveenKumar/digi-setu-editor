@@ -9,7 +9,9 @@
 -->
 <script setup lang="ts">
 import { computed, ref } from "vue";
-import { useSessionStore } from "../../stores/session";
+import { useChatStore } from "../../stores/chat";
+import { useFilesStore, normalizeWorkspacePath } from "../../stores/files";
+import { useSnapshotsStore } from "../../stores/snapshots";
 import { fileGlyph } from "../../lib/file-tree";
 import { writeContentToUnified } from "../../lib/pi-diff-to-unified";
 import type { ToolCall } from "../../types/rpc";
@@ -17,16 +19,16 @@ import DiffView from "./DiffView.vue";
 
 const props = defineProps<{ call: ToolCall }>();
 
-const store = useSessionStore();
+const chat = useChatStore();
+const files = useFilesStore();
+const snapshots = useSnapshotsStore();
 
 const path = computed(() => {
   const args = props.call.args as { path?: unknown } | undefined;
   return typeof args?.path === "string" ? args.path : "";
 });
 
-const displayPath = computed(() =>
-  path.value ? store.normalizeWorkspacePath(path.value) : ""
-);
+const displayPath = computed(() => (path.value ? normalizeWorkspacePath(path.value) : ""));
 
 const filename = computed(() => {
   const p = displayPath.value;
@@ -82,12 +84,12 @@ const isStreaming = computed(
 
 const isFocused = computed(() => {
   if (!path.value) return false;
-  return store.currentFile?.path === store.normalizeWorkspacePath(path.value);
+  return files.currentFile?.path === normalizeWorkspacePath(path.value);
 });
 
 /** True when the editor is currently in review mode pinned to THIS call. */
 const isReviewing = computed(
-  () => store.editorReview?.toolCallId === props.call.id
+  () => snapshots.editorReview?.toolCallId === props.call.id
 );
 
 const glyph = computed(() => (path.value ? fileGlyph(filename.value) : "·"));
@@ -101,14 +103,14 @@ const unifiedDiff = computed(() =>
 
 function focus(): void {
   if (!path.value) return;
-  store.focusToolCall(props.call.id);
+  chat.focusToolCall(props.call.id);
   if (props.call.status === "success") {
-    void store.openFile(path.value);
+    void files.openFile(path.value);
   }
 }
 
 function review(): void {
-  void store.enterReviewMode(props.call.id);
+  void snapshots.enterReviewMode(props.call.id);
 }
 
 const restoreBusy = ref(false);
@@ -125,8 +127,8 @@ async function restore(): Promise<void> {
   restoreBusy.value = true;
   restoreError.value = null;
   try {
-    const files = await store.restoreToolCall(props.call.id);
-    console.info(`[restore] reverted ${files.length} file(s)`, files);
+    const restored = await snapshots.restoreToolCall(props.call.id);
+    console.info(`[restore] reverted ${restored.length} file(s)`, restored);
   } catch (exc) {
     restoreError.value = (exc as Error).message;
   } finally {

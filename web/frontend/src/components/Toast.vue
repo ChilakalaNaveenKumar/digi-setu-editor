@@ -9,10 +9,10 @@
 -->
 <script setup lang="ts">
 import { storeToRefs } from "pinia";
-import { useSessionStore } from "../stores/session";
+import { useUiStore } from "../stores/ui";
 
-const store = useSessionStore();
-const { toasts } = storeToRefs(store);
+const ui = useUiStore();
+const { toasts } = storeToRefs(ui);
 </script>
 
 <template>
@@ -41,7 +41,7 @@ const { toasts } = storeToRefs(store);
             type="button"
             class="ml-2 shrink-0 rounded-sm px-1 text-current opacity-60 transition-opacity hover:opacity-100"
             title="Dismiss"
-            @click="store.dismissToast(t.id)"
+            @click="ui.dismissToast(t.id)"
           >×</button>
         </div>
       </transition-group>

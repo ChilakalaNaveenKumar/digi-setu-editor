@@ -11,18 +11,100 @@
                of this component.
 -->
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { storeToRefs } from "pinia";
+import { useRouter } from "vue-router";
 import { Icon } from "@iconify/vue";
-import { useSessionStore } from "../stores/session";
+import { useChatStore } from "../stores/chat";
+import { useFilesStore } from "../stores/files";
+import { useUiStore } from "../stores/ui";
 import { buildTree, type TreeNode } from "../lib/file-tree";
 import TreeNodeRow from "./TreeNodeRow.vue";
 
-const store = useSessionStore();
-const { session, fileEntries } = storeToRefs(store);
+import { useWorkspaceStore } from "../stores/workspace";
+import { uploadAttachments } from "../api/attachments";
+
+const router = useRouter();
+const chat = useChatStore();
+const files = useFilesStore();
+const ui = useUiStore();
+const workspace = useWorkspaceStore();
+const { session } = storeToRefs(chat);
+const { fileEntries, treeUiState } = storeToRefs(files);
+
+// Root-level drag-drop: drop directly into the workspace root, not on
+// any specific folder row. Same dragenter/leave counter pattern as the
+// composer + tree rows so the highlight survives child mouseovers.
+const rootDragOver = ref(false);
+const rootDragCounter = ref(0);
+const rootUploading = ref(false);
+
+function _rootDragHasFiles(e: DragEvent): boolean {
+  const types = e.dataTransfer?.types;
+  if (!types) return false;
+  return Array.from(types).includes("Files");
+}
+
+function onRootDragEnter(e: DragEvent): void {
+  if (!_rootDragHasFiles(e)) return;
+  e.preventDefault();
+  rootDragCounter.value += 1;
+  rootDragOver.value = true;
+}
+function onRootDragLeave(e: DragEvent): void {
+  if (!_rootDragHasFiles(e)) return;
+  rootDragCounter.value = Math.max(0, rootDragCounter.value - 1);
+  if (rootDragCounter.value === 0) rootDragOver.value = false;
+}
+function onRootDragOver(e: DragEvent): void {
+  if (!_rootDragHasFiles(e)) return;
+  e.preventDefault();
+  if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+}
+async function onRootDrop(e: DragEvent): Promise<void> {
+  if (!_rootDragHasFiles(e)) return;
+  e.preventDefault();
+  rootDragCounter.value = 0;
+  rootDragOver.value = false;
+  const list = e.dataTransfer?.files;
+  if (!list || list.length === 0) return;
+  if (!workspace.activeId) return;
+  rootUploading.value = true;
+  try {
+    // Empty target_dir → backend's default ("uploads"). User can move
+    // them out from there if they want a different home.
+    const result = await uploadAttachments(workspace.activeId, Array.from(list));
+    chat.addPendingAttachments(
+      result.saved.map((s) => ({
+        localId: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        name: s.name,
+        size: s.size,
+        mime: s.mime,
+        path: s.path,
+        agentPath: s.agent_path,
+      })),
+    );
+    void files.refreshTree();
+  } catch (exc) {
+    ui.toastError("Upload failed", exc);
+  } finally {
+    rootUploading.value = false;
+  }
+}
+
+// Click on empty tree body clears the multi-selection — same as
+// clicking empty space in VS Code's Explorer.
+function onRootClick(e: MouseEvent): void {
+  const target = e.target as HTMLElement | null;
+  if (!target) return;
+  // Only when click landed directly on the scroll body; child rows
+  // stop propagation via their own handlers.
+  if (target.dataset.role !== "tree-body") return;
+  files.clearSelection();
+}
 
 onMounted(() => {
-  void store.refreshFileTree();
+  void files.refreshTree();
 });
 
 const tree = computed(() => buildTree(fileEntries.value));
@@ -39,32 +121,70 @@ const cwdShort = computed(() => {
 });
 
 function back(): void {
-  store.disconnect();
+  chat.disconnect();
+  router.push({ name: "picker" });
 }
 
 // ── Toolbar actions ────────────────────────────────────────────────────
 /** Where new files/folders should land if the user hits the toolbar
- *  button. We don't track an explicit "selected folder" yet — for now
- *  use the parent of the open file, or the root. */
+ *  button. We don't track an explicit "selected folder" yet, so fall
+ *  back to the root (`""`) — the inline input row at the top of the
+ *  body handles that case so it works even on an empty workspace. */
 const toolbarTargetFolder = computed(() => {
-  const cf = store.currentFile;
-  if (!cf?.path) return "";
+  const cf = files.currentFile;
+  if (!cf?.path) return ""; // root
   const segs = cf.path.split("/").filter(Boolean);
   segs.pop();
   return segs.join("/");
 });
 
 function toolbarNewFile(): void {
-  store.startCreate(toolbarTargetFolder.value, "file");
+  files.startCreate(toolbarTargetFolder.value, "file");
 }
 function toolbarNewFolder(): void {
-  store.startCreate(toolbarTargetFolder.value, "folder");
+  files.startCreate(toolbarTargetFolder.value, "folder");
 }
 function toolbarRefresh(): void {
-  void store.refreshFileTree();
+  void files.refreshTree();
 }
 function toolbarCollapseAll(): void {
-  store.collapseAll();
+  files.collapseAll();
+}
+
+// ── Root-level inline create ──────────────────────────────────────────
+// The recursive TreeNodeRow only renders the "new name" input under an
+// EXISTING folder node. If the user clicks New File on an empty
+// workspace (no nodes to attach to) the input would never appear. This
+// dedicated row covers the root case (`creatingUnderPath === ""`).
+const rootCreating = computed(() =>
+  treeUiState.value.creatingUnderPath === "" ? treeUiState.value.creatingKind : null,
+);
+const rootNewName = ref("");
+const rootNewInput = ref<HTMLInputElement | null>(null);
+
+watch(rootCreating, async (kind) => {
+  if (kind) {
+    rootNewName.value = "";
+    await nextTick();
+    rootNewInput.value?.focus();
+  }
+});
+
+function commitRootCreate(): void {
+  const name = rootNewName.value.trim();
+  if (!name) {
+    files.cancelCreate();
+    return;
+  }
+  if (rootCreating.value === "file") {
+    void files.createFile(name);
+  } else if (rootCreating.value === "folder") {
+    void files.createFolder(name);
+  }
+}
+
+function cancelRootCreate(): void {
+  files.cancelCreate();
 }
 
 // ── Context menu (right-click on a node) ───────────────────────────────
@@ -117,14 +237,14 @@ function ctxOpen(): void {
   const n = menu.value.node;
   closeContextMenu();
   if (!n) return;
-  if (!n.isDir) void store.openFile(n.path);
+  if (!n.isDir) void files.openFile(n.path);
 }
 
 function ctxRename(): void {
   const n = menu.value.node;
   closeContextMenu();
   if (!n) return;
-  store.startRename(n.path);
+  files.startRename(n.path);
 }
 
 async function ctxDelete(): Promise<void> {
@@ -132,7 +252,7 @@ async function ctxDelete(): Promise<void> {
   closeContextMenu();
   if (!n) return;
   const label = n.isDir ? "folder" : "file";
-  const ok = await store.confirm({
+  const ok = await ui.confirm({
     title: `Delete ${label}?`,
     description:
       `"${n.path}" will be deleted from the workspace.` +
@@ -142,7 +262,7 @@ async function ctxDelete(): Promise<void> {
     variant: "destructive",
   });
   if (!ok) return;
-  await store.deletePath(n.path);
+  await files.deletePath(n.path);
 }
 
 async function ctxCopyPath(): Promise<void> {
@@ -161,7 +281,7 @@ function ctxNewFile(): void {
   closeContextMenu();
   if (!n) return;
   const parent = n.isDir ? n.path : n.path.split("/").slice(0, -1).join("/");
-  store.startCreate(parent, "file");
+  files.startCreate(parent, "file");
 }
 
 function ctxNewFolder(): void {
@@ -169,37 +289,36 @@ function ctxNewFolder(): void {
   closeContextMenu();
   if (!n) return;
   const parent = n.isDir ? n.path : n.path.split("/").slice(0, -1).join("/");
-  store.startCreate(parent, "folder");
+  files.startCreate(parent, "folder");
 }
 
 // ── Cut / Copy / Paste / Duplicate ────────────────────────────────────
-const { fsClipboard } = storeToRefs(store);
+const { fsClipboard } = storeToRefs(files);
 
 function ctxCut(): void {
   const n = menu.value.node;
   closeContextMenu();
   if (!n) return;
-  store.clipboardCut(n.path, n.isDir);
+  files.clipboardCut(n.path, n.isDir);
 }
 function ctxCopy(): void {
   const n = menu.value.node;
   closeContextMenu();
   if (!n) return;
-  store.clipboardCopy(n.path, n.isDir);
+  files.clipboardCopy(n.path, n.isDir);
 }
 async function ctxPaste(): Promise<void> {
   const n = menu.value.node;
   closeContextMenu();
   if (!n || !fsClipboard.value) return;
-  // Paste INTO the node if it's a folder, otherwise into its parent.
   const target = n.isDir ? n.path : n.path.split("/").slice(0, -1).join("/");
-  await store.clipboardPaste(target);
+  await files.clipboardPaste(target);
 }
 async function ctxDuplicate(): Promise<void> {
   const n = menu.value.node;
   closeContextMenu();
   if (!n) return;
-  await store.duplicatePath(n.path);
+  await files.duplicatePath(n.path);
 }
 const canPaste = computed(() => fsClipboard.value !== null);
 </script>
@@ -270,12 +389,75 @@ const canPaste = computed(() => fsClipboard.value !== null);
     </div>
 
     <!-- ── Body: recursive tree ──────────────────────────────────────── -->
-    <div class="flex-1 overflow-y-auto py-1 text-sm">
+    <div
+      data-role="tree-body"
+      class="relative flex-1 overflow-y-auto py-1 text-sm"
+      :class="rootDragOver && 'ring-2 ring-primary ring-inset'"
+      @click="onRootClick"
+      @dragenter="onRootDragEnter"
+      @dragleave="onRootDragLeave"
+      @dragover="onRootDragOver"
+      @drop="onRootDrop"
+    >
+      <!-- Drop overlay shown while user is dragging OS files over the
+           tree body but not over any specific folder row. -->
       <div
-        v-if="!tree.length"
+        v-if="rootDragOver"
+        class="pointer-events-none absolute inset-0 z-10 flex items-center justify-center bg-primary/10 backdrop-blur-[1px]"
+      >
+        <div
+          class="flex items-center gap-2 rounded-md border border-primary bg-card px-3 py-2 text-sm font-medium text-foreground shadow"
+        >
+          <Icon
+            :icon="rootUploading ? 'codicon:loading' : 'codicon:cloud-upload'"
+            :class="rootUploading && 'animate-spin'"
+            class="h-4 w-4 text-primary"
+          />
+          {{
+            rootUploading
+              ? "Uploading…"
+              : "Drop to upload to workspace/uploads/"
+          }}
+        </div>
+      </div>
+      <!-- Root-level inline create input. Renders only when the toolbar
+           "New File / New Folder" was clicked with no folder context (or
+           the workspace is still empty). The TreeNodeRow input only fires
+           inside an existing folder, so this row is what makes the toolbar
+           buttons functional on a brand-new workspace. -->
+      <div
+        v-if="rootCreating"
+        class="flex items-center gap-1 px-1 py-[3px]"
+      >
+        <span class="inline-block h-4 w-3 shrink-0"></span>
+        <Icon
+          :icon="
+            rootCreating === 'folder'
+              ? 'material-icon-theme:folder'
+              : 'material-icon-theme:file'
+          "
+          class="h-[16px] w-[16px] shrink-0 opacity-70"
+        />
+        <input
+          ref="rootNewInput"
+          v-model="rootNewName"
+          type="text"
+          :placeholder="rootCreating === 'folder' ? 'new folder name' : 'new file name'"
+          class="min-w-0 flex-1 rounded-sm border border-primary/50 bg-background px-1 py-[1px] font-mono text-[12px] text-foreground outline-none focus:ring-1 focus:ring-primary"
+          @keydown.enter.prevent="commitRootCreate"
+          @keydown.esc.prevent="cancelRootCreate"
+          @blur="commitRootCreate"
+        />
+      </div>
+
+      <div
+        v-if="!tree.length && !rootCreating"
         class="px-3 py-3 text-xs text-muted-foreground"
       >
-        Empty. Files appear here as the agent creates them.
+        Empty. Files appear here as the agent creates them — or use the
+        <Icon icon="codicon:new-file" class="inline-block h-3 w-3" /> /
+        <Icon icon="codicon:new-folder" class="inline-block h-3 w-3" />
+        buttons above to create one yourself.
       </div>
       <TreeNodeRow
         v-for="node in tree"

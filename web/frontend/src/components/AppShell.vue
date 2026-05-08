@@ -22,14 +22,14 @@ import { Splitpanes, Pane } from "splitpanes";
 import "splitpanes/dist/splitpanes.css";
 
 import ChatPane from "./ChatPane.vue";
-import ConfirmModal from "./ConfirmModal.vue";
 import EditorPane from "./EditorPane.vue";
 import FileTreePane from "./FileTreePane.vue";
 import TerminalPane from "./TerminalPane.vue";
-import Toast from "./Toast.vue";
-import { useSessionStore } from "../stores/session";
+import { useFilesStore } from "../stores/files";
+import { useTerminalsStore } from "../stores/terminals";
 
-const store = useSessionStore();
+const files = useFilesStore();
+const terminals = useTerminalsStore();
 
 // ── Persisted sizes ──────────────────────────────────────────────────
 const LS_HORIZ = "ui.layout.horizontal";
@@ -104,25 +104,51 @@ function saveVert(): void {
 interface PaneSize {
   size: number;
 }
+
+/**
+ * Read a numeric `.size` from a pane entry. The splitpanes library
+ * occasionally fires `resize` with array slots that are momentarily
+ * undefined / mid-update — typically while the inner Splitpanes is
+ * being torn down by the terminal-collapse v-if swap. Guarding here
+ * keeps Vue from logging an "Unhandled error during execution of
+ * component event handler" on every drag.
+ */
+function safeSize(p: PaneSize | undefined | null): number | null {
+  if (!p) return null;
+  const v = (p as PaneSize).size;
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
 function onHorizResize(panes: PaneSize[]): void {
-  if (!panes || panes.length < 3) return;
-  horiz.value = {
-    tree: panes[0]!.size,
-    middle: panes[1]!.size,
-    chat: panes[2]!.size,
-  };
-  saveHoriz();
+  try {
+    if (!Array.isArray(panes) || panes.length < 3) return;
+    const t = safeSize(panes[0]);
+    const m = safeSize(panes[1]);
+    const c = safeSize(panes[2]);
+    if (t === null || m === null || c === null) return;
+    horiz.value = { tree: t, middle: m, chat: c };
+    saveHoriz();
+  } catch (exc) {
+    console.warn("[appshell] horiz resize handler swallowed", exc);
+  }
 }
 
 function onVertResize(panes: PaneSize[]): void {
-  if (!panes || panes.length < 2) return;
-  vert.value = { editor: panes[0]!.size, terminal: panes[1]!.size };
-  saveVert();
+  try {
+    if (!Array.isArray(panes) || panes.length < 2) return;
+    const e = safeSize(panes[0]);
+    const t = safeSize(panes[1]);
+    if (e === null || t === null) return;
+    vert.value = { editor: e, terminal: t };
+    saveVert();
+  } catch (exc) {
+    console.warn("[appshell] vert resize handler swallowed", exc);
+  }
 }
 
 // Terminal collapse state lives in the store so the toggle inside
 // TerminalPane stays in sync with the splitpanes layout here.
-const terminalShown = computed(() => store.terminalExpanded);
+const terminalShown = computed(() => terminals.expanded);
 
 // When terminal becomes hidden, remember the current vertical sizes so
 // we can restore them on re-show.
@@ -144,8 +170,8 @@ onMounted(() => {
   // Restore the previously active tab so the editor body isn't blank
   // on refresh. Tabs are persisted to localStorage but currentFile
   // (the actual content / kind) is not — fetch it now.
-  if (store.activeTabPath && !store.currentFile) {
-    void store.openFile(store.activeTabPath);
+  if (files.activeTabPath && !files.currentFile) {
+    void files.openFile(files.activeTabPath);
   }
 });
 </script>
@@ -200,12 +226,6 @@ onMounted(() => {
         <ChatPane />
       </Pane>
     </Splitpanes>
-
-    <!-- Global confirm dialog (delete, close-dirty, etc.) -->
-    <ConfirmModal />
-
-    <!-- Global toast stack (replaces window.alert blocking dialogs) -->
-    <Toast />
   </div>
 </template>
 

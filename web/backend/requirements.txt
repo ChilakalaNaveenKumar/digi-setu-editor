@@ -2,3 +2,18 @@ fastapi==0.115.5
 uvicorn[standard]==0.32.1
 websockets==13.1
 watchdog==6.0.0
+# FastAPI's File()/Form() multipart parsing depends on python-multipart.
+# Required for the attachments upload route.
+python-multipart==0.0.20
+
+# Auth (Clerk + webhook signature verification)
+clerk-backend-api==5.0.6
+svix==1.92.2
+
+# Billing (Stripe Checkout + Customer Portal + webhooks).
+# USD-only for v1; India will arrive on Razorpay or a Merchant of Record
+# (Paddle / Lemon Squeezy) once the first paid customer asks for it.
+stripe==15.1.0
+
+# Test runner. Only needed for `pytest`; not pulled into the prod image.
+pytest==9.0.3

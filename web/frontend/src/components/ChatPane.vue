@@ -1,29 +1,39 @@
 <!--
-  ChatPane — right column. Chat header (model + token totals), MessageList,
-  and Composer pinned to the bottom.
+  ChatPane — right column. Chat header (model picker + settings menu),
+  MessageList, then Composer pinned to the bottom.
+
+  Per-turn token/cost stats live inside each assistant bubble; the user's
+  plan-level usage lives in ChatSettingsMenu (gear icon). We deliberately
+  no longer render a session-total ticker here — it conflated raw model
+  cost with billed usage and read as alarming.
 -->
 <script setup lang="ts">
 import { storeToRefs } from "pinia";
-import { useSessionStore } from "../stores/session";
-import { formatCost, formatTokens } from "../lib/format";
+import { useBillingStore } from "../stores/billing";
+import { useChatStore } from "../stores/chat";
+import ChatErrorBanner from "./ChatErrorBanner.vue";
 import Composer from "./Composer.vue";
+import ChatSettingsMenu from "./ChatSettingsMenu.vue";
 import MessageList from "./MessageList.vue";
+import ModelPicker from "./ModelPicker.vue";
 
-const store = useSessionStore();
-const { messages, totals, isStreaming, connState, lastError } = storeToRefs(store);
+const chat = useChatStore();
+const billing = useBillingStore();
 
-const PROVIDER = "anthropic-vertex";
-const MODEL = "claude-opus-4-7";
+const { messages, isStreaming, connState, lastError } = storeToRefs(chat);
+const { exhausted } = storeToRefs(billing);
 </script>
 
 <template>
   <aside
     class="flex h-full w-full min-w-0 flex-col border-l border-border bg-sidebar text-sidebar-foreground"
   >
-    <header class="flex items-center justify-between border-b border-sidebar-border px-3 py-2">
-      <div class="flex items-center gap-2">
+    <header
+      class="flex items-center justify-between gap-2 border-b border-sidebar-border px-3 py-2"
+    >
+      <div class="flex items-center gap-2 min-w-0">
         <span
-          class="inline-block h-1.5 w-1.5 rounded-full"
+          class="inline-block h-1.5 w-1.5 shrink-0 rounded-full"
           :class="
             connState === 'open'
               ? 'bg-success'
@@ -34,32 +44,23 @@ const MODEL = "claude-opus-4-7";
           :title="connState"
         />
         <span class="text-[11px] uppercase tracking-wide text-muted-foreground">chat</span>
+        <span v-if="isStreaming" class="text-[11px] text-warning">streaming…</span>
       </div>
-      <div class="flex items-center gap-3 text-[11px] font-mono text-muted-foreground">
-        <span :title="`${PROVIDER} · ${MODEL}`">{{ MODEL }}</span>
-        <span v-if="isStreaming" class="text-warning">streaming…</span>
+      <div class="flex items-center gap-2">
+        <ModelPicker />
+        <ChatSettingsMenu />
       </div>
     </header>
 
     <MessageList :messages="messages" />
 
-    <footer class="border-t border-sidebar-border bg-sidebar px-3 py-1 text-[10px] font-mono text-muted-foreground flex items-center justify-between">
-      <div class="flex items-center gap-2">
-        <span title="input tokens">↑ {{ formatTokens(totals.input) }}</span>
-        <span title="output tokens">↓ {{ formatTokens(totals.output) }}</span>
-        <span title="cache read">R {{ formatTokens(totals.cacheRead) }}</span>
-        <span title="cache write">W {{ formatTokens(totals.cacheWrite) }}</span>
-      </div>
-      <span :title="`${PROVIDER} · ${MODEL}`">{{ formatCost(totals.cost) }}</span>
-    </footer>
-
     <Composer />
 
-    <div
+    <ChatErrorBanner
       v-if="lastError"
-      class="border-t border-destructive/30 bg-destructive/10 px-3 py-1 text-[11px] text-destructive"
-    >
-      {{ lastError }}
-    </div>
+      :message="lastError"
+      :credit-exhausted="exhausted"
+      @dismiss="lastError = null"
+    />
   </aside>
 </template>

@@ -1,0 +1,144 @@
+# pi-typst-test hosted stack — runs on the digi-setu-live VM at digi-setu.com.
+#
+# Replaces the legacy typst-agent compose file. Same VM, same Caddy
+# pattern (TLS via Cloudflare DNS-01), same Artifact Registry, but
+# only ONE backend container (FastAPI bridges to pi inside the same
+# image — no separate sandbox process for v1).
+#
+# Deployed to /opt/pi/docker-compose.yml on the VM by
+# scripts/remote-deploy.sh, then managed via the pi.service systemd
+# unit (deploy/systemd/pi.service).
+#
+# Services:
+#   backend  — FastAPI + pi (Node) + watchdog. Listens on 127.0.0.1:8788.
+#              Runs as uid 1100 (`app`); mediates every workspace
+#              read/write. The AI's bash tool stays inside the
+#              workspace folder under /srv/pi/data/workspaces/<wsid>/.
+#
+#   caddy    — TLS + static SPA + reverse proxy. Built locally so the
+#              caddy-dns/cloudflare module is baked in. Binds 80/443
+#              directly on the host network (matches typst-agent).
+#
+# Volumes (created by deploy/systemd/pi-prepare.service):
+#   /srv/pi/state       0700 root:root      auth.db, jwt key, registry.json metadata
+#                                          (NOT the workspace files themselves)
+#   /srv/pi/data        0700 1100:1100      registry.json, workspaces/, chats/, shadows/
+#   /srv/pi/www         0755 root:root      static SPA bundle (RO mount into Caddy)
+#   /srv/caddy/data, /srv/caddy/config      Caddy state
+#
+# Env file (mode 0600 root:root):
+#   /opt/pi/stack.env   image tag, ACME email, Cloudflare token, GCP
+#                       project, JWT secret, Google OAuth client.
+
+services:
+  backend:
+    image: ${BACKEND_IMAGE:-us-central1-docker.pkg.dev/digi-setu-dev/digi-setu/pi-backend:latest}
+    container_name: pi-backend
+    restart: unless-stopped
+    network_mode: host
+    # Host networking keeps the GCE metadata server reachable at
+    # 169.254.169.254 so anthropic-vertex can pick up Application
+    # Default Credentials without us shipping a JSON key into the image.
+    environment:
+      HOST: 127.0.0.1
+      PORT: "8788"
+
+      PI_MODE: web
+      PI_DATA_ROOT: /srv/pi/data
+
+      # Vertex AI — provider + model defaults. Override per-deploy via
+      # stack.env if you want to A/B different models.
+      PI_PROVIDER: anthropic-vertex
+      PI_MODEL: ${PI_MODEL:-claude-sonnet-4-6}
+      PI_VERTEX_ANTHROPIC_LOCATION: global
+      GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-digi-setu-dev}
+      GOOGLE_CLOUD_LOCATION: ${GOOGLE_CLOUD_LOCATION:-global}
+
+      # Auth (Clerk). Leaving CLERK_SECRET_KEY empty puts the backend in
+      # open dev mode (every request → user_id="dev"); fine for the
+      # initial cutover, never for public traffic. See
+      # deploy/stack.env.example for the full setup checklist.
+      CLERK_PUBLISHABLE_KEY: ${CLERK_PUBLISHABLE_KEY:-}
+      CLERK_SECRET_KEY: ${CLERK_SECRET_KEY:-}
+      CLERK_WEBHOOK_SECRET: ${CLERK_WEBHOOK_SECRET:-}
+      OAUTH_REDIRECT_BASE: ${OAUTH_REDIRECT_BASE:-https://digi-setu.com}
+      FEEDBACK_EMAIL_TO: ${FEEDBACK_EMAIL_TO:-nchilaka@digi-setu.com}
+
+      # Rate-limit overrides. Empty = use defaults from
+      # backend/services/rate_limit.py. See stack.env.example for the
+      # full list and what each one controls.
+      RL_WS_CONNECT_CAPACITY: ${RL_WS_CONNECT_CAPACITY:-}
+      RL_WS_CONNECT_PER_MIN: ${RL_WS_CONNECT_PER_MIN:-}
+      RL_PI_SPAWN_CAPACITY: ${RL_PI_SPAWN_CAPACITY:-}
+      RL_PI_SPAWN_PER_HOUR: ${RL_PI_SPAWN_PER_HOUR:-}
+      RL_CHAT_MSG_CAPACITY: ${RL_CHAT_MSG_CAPACITY:-}
+      RL_CHAT_MSG_PER_MIN: ${RL_CHAT_MSG_PER_MIN:-}
+      RL_FEEDBACK_CAPACITY: ${RL_FEEDBACK_CAPACITY:-}
+      RL_FEEDBACK_PER_HOUR: ${RL_FEEDBACK_PER_HOUR:-}
+      RL_DAILY_TOKEN_BUDGET: ${RL_DAILY_TOKEN_BUDGET:-}
+
+      # Subscription credit knobs. Empty = use defaults from
+      # backend/services/billing.py. See stack.env.example for what
+      # each one means and how the per-prompt cost is computed.
+      BILLING_VM_HOURLY_USD: ${BILLING_VM_HOURLY_USD:-}
+      BILLING_VM_USERS_AT_ONCE: ${BILLING_VM_USERS_AT_ONCE:-}
+      BILLING_INFRA_MARKUP: ${BILLING_INFRA_MARKUP:-}
+      BILLING_FREE_CREDIT_USD: ${BILLING_FREE_CREDIT_USD:-}
+      BILLING_STARTER_CREDIT_USD: ${BILLING_STARTER_CREDIT_USD:-}
+      BILLING_PRO_CREDIT_USD: ${BILLING_PRO_CREDIT_USD:-}
+      BILLING_MAX_CREDIT_USD: ${BILLING_MAX_CREDIT_USD:-}
+      BILLING_DEFAULT_PLAN: ${BILLING_DEFAULT_PLAN:-}
+
+      # Stripe (USD-only, see stack.env.example for the setup
+      # checklist). Empty STRIPE_SECRET_KEY = billing endpoints
+      # return 503 and the SPA hides the Upgrade button.
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      STRIPE_PRICE_STARTER: ${STRIPE_PRICE_STARTER:-}
+      STRIPE_PRICE_PRO: ${STRIPE_PRICE_PRO:-}
+      STRIPE_PRICE_MAX: ${STRIPE_PRICE_MAX:-}
+      BILLING_RETURN_URL: ${BILLING_RETURN_URL:-}
+
+      # Per-workspace safety limits. Empty = use defaults from
+      # backend/config.py (100 MB / 900 s). See stack.env.example.
+      WORKSPACE_DISK_QUOTA_MB: ${WORKSPACE_DISK_QUOTA_MB:-}
+      PROMPT_TIMEOUT_SECONDS: ${PROMPT_TIMEOUT_SECONDS:-}
+    volumes:
+      # Per-deployment secrets the backend reads at boot but the AI
+      # must never see (auth.db, JWT key, etc.). Backend opens these
+      # before privilege drop wouldn't help — it already runs as `app`,
+      # so the volume is mounted with mode 0750 root:app and the AI's
+      # bash subprocess (which inherits uid 1100 in v1) can `cat` it
+      # transitively. Phase 5 fixes this with the runuser drop.
+      - /srv/pi/state:/srv/pi/state
+      # Workspaces, chats, shadows, registry. Owned by uid 1100 so the
+      # backend (app user) can RW everything.
+      - /srv/pi/data:/srv/pi/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8788/healthz >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+  caddy:
+    build:
+      context: ./caddy
+      dockerfile: Dockerfile
+    image: pi-caddy:latest
+    container_name: pi-caddy
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      ACME_EMAIL: ${ACME_EMAIL}
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN}
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # Static SPA build — produced by scripts/remote-deploy.sh and
+      # streamed to /srv/pi/www on the VM.
+      - /srv/pi/www:/srv/pi/www:ro
+      - /srv/caddy/data:/data
+      - /srv/caddy/config:/config
+    depends_on:
+      backend:
+        condition: service_started
