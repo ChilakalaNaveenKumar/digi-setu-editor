@@ -327,10 +327,30 @@
 
   ### 5b. Firewall (gcloud-managed, supplements `nftables`)
 
-  The repo's `pi-firewall.service` blocks egress from uid **1000** (the
-  AI's sandbox uid in v1.1) to the metadata server. The backend (uid
-  1100) keeps unrestricted egress so the Vertex SDK can fetch ADC
-  tokens. Inbound is gated by GCP firewall rules:
+  The repo's `pi-firewall.service` blocks AWS/ECS metadata
+  (169.254.170.2) and IPv6 link-local (fe80::/10) for uid **1000**
+  (the AI's sandbox uid in v1.1). The backend (uid 1100) keeps
+  unrestricted egress.
+
+  **NOTE on GCE metadata (169.254.169.254):** intentionally NOT
+  blocked. The dual-uid sandbox runs the legitimate `pi` process AND
+  the AI's bash subprocess as the SAME uid (1000), so a kernel-uid
+  firewall cannot tell them apart. Blocking the GCE metadata server
+  for uid 1000 also blocks pi's own ADC token fetch, which broke
+  every `--provider anthropic-vertex` / `--provider google-vertex`
+  chat in production with "No API key found" at startup.
+
+  The trust boundary for the metadata token has therefore moved from
+  "kernel firewall" to **"GCP IAM scope on the VM service account"**
+  (§6 below). As long as the SA only has `roles/aiplatform.user`
+  (and NOT `roles/iam.serviceAccountTokenCreator`,
+  `roles/storage.admin`, `roles/owner`, etc.), a stolen token can at
+  most spend Vertex / Anthropic quota in our project — same blast
+  radius as a paid pi prompt would already have. **Audit the SA's
+  bindings every month** (§6, command at the bottom of §7) — that is
+  now the single most important defence against AI-token theft.
+
+  Inbound is gated by GCP firewall rules:
 
   - [ ] **VPC Network → Firewall:** confirm rules:
         - `allow-https` (0.0.0.0/0 → tcp:443) — public traffic to Caddy.
@@ -480,7 +500,12 @@
 
   # 7. nftables egress firewall (on the VM)
   ssh digi-setu-live 'sudo nft list table inet pi_egress'
-  # Expect: 3 drop rules (skuid 1000 → 169.254.0.0/16, fe80::/10, 169.254.170.2).
+  # Expect: 2 drop rules
+  #   - skuid 1000 → 169.254.170.2 (AWS metadata, unused but blocked)
+  #   - skuid 1000 → fe80::/10 (IPv6 link-local)
+  # GCE metadata (169.254.169.254) is INTENTIONALLY allowed for uid 1000
+  # so pi's own ADC token fetch works — see §5b for the rationale and
+  # the IAM-scope mitigation that replaces this firewall layer.
 
   # 8. Container hardening (on the VM)
   ssh digi-setu-live 'docker inspect pi-backend' | \
@@ -613,9 +638,12 @@
   - `services/pi_session.py` wraps the pi exec in
     `/usr/bin/setpriv --reuid 1000 --regid 1000 --clear-groups
     --no-new-privs pi --mode rpc …`.
-  - `deploy/nftables/pi-egress.nft` blocks `skuid 1000` from the
-    GCP metadata server (169.254.0.0/16, fe80::/10). The backend
-    (uid 1100) keeps unrestricted egress so its Vertex SDK can
+  - `deploy/nftables/pi-egress.nft` blocks `skuid 1000` from AWS
+    ECS metadata (169.254.170.2) and IPv6 link-local (fe80::/10).
+    GCE metadata (169.254.169.254) is intentionally ALLOWED for
+    uid 1000 — see §5b for why (pi needs its own ADC) and the
+    IAM-scope mitigation. The backend (uid 1100) has unrestricted
+    egress so its Vertex SDK can
     still fetch ADC tokens.
 
   ### 11c. Verification — run on the VM after deploy
@@ -643,11 +671,18 @@
   ssh digi-setu-live "docker exec --user 1000:1000 pi-backend ls /srv/pi/data/workspaces/${WS}"
   # Expect: a normal listing of `workspace/`, the symlinks, etc.
 
-  # 5. The metadata server is blocked for uid 1000 but reachable for uid 1100
-  ssh digi-setu-live 'docker exec --user 1000:1000 pi-backend curl -sS --max-time 2 http://169.254.169.254/'
-  # Expect: a curl: (28) Connection timed out OR (7) Failed to connect — NOT a 200.
-  ssh digi-setu-live 'docker exec --user 1100:1100 pi-backend curl -sS --max-time 2 http://169.254.169.254/'
-  # Expect: a 200 OK with the metadata index. (Backend Vertex auth works.)
+  # 5. The metadata server is reachable for BOTH uid 1000 AND uid 1100.
+  #    (uid 1000 is allowed by design — see §5b for why. The token
+  #    blast radius is now controlled by the SA's IAM scope, not by
+  #    the firewall.)
+  ssh digi-setu-live 'docker exec --user 1000:1000 pi-backend curl -sS --max-time 2 -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/scopes'
+  # Expect: a 200 OK listing the SA's scopes (Vertex + read storage).
+  ssh digi-setu-live 'docker exec --user 1100:1100 pi-backend curl -sS --max-time 2 -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/scopes'
+  # Expect: a 200 OK with the same scopes. (Backend Vertex auth works.)
+  # AWS metadata (169.254.170.2) and IPv6 link-local (fe80::/10) ARE
+  # still blocked for uid 1000; verify with:
+  ssh digi-setu-live 'docker exec --user 1000:1000 pi-backend curl -sS --max-time 2 http://169.254.170.2/'
+  # Expect: a curl: (28) Connection timed out — NOT a 200.
 
   # 6. setpriv is the binary we expect (not a forgotten symlink)
   ssh digi-setu-live 'docker exec pi-backend stat -c "%U:%G %a %n" /usr/bin/setpriv'

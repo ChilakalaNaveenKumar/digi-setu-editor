@@ -34,12 +34,40 @@ table inet pi_egress {
     chain output {
         type filter hook output priority filter; policy accept;
 
-        # Cloud-metadata endpoints — ANY of these would hand out
-        # an IAM token to anyone who can curl them.
-        skuid 1000 ip  daddr 169.254.0.0/16 drop
-        skuid 1000 ip6 daddr fe80::/10      drop
+        # AWS / ECS metadata (cross-cloud belt-and-suspenders). We are
+        # NOT on AWS today, so blocking 169.254.170.2 has zero
+        # collateral risk and does still close the cross-cloud SSRF
+        # path if we ever migrate.
+        skuid 1000 ip daddr 169.254.170.2 drop
 
-        # AWS / ECS metadata (cross-cloud belt-and-suspenders).
-        skuid 1000 ip  daddr 169.254.170.2 drop
+        # IPv6 link-local — also unused on our network and a known
+        # carrier for cloud-metadata-style services. Keep it blocked.
+        skuid 1000 ip6 daddr fe80::/10 drop
+
+        # ───────────────────────────────────────────────────────────────
+        # NOTE: GCE metadata (169.254.169.254 / 169.254.0.0/16 IPv4)
+        # is INTENTIONALLY ALLOWED for uid 1000.
+        #
+        # The dual-uid sandbox runs both legitimate `pi` and the AI's
+        # bash subprocesses as uid 1000 — we cannot differentiate
+        # between them at the kernel firewall layer (skuid is process-
+        # uid, not process-identity). Blocking 169.254.169.254 here
+        # blocks pi's own ADC token fetch alongside any rogue
+        # `curl http://metadata.google.internal/...` from the AI's bash.
+        # Without ADC, every `--provider anthropic-vertex` /
+        # `--provider google-vertex` chat dies at startup with
+        # "No API key found", which is what shipped to prod and
+        # immediately broke chat for every user.
+        #
+        # The trust boundary for the metadata token has therefore moved
+        # from "kernel firewall" to "GCP IAM scope on the VM service
+        # account". As long as the SA only has roles/aiplatform.user
+        # (and NOT roles/iam.serviceAccountTokenCreator,
+        # roles/storage.admin, roles/owner, etc.), a stolen token can
+        # at most spend a small amount of Vertex / Anthropic quota in
+        # our project — same blast radius as a paid pi prompt would
+        # already have. See deploy/HARDENING.md §6 (GCP IAM bindings)
+        # for the SA hardening checklist.
+        # ───────────────────────────────────────────────────────────────
     }
 }
