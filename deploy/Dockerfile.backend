@@ -192,12 +192,40 @@ COPY web/backend/fonts/ /usr/local/share/fonts/digi-setu/
 # every Pillow / matplotlib / cairo workflow does, so we build it.
 RUN fc-cache -f -v | tail -5
 
-# Lock the deployed code down. The backend (uid 1100) reads it; pi
-# subprocesses inherit that uid for now (v1) but in v1.1 the runuser
-# drop means uid 1000 is on the read-list ONLY for /srv/pi/users.
+# Lock the deployed code down. The backend (uid 1100, group app) and
+# the sandbox uid (1000, NOT in group app) BOTH need to:
+#   - traverse /app to reach /app/node_modules/.bin/pi
+#   - execute pi + its npm-bundled binaries
+#   - read /app/web/backend (uvicorn imports), /app/extensions (pi
+#     loads typst-tools.ts at startup), /app/.pi (registry config)
+#
+# Original v1.0 chown-root:app + 0750/0640 only worked because pi ran
+# as uid 1100 (group app member). v1.1 spins pi out to uid 1000 — at
+# that point /app needs world-read+execute or pi crashes with a
+# confusing "setpriv: failed to execute pi: Permission denied".
+#
+# Safety: NOTHING in /app is a secret. All runtime secrets (Clerk,
+# Stripe, Cloudflare API tokens, ADMIN_*, JWT keys) come from
+# /opt/pi/stack.env which is bind-mounted at runtime via docker-compose
+# `env_file:`, NEVER baked into the image. The COPY rules above only
+# pull source code + lockfiles + fonts, none of which contain creds.
+# Dev .env files are .dockerignore'd / .gitignore'd at the source.
+#
+# Defence-in-depth: even if a stray .env did sneak in, the system-wide
+# secret scrubber in pi_session.py (_PI_ENV_DENY) keeps every Clerk/
+# Stripe/Cloudflare key OUT of the env handed to pi, so a hostile
+# bash inside the AI can't `printenv` them either way.
+#
+# We use `chmod -R a+rX,go-w`:
+#   a+r = add read for owner+group+other (so sandbox uid can read)
+#   X   = add execute ONLY where it makes sense (directories, or
+#         files that ALREADY have any execute bit set). This keeps
+#         npm-installed binaries / shell scripts executable without
+#         turning JSON / .ts / .js source files into misleadingly
+#         executable files.
+#   go-w = strip write for group+other (only owner=root writes /app)
 RUN chown -R root:app /app \
- && find /app -type d -exec chmod 0750 {} + \
- && find /app -type f -exec chmod 0640 {} + \
+ && chmod -R a+rX,go-w /app \
  && chmod 0755 /usr/local/bin/pi
 
 # ── Runtime env ──────────────────────────────────────────────────────
