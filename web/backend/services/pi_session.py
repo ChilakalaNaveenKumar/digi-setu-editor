@@ -293,6 +293,31 @@ class PiSession:
         if self._proc is not None:
             return
 
+        # Self-heal sandbox symlinks before every spawn. Two reasons:
+        # (1) workspaces created before SANDBOX_SYMLINKS gained a new
+        #     entry (e.g. node_modules added in the dual-uid migration)
+        #     would otherwise stay broken forever — pi crashes at
+        #     startup with "Cannot find module 'X'" because the require
+        #     resolver can't see /app/node_modules from the workspace
+        #     cwd.
+        # (2) hostile or accidental `rm symlink` inside the workspace
+        #     would silently disable the agent. Re-creating idempotent
+        #     symlinks on every session start is cheap and robust.
+        # Importing inside start() avoids a circular import at module
+        # load (registry imports pi_session indirectly via routes).
+        try:
+            from services.registry import Registry as _Registry
+            _Registry.instance()._wire_sandbox_symlinks(self.workspace_path)
+        except Exception as exc:
+            # Failure here isn't fatal — pi might still work if the
+            # symlinks already exist from create_web_workspace. Log and
+            # continue.
+            print(
+                f"[pi_session {self.session_id}] WARN: "
+                f"_wire_sandbox_symlinks failed: {exc}",
+                file=sys.stderr,
+            )
+
         # Base argv for pi --mode rpc. Built first so the setpriv prefix
         # below can be prepended cleanly.
         pi_argv = [
