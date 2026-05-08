@@ -254,6 +254,31 @@ class PiSession:
         if self._provider == "anthropic-vertex":
             env.setdefault("PI_VERTEX_ANTHROPIC_LOCATION", "global")
 
+        # On the GCE VM the workload identity comes from the metadata
+        # server (169.254.169.254), not from a written ADC file. pi-ai's
+        # `hasVertexAdcCredentials()` heuristic only checks for a file on
+        # disk and otherwise rejects every chat at startup with "No API
+        # key found for {anthropic-vertex,google-vertex}" — even though
+        # google-auth-library inside the SDK would happily fetch a
+        # token from metadata at request time. The patched-in escape
+        # hatch (`PI_TRUST_GCE_METADATA=1`, see
+        # patches/apply-edits.mjs §3b) tells the heuristic to trust
+        # GCE workload identity.
+        #
+        # We set it whenever the env declares the operator INTENDS to
+        # use Vertex (`GOOGLE_GENAI_USE_VERTEXAI=true`) AND a
+        # `GOOGLE_CLOUD_PROJECT` is defined — same signal the SDK
+        # itself uses to decide between AI Studio and Vertex routing.
+        # On a non-GCE machine without ADC the actual API call will
+        # fail with a clear "could not load Application Default
+        # Credentials" error from google-auth-library; our heuristic
+        # only widens the auth-PRESENCE check, not the auth FACT.
+        if (
+            env.get("GOOGLE_GENAI_USE_VERTEXAI", "").lower() == "true"
+            and env.get("GOOGLE_CLOUD_PROJECT")
+        ):
+            env.setdefault("PI_TRUST_GCE_METADATA", "1")
+
         # The permission extension reads PI_PERMISSION_MODE on startup. We pin
         # it here so each spawned pi inherits the user's preference (or the
         # plan default the caller chose). Validation happens inside the

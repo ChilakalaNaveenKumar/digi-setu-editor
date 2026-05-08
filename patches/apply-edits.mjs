@@ -157,6 +157,38 @@ export const streamSimpleAnthropicVertex = createLazySimpleStream(loadAnthropicV
     }`,
     "env-api-keys: anthropic-vertex ADC branch",
   );
+  // ── 3b. Trust the GCE metadata server when no ADC file is present ─────
+  //
+  // Inside the dual-uid sandbox container running on a GCE VM, neither
+  // GOOGLE_APPLICATION_CREDENTIALS nor ~/.config/gcloud/application_default_credentials.json
+  // exists — but http://metadata.google.internal IS reachable and the
+  // attached service account has roles/aiplatform.user. The actual
+  // google-auth-library inside the Vertex / Anthropic-Vertex SDKs will
+  // happily fetch a token from metadata at request time.
+  //
+  // pi-ai's auth-presence heuristic, however, only checks for an ADC
+  // FILE on disk and rejects the chat at startup with "No API key
+  // found" before the SDK ever gets a chance to try metadata. Patch
+  // hasVertexAdcCredentials so it ALSO returns true when the operator
+  // explicitly opts in via `PI_TRUST_GCE_METADATA=1` (set by
+  // services/pi_session.py on the GCE VM). We don't auto-detect by
+  // probing 169.254.169.254 because the probe is sync-only here and we
+  // don't want to add a network round-trip to every getEnvApiKey()
+  // call.
+  patch(
+    f,
+    `function hasVertexAdcCredentials() {
+    if (cachedVertexAdcCredentialsExists === null) {`,
+    `function hasVertexAdcCredentials() {
+    // Operator-opt-in: on GCE / Cloud Run with workload identity, the
+    // ADC file is absent but the metadata server provides tokens at
+    // request time. See patches/apply-edits.mjs §3b.
+    if (process.env.PI_TRUST_GCE_METADATA === "1") {
+        return true;
+    }
+    if (cachedVertexAdcCredentialsExists === null) {`,
+    "env-api-keys: hasVertexAdcCredentials trusts PI_TRUST_GCE_METADATA",
+  );
 }
 
 // ── 4. models.generated.js: register the three models ────────────────────
