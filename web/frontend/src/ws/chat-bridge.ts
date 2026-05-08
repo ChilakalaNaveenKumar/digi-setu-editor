@@ -61,6 +61,15 @@ export class ChatBridge {
           this.opts.onState("error", "kicked by newer tab");
           return;
         }
+        // 4410 = client-requested abort. Backend killed the pi
+        // subprocess to interrupt the in-flight turn. The SPA already
+        // received a `_bridge_error` with code "aborted" before the
+        // close — chat.ts watches for this state and auto-reconnects
+        // so the user can keep chatting without manual intervention.
+        if (e.code === 4410) {
+          this.opts.onState("closed");
+          return;
+        }
         // 4429 = WS-level rate limit (connect/spawn bucket exhausted).
         if (e.code === 4429) {
           this.opts.onState("error", "you're connecting too fast");

@@ -25,6 +25,35 @@ type TokenResolver = () => Promise<string | null>;
 let _tokenResolver: TokenResolver | null = null;
 
 /**
+ * Optional base URL prefix for every request. Web mode leaves this
+ * empty (Caddy reverse-proxies /api/* same-origin). Desktop mode
+ * sets it to `http://127.0.0.1:<sidecar-port>` because the Tauri
+ * webview navigates to a different origin than the FastAPI sidecar
+ * — without this prefix every fetch would 404.
+ *
+ * Only intended for absolute "/api/..." paths and any other path
+ * starting with "/". Already-absolute URLs (https://...) pass
+ * through unchanged. Wired in main.ts after we discover the sidecar
+ * port from `getBackendPort()`.
+ */
+let _apiBase = "";
+
+export function setApiBase(base: string): void {
+  _apiBase = base.replace(/\/+$/, "");
+}
+
+export function getApiBase(): string {
+  return _apiBase;
+}
+
+function _absolutize(path: string): string {
+  if (!_apiBase) return path;
+  if (/^[a-z][a-z0-9+\-.]*:\/\//i.test(path)) return path;
+  if (!path.startsWith("/")) return path;
+  return _apiBase + path;
+}
+
+/**
  * Register the function the API client should call to get a fresh
  * session token (or null if not signed in). Wired in main.ts after
  * the Clerk plugin is installed.
@@ -63,7 +92,7 @@ async function _request(path: string, init?: RequestInit): Promise<Response> {
       ...(init?.headers || {}),
     },
   };
-  const res = await fetch(path, merged);
+  const res = await fetch(_absolutize(path), merged);
   if (!res.ok) throw new ApiError(res.status, await _detail(res));
   return res;
 }
@@ -126,8 +155,19 @@ export async function apiPostForm<T>(path: string, form: FormData): Promise<T> {
  * (custom origin) and prod (same-origin Caddy).
  */
 export async function buildWebSocketUrl(path: string): Promise<string> {
-  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-  let url = `${proto}//${window.location.host}${path}`;
+  // In desktop mode the SPA is served from `tauri://localhost` (or a
+  // dev-mode Vite origin) but the WebSocket has to land on the
+  // FastAPI sidecar's local port. We honour `_apiBase` here so the
+  // computed `ws://` URL points at the right host:port.
+  let url: string;
+  if (_apiBase) {
+    const base = new URL(_apiBase);
+    const proto = base.protocol === "https:" ? "wss:" : "ws:";
+    url = `${proto}//${base.host}${path}`;
+  } else {
+    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+    url = `${proto}//${window.location.host}${path}`;
+  }
   if (_tokenResolver) {
     try {
       const token = await _tokenResolver();

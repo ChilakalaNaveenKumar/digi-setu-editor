@@ -16,6 +16,12 @@ export const useConfigStore = defineStore("config", () => {
   const mode = ref<DeployMode>("web");
   const authRequired = ref(false);
   const clerkPublishableKey = ref("");
+  // BYOK = user dropped their own AI keys into ~/.digi-setu/.env.
+  // When true the picker skips the login redirect, the header shows
+  // a "Using your own key" chip, and Upgrade buttons disappear (they
+  // pay the AI provider directly, our subscription is irrelevant).
+  const byokMode = ref(false);
+  const byokKeys = ref<string[]>([]);
   const ready = ref(false);
 
   async function refresh(): Promise<void> {
@@ -24,6 +30,8 @@ export const useConfigStore = defineStore("config", () => {
       mode.value = cfg.mode === "desktop" ? "desktop" : "web";
       authRequired.value = !!cfg.auth_required;
       clerkPublishableKey.value = cfg.clerk_publishable_key || "";
+      byokMode.value = !!cfg.byok_mode;
+      byokKeys.value = Array.isArray(cfg.byok_keys) ? cfg.byok_keys : [];
     } catch (exc) {
       console.warn("[config] failed to fetch deploy config", exc);
     } finally {
@@ -31,5 +39,13 @@ export const useConfigStore = defineStore("config", () => {
     }
   }
 
-  return { mode, authRequired, clerkPublishableKey, ready, refresh };
+  return {
+    mode,
+    authRequired,
+    clerkPublishableKey,
+    byokMode,
+    byokKeys,
+    ready,
+    refresh,
+  };
 });

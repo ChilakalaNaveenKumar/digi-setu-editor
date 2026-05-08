@@ -19,7 +19,21 @@ import {
   openPortal as apiOpenPortal,
   startCheckout as apiStartCheckout,
 } from "../api/billing";
+import { isDesktop, openExternal } from "../lib/native-bridge";
 import type { CreditSnapshot, PlanInfo } from "../api/types";
+
+/**
+ * In desktop mode Stripe Checkout / Customer Portal must open in the
+ * system browser (3DS, Apple Pay, autofill all break inside Tauri's
+ * webview). The deep-link bridge in main.ts listens for the matching
+ * pi-typst-test://billing/return URL the user hits after success or
+ * cancel, refreshes credit state, and surfaces a confirmation toast.
+ *
+ * The web build keeps the existing `window.location.href` redirect:
+ * it's same-origin, the URL is whitelisted by Stripe, and the
+ * post-payment cookie reattaches automatically.
+ */
+const DESKTOP_BILLING_RETURN = "pi-typst-test://billing/return";
 
 export const useBillingStore = defineStore("billing", () => {
   const enabled = ref(false);
@@ -62,13 +76,28 @@ export const useBillingStore = defineStore("billing", () => {
   }
 
   async function startCheckout(planId: string): Promise<void> {
-    const r = await apiStartCheckout(planId);
-    window.location.href = r.url;
+    const desktop = isDesktop();
+    const r = await apiStartCheckout(
+      planId,
+      desktop ? DESKTOP_BILLING_RETURN : undefined,
+    );
+    if (desktop) {
+      await openExternal(r.url);
+    } else {
+      window.location.href = r.url;
+    }
   }
 
   async function openPortal(): Promise<void> {
-    const r = await apiOpenPortal();
-    window.location.href = r.url;
+    const desktop = isDesktop();
+    const r = await apiOpenPortal(
+      desktop ? DESKTOP_BILLING_RETURN : undefined,
+    );
+    if (desktop) {
+      await openExternal(r.url);
+    } else {
+      window.location.href = r.url;
+    }
   }
 
   const planLabel = computed(() => credit.value?.plan?.label ?? "Free");

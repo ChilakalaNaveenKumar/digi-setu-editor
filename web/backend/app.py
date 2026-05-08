@@ -54,7 +54,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from config import CORS_ORIGINS
+from config import CORS_ORIGINS, DEPLOY_MODE
 from routes import (
     attachments,
     auth_webhook,
@@ -62,6 +62,7 @@ from routes import (
     billing,
     chat_ws,
     config as config_route,
+    desktop_relay,
     feedback,
     files,
     fs,
@@ -100,20 +101,28 @@ async def _lifespan(app: FastAPI):
     fall back to the subprocess runtime where this proxy isn't on
     the path anyway.
     """
-    try:
-        await container_pool.cleanup_orphaned_containers()
-    except Exception as exc:
-        # Cleanup failures are non-fatal — orphans burn a little
-        # memory until the next manual `docker rm` but don't break
-        # new chats.
-        import sys as _sys
-        print(f"[lifespan] container_pool cleanup failed: {exc}", file=_sys.stderr)
+    # Desktop mode runs the agent as a plain subprocess on the user's
+    # own machine — no Docker, no per-session containers, no egress
+    # MITM proxy. Skipping the container pool sweep + egress proxy
+    # avoids spurious "/srv/pi/state read-only" warnings on first
+    # launch and keeps the boot fast.
+    if DEPLOY_MODE != "desktop":
+        try:
+            await container_pool.cleanup_orphaned_containers()
+        except Exception as exc:
+            # Cleanup failures are non-fatal — orphans burn a little
+            # memory until the next manual `docker rm` but don't break
+            # new chats.
+            import sys as _sys
+            print(f"[lifespan] container_pool cleanup failed: {exc}", file=_sys.stderr)
 
-    egress_proxy.start_egress_proxy()
+        egress_proxy.start_egress_proxy()
+
     try:
         yield
     finally:
-        egress_proxy.stop_egress_proxy()
+        if DEPLOY_MODE != "desktop":
+            egress_proxy.stop_egress_proxy()
 
 
 def create_app() -> FastAPI:
@@ -149,9 +158,15 @@ def create_app() -> FastAPI:
     app.include_router(terminal_ws.router)
 
     # Public (unauth) auth-side endpoints: webhook + feedback.
-    # The webhook is signature-verified, the feedback endpoint requires
-    # a signed-in user — they're grouped here only for module locality.
+    # auth_webhook is Clerk-signature-verified; feedback requires a
+    # signed-in user.
     app.include_router(auth_webhook.router)
+
+    # Desktop relay: hosted backend endpoint that desktop clients (no
+    # BYOK key, signed in via Clerk) connect to over WebSocket. The
+    # router itself decides per-request whether to accept based on
+    # plan + headers; see web/backend/routes/desktop_relay.py.
+    app.include_router(desktop_relay.router)
     app.include_router(feedback.router)
     app.include_router(usage.router)
     app.include_router(models_route.router)

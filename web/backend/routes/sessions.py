@@ -23,6 +23,7 @@ from services.billing import CreditLedger
 from services.history import load_history
 from services.models_registry import is_allowed
 from services.registry import Registry
+from services.user_prefs import user_prefs
 
 router = APIRouter(tags=["sessions"])
 
@@ -84,7 +85,7 @@ async def set_session_model(
     surfaces this by labelling the picker's selection "from next prompt"
     when the chat WS is open.
     """
-    session_for_user_or_404(sid, user_id)
+    sess_rec = session_for_user_or_404(sid, user_id)
     plan_id = CreditLedger.instance().get_plan_id(user_id)
     if not is_allowed(payload.model, plan_id):
         raise HTTPException(
@@ -92,9 +93,20 @@ async def set_session_model(
             detail=f"model '{payload.model}' is not available on the {plan_id} plan",
         )
     try:
-        return Registry.instance().set_session_model(sid, payload.model)
+        result = Registry.instance().set_session_model(sid, payload.model)
     except KeyError:
         raise HTTPException(status_code=404, detail=f"unknown session: {sid}")
+
+    # Remember this pick as the workspace's default for the next new
+    # chat. Per-workspace memory means each folder stays "sticky" on
+    # whatever model the user used there last — they don't have to
+    # re-pick every time they hop between projects with different
+    # cost/quality trade-offs.
+    wsid = (sess_rec.get("workspace_id") or "").strip()
+    if wsid:
+        user_prefs().set_workspace_model(user_id, wsid, payload.model)
+
+    return result
 
 
 @router.patch("/api/sessions/{sid}")

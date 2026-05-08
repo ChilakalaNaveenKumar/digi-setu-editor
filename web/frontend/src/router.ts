@@ -6,8 +6,13 @@
  *   /                  Home — picker (web flat list, or desktop workspace list)
  *   /sessions          Alias for / — Clerk's hosted sign-in redirects here
  *                      after auth (configured in the Clerk dashboard).
- *   /workspaces/:wsid  Desktop drilled into one workspace's chat list
- *   /chat/:sid         Active chat session (the IDE shell)
+ *   /workspaces/:wsid  Desktop landing — resolves to the most-recent
+ *                      chat in the workspace (or auto-creates one), then
+ *                      redirects to /chat/:sid. Kept for bookmark stability;
+ *                      not part of the primary navigation flow.
+ *   /chat/:sid         Active chat session (the IDE shell). Tabs in the
+ *                      chat sidebar switch between chats inside the
+ *                      currently-open workspace.
  *   /login             Clerk <SignIn /> mount point
  *   /pricing           Public plans page (sign-in required to upgrade)
  *   /privacy           Static privacy policy (/privacy-policy is also routed

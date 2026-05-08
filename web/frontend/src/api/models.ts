@@ -12,6 +12,14 @@ import type { ModelInfo, SessionRecord } from "./types";
 export interface ModelsResponse {
   default: string;
   plan: string;
+  /**
+   * True when the desktop sidecar booted with at least one BYOK
+   * provider key in ~/.digi-setu/.env. Frontend uses it to decide
+   * whether to surface the "BYOK / Cloud" hint in the model picker
+   * — when there are no BYOK keys at all, every model is cloud and
+   * the badge would just be noise.
+   */
+  byok_mode?: boolean;
   models: ModelInfo[];
 }
 

@@ -16,7 +16,13 @@ from typing import Any
 
 from fastapi import APIRouter
 
-from config import AUTH_REQUIRED, CLERK_PUBLISHABLE_KEY, DEPLOY_MODE
+from config import (
+    AUTH_REQUIRED,
+    BYOK_MODE,
+    CLERK_PUBLISHABLE_KEY,
+    DEPLOY_MODE,
+    DETECTED_BYOK_KEYS,
+)
 
 router = APIRouter()
 
@@ -27,4 +33,15 @@ async def get_config() -> dict[str, Any]:
         "mode": DEPLOY_MODE,
         "auth_required": AUTH_REQUIRED,
         "clerk_publishable_key": CLERK_PUBLISHABLE_KEY,
+        # `byok_mode=true` tells the SPA the user has dropped their
+        # own AI keys into ~/.digi-setu/.env. The picker / chat
+        # views use it to:
+        #   - skip the "sign in" gate (no Clerk needed)
+        #   - render a small "Using your own key" chip in the header
+        #   - hide the Upgrade / billing CTAs (they pay their
+        #     provider directly, our subscription is irrelevant)
+        # Empty list when BYOK is off; tells which key kinds were
+        # detected when on (for the chip's tooltip).
+        "byok_mode": BYOK_MODE,
+        "byok_keys": DETECTED_BYOK_KEYS if BYOK_MODE else [],
     }

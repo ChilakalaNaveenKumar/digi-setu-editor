@@ -241,6 +241,14 @@ _PI_ENV_DENY: frozenset[str] = frozenset({
     "ADMIN_EMAILS",
     "ADMIN_USER_IDS",
     "DATABASE_URL", "DB_PASSWORD",
+})
+
+# BYOK API keys that desktop users may put in ~/.digi-setu/.env. In
+# web mode these stay denied (the cloud relay never wants the user's
+# direct keys leaking into the container). In desktop+BYOK mode we
+# allow whichever key matches the picked model — see services.byok
+# for the per-provider scrubbing.
+_PI_ENV_BYOK_KEYS: frozenset[str] = frozenset({
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
 })
@@ -249,10 +257,24 @@ _PI_ENV_ALLOW_PREFIXES: tuple[str, ...] = ("PI_",)
 
 
 def _scrub_env_for_subprocess(full_env: dict[str, str]) -> dict[str, str]:
-    """Subprocess runtime: drop secrets, keep PI_*/GOOGLE_*/etc."""
+    """Subprocess runtime: drop secrets, keep PI_*/GOOGLE_*/etc.
+
+    In desktop+BYOK mode, BYOK API keys (ANTHROPIC_API_KEY,
+    OPENAI_API_KEY, …) are allowed through because they're the
+    user's own credentials — the whole point of BYOK. The per-call
+    scrubbing in services.byok then prunes keys irrelevant to the
+    picked model so an Anthropic call doesn't see the user's OpenAI
+    key, etc.
+    """
+    from config import BYOK_MODE  # local import to avoid cycles at module load
+
     out: dict[str, str] = {}
     for key, value in full_env.items():
         if key in _PI_ENV_DENY:
+            continue
+        if key in _PI_ENV_BYOK_KEYS:
+            if BYOK_MODE:
+                out[key] = value
             continue
         if key in _PI_ENV_ALLOW_SUBPROCESS:
             out[key] = value
@@ -655,8 +677,34 @@ class PiSession:
         """
         env = _scrub_env_for_subprocess(self._backend_env)
 
+        # ── BYOK rerouting (desktop only) ────────────────────────────
+        # If we're in BYOK mode AND the picked model has a route via
+        # one of the user's keys, swap the cloud-relay provider
+        # (anthropic-vertex / google-vertex) for the direct provider
+        # (anthropic / google / openai) and prune env vars from
+        # *other* providers so a Claude call doesn't see the user's
+        # OpenAI key. This MUST run before the cloud-relay default
+        # injection below — once we go BYOK we don't want our project
+        # id silently riding along.
+        from config import BYOK_MODE  # local import: avoid cycles
+        from services.byok import byok_provider_for, byok_subprocess_env  # noqa: E402
+        from services.models_registry import get_model  # noqa: E402
+
+        active_provider = self._provider
+        spec = get_model(self._model)
+        if BYOK_MODE and spec is not None:
+            pick = byok_provider_for(spec)
+            if pick is not None:
+                env = byok_subprocess_env(spec, env)
+                active_provider = pick[1]
+                # Mutate self._provider so later code paths (cmd
+                # arg list, _container_env if it ever ran in this
+                # branch) see the updated value too. Subprocess is
+                # the only path that hits this in desktop today.
+                self._provider = active_provider
+
         # Per-session overrides win over env.sh defaults.
-        if self._provider == "anthropic-vertex":
+        if active_provider == "anthropic-vertex":
             env.setdefault("PI_VERTEX_ANTHROPIC_LOCATION", "global")
 
         # Vertex on a GCE VM (laptop dev usually doesn't hit this; the
@@ -672,6 +720,58 @@ class PiSession:
         env["PI_PERMISSION_MODE"] = self._permission_mode
         if self._permission_mode_file_host:
             env["PI_PERMISSION_MODE_FILE"] = str(self._permission_mode_file_host)
+
+        # ── Desktop runtime override ─────────────────────────────────
+        # When the Tauri shell launches the backend it sets two env
+        # vars pointing at the bundled Node + pi-coding-agent install
+        # so we don't depend on whatever Node/pi the user has on PATH
+        # (or doesn't). The bundled extensions live next to the
+        # bundled pi tree so absolute paths work regardless of which
+        # folder the user picked.
+        #
+        # Layout (set up by desktop/pi-runtime/install-pi.sh):
+        #   PI_DESKTOP_NODE_BIN = <vendor>/node-<plat>/bin/node
+        #   PI_DESKTOP_PI_DIR   = <vendor>/pi  (contains node_modules/.bin/pi)
+        #   <vendor>/extensions/typst-tools.ts
+        #   <vendor>/extensions/permission.ts
+        #
+        # In web mode neither var is set so we fall through to the
+        # `pi` PATH lookup, exactly as before.
+        desktop_node = env.get("PI_DESKTOP_NODE_BIN", "").strip()
+        desktop_pi_dir = env.get("PI_DESKTOP_PI_DIR", "").strip()
+        if desktop_node and desktop_pi_dir:
+            from pathlib import Path as _Path
+            _pi_dir = _Path(desktop_pi_dir)
+            _vendor_root = _pi_dir.parent
+            # The npm-installed shim is a node script; we invoke it as
+            # `node <pi-shim>` to avoid relying on the shebang (which
+            # points at /usr/bin/env node — fine on Mac, fails inside
+            # a sandboxed app bundle on Win).
+            # The package's `bin` field points at `dist/cli.js`, which
+            # is what `node_modules/.bin/pi` symlinks to. We invoke
+            # that file directly because the symlink doesn't survive a
+            # Tauri bundle copy on Windows (NTFS junction limitations
+            # vs the npm-created reparse point).
+            _pi_shim = _pi_dir / "node_modules" / "@mariozechner" / "pi-coding-agent" / "dist" / "cli.js"
+            _ext_typst = _vendor_root / "extensions" / "typst-tools.ts"
+            _ext_perm = _vendor_root / "extensions" / "permission.ts"
+            cmd = [
+                desktop_node,
+                str(_pi_shim),
+                "--mode", "rpc",
+                "--provider", self._provider,
+                "--model", self._model,
+                "--session-dir", str(self.session_dir),
+            ]
+            if _ext_typst.exists():
+                cmd += ["--extension", str(_ext_typst)]
+            if _ext_perm.exists():
+                cmd += ["--extension", str(_ext_perm)]
+            # NODE_PATH lets jiti / require resolve the extensions'
+            # deps (@google/genai, typebox, …) which live next to the
+            # bundled pi install, not in the user's picked folder.
+            env["NODE_PATH"] = str(_pi_dir / "node_modules")
+            return cmd, str(self.workspace_path), env
 
         cmd = [
             "pi",
@@ -740,6 +840,48 @@ class PiSession:
                 )
             except Exception:
                 pass
+
+        if self._stderr_task and not self._stderr_task.done():
+            self._stderr_task.cancel()
+
+    async def terminate(self) -> None:
+        """Force-kill the pi subprocess immediately, bypassing the 5s grace
+        period used by `close()`. This is what an interactive abort needs:
+        when the user clicks stop, the in-flight HTTP request to Vertex /
+        Anthropic must be dropped at the OS level *now*, not after a polite
+        stdin-close handshake that waits for the LLM round-trip to finish
+        on its own.
+
+        Idempotent — second call after the process already exited is a
+        no-op. Marks the session closed so `close()` won't double-kill.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        if self._proc is None:
+            return
+
+        if self._runtime == "docker":
+            try:
+                import subprocess as _sp
+                _sp.run(
+                    ["docker", "kill", self._container_name],
+                    check=False,
+                    capture_output=True,
+                    timeout=2.0,
+                )
+            except Exception:
+                pass
+        try:
+            self._proc.kill()
+        except ProcessLookupError:
+            pass
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(self._proc.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pass
 
         if self._stderr_task and not self._stderr_task.done():
             self._stderr_task.cancel()

@@ -206,3 +206,65 @@ digi-setu.com, www.digi-setu.com {
 		file_server
 	}
 }
+
+# ── api.digi-setu.com — desktop relay subdomain ─────────────────────
+# Hosts the cloud-relay endpoint that desktop clients without BYOK
+# keys connect to: `wss://api.digi-setu.com/v1/ws/desktop-relay`. The
+# desktop ships this URL hard-coded as the default for `PI_RELAY_BASE`,
+# so any change to the hostname / path scheme here breaks every
+# already-shipped binary.
+#
+# Keep the surface MINIMAL: only `/v1/...` is exposed. Anything not
+# under `/v1/` returns 404 — we don't want the api subdomain to
+# accidentally serve the SPA, the legacy /api routes, or static assets.
+#
+# Same backend container as the apex (127.0.0.1:8788) for v1; if/when
+# the relay grows enough to need its own VM or Cloud Run service we
+# can split here without changing the public URL.
+#
+# DNS / Cloudflare prerequisites (one-time, not Caddy's job):
+#   1. In Cloudflare DNS for digi-setu.com:
+#        Type:  CNAME (or A — see note below)
+#        Name:  api
+#        Value: <same target as @ — typically the VM's public hostname>
+#        Proxy: leave OFF if you want Caddy to terminate TLS itself
+#               (Let's Encrypt DNS-01 needs the Cloudflare API token in
+#               stack.env). Turn ON if you'd rather terminate at
+#               Cloudflare and let Caddy serve plain HTTP — but then
+#               drop the TLS block below and add `cf-connecting-ip`
+#               handling like the apex.
+#   2. The CLOUDFLARE_API_TOKEN scoped to "Edit zone DNS" must include
+#      the api.digi-setu.com subdomain (zone-level scoping covers this
+#      automatically).
+#   3. After deploying this Caddyfile change, Caddy will request a Let's
+#      Encrypt cert for api.digi-setu.com on first request. Allow ~30 s
+#      for the DNS-01 challenge to propagate before the relay endpoint
+#      is reachable.
+api.digi-setu.com {
+	import common_headers
+
+	# /v1/ws/desktop-relay — desktop ⇄ server-side pi WebSocket.
+	# Same stream_proxy snippet the apex uses for chat/terminal WS so
+	# tokens flush per-write and the long-lived socket isn't cut by
+	# the default idle timeout.
+	handle /v1/ws/* {
+		import stream_proxy
+	}
+
+	# /v1/health — smoke probe (used by monitoring + the desktop's
+	# pre-flight check before opening the relay WS). Plain JSON, no
+	# auth, returns immediately.
+	#
+	# /v1/<other> — future REST endpoints under the same versioned
+	# tree. Anything not handled explicitly above falls through here.
+	handle /v1/* {
+		reverse_proxy 127.0.0.1:8788
+	}
+
+	# Lock down everything else. We don't want the api subdomain to
+	# accidentally serve the SPA, /healthz (apex-only), or anything
+	# under /api/ (also apex-only).
+	handle {
+		respond 404
+	}
+}

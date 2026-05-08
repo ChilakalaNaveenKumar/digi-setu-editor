@@ -25,12 +25,15 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { Icon } from "@iconify/vue";
 
 import type { ModelInfo } from "../api/types";
+import { useBillingStore } from "../stores/billing";
 import { useChatStore } from "../stores/chat";
 import { useModelsStore } from "../stores/models";
 
 const models = useModelsStore();
 const chat = useChatStore();
-const { catalogue, activeModelId, activeModelName } = storeToRefs(models);
+const billing = useBillingStore();
+const { catalogue, activeModelId, activeModelName, byokMode } = storeToRefs(models);
+const { enabled: billingEnabled } = storeToRefs(billing);
 
 const open = ref(false);
 const triggerRef = ref<HTMLButtonElement | null>(null);
@@ -132,7 +135,35 @@ function intelligenceBadge(m: ModelInfo): { label: string; class: string } {
 function tooltipFor(m: ModelInfo): string {
   const price = `$${m.cost_per_mtok_input.toFixed(2)} / $${m.cost_per_mtok_output.toFixed(2)} per Mtok`;
   const lock = m.available ? "" : ` · requires ${m.min_plan.toUpperCase()}`;
-  return `${m.name} · ${price}${lock}\n${m.blurb}`;
+  // Surface the routing path in BYOK-eligible deployments. We do
+  // this in the title attribute (not as inline text) because the
+  // dropdown row is already dense; users only need the detail when
+  // they pause to read it.
+  const route = m.route === "byok"
+    ? "\nroute: your key (BYOK) — billed by your AI provider directly"
+    : m.route === "cloud" && byokMode.value
+      ? "\nroute: cloud relay — billed against your Digi Setu subscription"
+      : "";
+  return `${m.name} · ${price}${lock}\n${m.blurb}${route}`;
+}
+
+/**
+ * Compact badge for the route column. Returned only when the user
+ * has at least one BYOK key configured (otherwise every model is
+ * cloud and the badge would just be noise).
+ */
+function routeBadge(m: ModelInfo): { label: string; class: string } | null {
+  if (!byokMode.value) return null;
+  if (m.route === "byok") {
+    return {
+      label: "BYOK",
+      class: "border-success/40 bg-success/10 text-success",
+    };
+  }
+  return {
+    label: "CLOUD",
+    class: "border-border bg-muted text-muted-foreground",
+  };
 }
 
 const filtered = computed<ModelInfo[]>(() => {
@@ -166,8 +197,37 @@ function moveHighlight(delta: number): void {
   highlightId.value = list[next].id;
 }
 
+// Cloud-model gate. In BYOK mode without a billing account we
+// cannot route a chat through our cloud relay (no auth, no way
+// to bill). Surface an upgrade nudge instead of silently failing
+// at chat-start. Backend has the same gate as a defence in depth
+// — see chat_ws.py `BYOK gate`.
+const cloudGateMessage = ref<string | null>(null);
+const cloudGateModel = ref<ModelInfo | null>(null);
+
+function shouldGateCloud(m: ModelInfo): boolean {
+  if (!byokMode.value) return false;
+  if (m.route !== "cloud") return false;
+  // billingEnabled is true when the backend has Stripe + Clerk
+  // wired AND the user is signed in. In that state cloud-relay
+  // works fine, so don't gate. In BYOK-only desktop launches the
+  // ledger reports enabled=false, which is exactly when we want
+  // to nudge.
+  return !billingEnabled.value;
+}
+
 async function onPick(m: ModelInfo): Promise<void> {
   if (!m.available) return;
+  if (shouldGateCloud(m)) {
+    cloudGateModel.value = m;
+    cloudGateMessage.value = (
+      `${m.name} runs on Digi Setu's cloud relay. ` +
+      `Pick a model badged BYOK to use the keys in ~/.digi-setu/.env, ` +
+      `or sign in / subscribe to use cloud models.`
+    );
+    open.value = false;
+    return;
+  }
   open.value = false;
   const sid = chat.session?.id;
   if (!sid) return;
@@ -277,6 +337,11 @@ function onKeyDown(e: KeyboardEvent): void {
               />
               <span class="flex-1 truncate">{{ m.name }}</span>
               <span
+                v-if="routeBadge(m)"
+                class="shrink-0 rounded border px-1 py-px font-mono text-[9px] uppercase tracking-wide"
+                :class="routeBadge(m)!.class"
+              >{{ routeBadge(m)!.label }}</span>
+              <span
                 class="shrink-0 text-[10px]"
                 :class="intelligenceBadge(m).class"
               >
@@ -298,6 +363,46 @@ function onKeyDown(e: KeyboardEvent): void {
         <!-- Footer hint — keeps the rows themselves uncluttered -->
         <div class="border-t border-border px-2.5 py-1 font-mono text-[9px] text-muted-foreground">
           ↑↓ navigate · ↵ pick · esc close · hover for price
+        </div>
+      </div>
+    </Teleport>
+
+    <!-- Upgrade modal (BYOK-only desktop trying to pick a cloud model).
+         Kept inline here rather than reusing UpgradeModal because the
+         copy is BYOK-specific — we want to clearly say "pick a BYOK
+         model OR subscribe" rather than the generic "you're out of
+         credit" pitch. -->
+    <Teleport to="body">
+      <div
+        v-if="cloudGateMessage"
+        class="fixed inset-0 z-[70] flex items-center justify-center bg-black/50 p-4"
+        @click="cloudGateMessage = null"
+      >
+        <div
+          class="w-full max-w-md rounded-lg border border-border bg-card p-5 shadow-2xl"
+          @click.stop
+        >
+          <div class="mb-2 flex items-center gap-2">
+            <Icon icon="codicon:cloud" class="h-5 w-5 text-warning" />
+            <h2 class="text-base font-semibold text-foreground">Cloud model selected</h2>
+          </div>
+          <p class="text-[12px] leading-relaxed text-muted-foreground">{{ cloudGateMessage }}</p>
+          <div class="mt-4 flex flex-wrap items-center justify-end gap-2">
+            <button
+              type="button"
+              class="rounded-md border border-border bg-background px-3 py-1.5 text-[11px] text-foreground hover:bg-muted"
+              @click="cloudGateMessage = null"
+            >
+              Pick a different model
+            </button>
+            <RouterLink
+              to="/pricing"
+              class="rounded-md bg-primary px-3 py-1.5 text-[11px] font-semibold text-primary-foreground hover:opacity-90"
+              @click="cloudGateMessage = null"
+            >
+              See plans
+            </RouterLink>
+          </div>
         </div>
       </div>
     </Teleport>

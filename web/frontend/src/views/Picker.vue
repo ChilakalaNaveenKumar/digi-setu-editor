@@ -19,6 +19,7 @@ import { useRouter } from "vue-router";
 import { Icon } from "@iconify/vue";
 
 import BrandHeader from "../components/BrandHeader.vue";
+import { pickFolder } from "../lib/native-bridge";
 import { useChatSessionStore } from "../stores/chat-session";
 import { useConfigStore } from "../stores/config";
 import { useUiStore } from "../stores/ui";
@@ -144,22 +145,65 @@ async function deleteWebSession(s: { id: string; workspace_id: string }): Promis
   }
 }
 
+/**
+ * Land the user inside a workspace's chat view with the right session
+ * preselected. Shared by the "pick a folder" CTA and the "click a recent
+ * folder card" path so they never diverge: both trust the registry's
+ * dedup (same canonical path → same wsid → same chat history) and only
+ * mint a fresh chat when the folder genuinely has no sessions yet.
+ */
+async function _enterDesktopWorkspace(w: WorkspaceRecord): Promise<void> {
+  await sess.refresh(w.id);
+  const recent = sess.sessions[0];
+  const target = recent ?? (await sess.create(w.id));
+  router.push({ name: "chat", params: { sid: target.id }, query: { wsid: w.id } });
+}
+
 async function pickDesktopWorkspace(): Promise<void> {
-  const path = window.prompt("Absolute path to workspace folder:");
+  // Tauri shell → native OS folder dialog. Web build → window.prompt
+  // fallback. The same call site works in both deployments because
+  // `pickFolder()` runtime-detects.
+  const path = await pickFolder();
   if (!path) return;
   busy.value = true;
   try {
+    // Backend `register_desktop_workspace` is now idempotent on
+    // (owner, canonical_path), so picking a folder we've already
+    // registered returns the existing wsid (with chats intact). We
+    // only auto-create a fresh chat when this is genuinely a new
+    // workspace — `_enterDesktopWorkspace` does that distinction.
     const w = await ws.create({ path });
-    router.push({ name: "workspace", params: { wsid: w.id } });
+    await _enterDesktopWorkspace(w);
   } catch (exc) {
-    ui.toastError("Could not open folder", exc);
+    // 404 from the backend means the user picked a folder that no
+    // longer exists on disk (deleted or unmounted between dialog and
+    // submit). Promote that to a friendlier message; everything else
+    // falls through to the generic toast.
+    const status = (exc as { status?: number } | null)?.status;
+    if (status === 404) {
+      ui.toastError(
+        "Folder not found — was it moved or deleted? Pick another.",
+        exc,
+      );
+    } else {
+      ui.toastError("Could not open folder", exc);
+    }
   } finally {
     busy.value = false;
   }
 }
 
-function openDesktopWorkspace(w: WorkspaceRecord): void {
-  router.push({ name: "workspace", params: { wsid: w.id } });
+async function openDesktopWorkspace(w: WorkspaceRecord): Promise<void> {
+  // Re-opening a folder card on the home page: jump to its most-recent
+  // chat if one exists, otherwise auto-create a new one.
+  busy.value = true;
+  try {
+    await _enterDesktopWorkspace(w);
+  } catch (exc) {
+    ui.toastError("Could not open folder", exc);
+  } finally {
+    busy.value = false;
+  }
 }
 
 async function renameWorkspace(w: WorkspaceRecord): Promise<void> {

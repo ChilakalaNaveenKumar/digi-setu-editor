@@ -158,6 +158,34 @@ materialises `/srv/pi/{state,data,www}` + `/srv/caddy`, and enables
 
 ## 4. Push stack files (compose, Caddyfile, systemd, scripts, stack.env)
 
+> **One-time DNS prereq for the desktop relay (added 2026-05-08).**
+> The Caddyfile now serves `api.digi-setu.com` (the desktop client's
+> cloud-relay endpoint). Before this push, add the subdomain in
+> Cloudflare DNS:
+>
+> 1. Cloudflare dashboard → `digi-setu.com` zone → **DNS** tab.
+> 2. **Add record**:
+>    - Type: `CNAME`
+>    - Name: `api`
+>    - Target: `digi-setu.com`  (so it follows the apex automatically)
+>    - Proxy status: **DNS only (grey cloud)** — Caddy must terminate
+>      TLS itself for the `wss://` upgrade. Orange-cloud proxy mode
+>      strips the `Upgrade` header on the free plan.
+>    - TTL: Auto.
+> 3. Wait ~30 s for propagation. Verify:
+>    ```bash
+>    dig +short api.digi-setu.com
+>    # → should return the same IP as digi-setu.com
+>    ```
+> 4. The existing `CLOUDFLARE_API_TOKEN` in `stack.env` is zone-scoped
+>    so it already covers `api.digi-setu.com` — no token rotation
+>    needed.
+>
+> After the next `remote-deploy.sh stack` + `systemctl reload pi`,
+> Caddy issues a fresh Let's Encrypt cert for `api.digi-setu.com` via
+> the DNS-01 challenge. First request to `https://api.digi-setu.com/v1/health`
+> may take ~30 s while the cert is being signed.
+
 ```bash
 deploy/scripts/remote-deploy.sh stack
 ```

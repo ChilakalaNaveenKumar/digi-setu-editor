@@ -40,6 +40,16 @@ export interface ModelInfo {
   blurb: string;
   cost_per_mtok_input: number;
   cost_per_mtok_output: number;
+  /**
+   * Which path the next prompt would take with this model:
+   *   - "byok"   — desktop BYOK; user pays the AI provider directly
+   *   - "cloud"  — our cloud relay; billed against the user's
+   *                Digi Setu subscription
+   * Web mode is always "cloud". Desktop mode flips to "byok" only
+   * when the user has a key compatible with the model's family in
+   * ~/.digi-setu/.env.
+   */
+  route?: "byok" | "cloud";
 }
 
 export interface PlanInfo {

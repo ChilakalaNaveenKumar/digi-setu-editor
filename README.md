@@ -35,6 +35,15 @@ scripts/run.sh                       # interactive
 
 For the full plan + concrete test prompts, see [RUN.md](./RUN.md).
 
+## Desktop app
+
+A Tauri-based macOS + Windows shell that wraps the same `web/` codebase
+lives under [`desktop/`](./desktop/). It bundles the FastAPI backend
+(via PyInstaller), Node.js, and pi-coding-agent into a single drag-to-
+Applications install. See [`desktop/README.md`](./desktop/README.md) for
+the full dev loop, release scripts, and how the desktop client differs
+from the hosted web product.
+
 ## What this exists to test
 
 1. Does pi load a 4-tool extension correctly via `package.json`'s `pi.extensions` field?

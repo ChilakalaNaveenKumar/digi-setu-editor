@@ -7,7 +7,9 @@ import { clerkPlugin, getToken } from "@clerk/vue";
 
 import App from "./App.vue";
 import { router } from "./router";
-import { setTokenResolver } from "./api/client";
+import { setApiBase, setTokenResolver } from "./api/client";
+import { installDeepLinkBridge } from "./lib/desktop-auth";
+import { isDesktop, waitForBackend } from "./lib/native-bridge";
 import { useConfigStore } from "./stores/config";
 import "./app.css";
 
@@ -50,6 +52,68 @@ async function boot(): Promise<void> {
   const pinia = createPinia();
   app.use(pinia);
   app.use(router);
+
+  // Desktop bridge: discover the sidecar's randomized port and pin
+  // every API request to `http://127.0.0.1:<port>`. In web mode this
+  // resolves to null and the api client uses relative paths, exactly
+  // as before. The wait is bounded by the sidecar health-check
+  // timeout in src-tauri/src/sidecar.rs; if it returns null we let
+  // the SPA boot anyway and surface the connection error in the UI.
+  if (isDesktop()) {
+    const port = await waitForBackend();
+    if (port) {
+      setApiBase(`http://127.0.0.1:${port}`);
+    } else {
+      console.error(
+        "[boot] Desktop sidecar did not announce a port; API calls will fail until it does.",
+      );
+    }
+
+    // Suppress page-reload shortcuts inside the Tauri webview. A
+    // native desktop app should NOT behave like a browser tab — Cmd+R
+    // / Ctrl+R / F5 would tear down all in-flight chats, drop the
+    // websocket, and replay the boot sequence from scratch (which
+    // confused the user during dev). Devtools / hard-refresh during
+    // engineering can still be done by restarting `tauri dev`.
+    window.addEventListener(
+      "keydown",
+      (e) => {
+        const isReloadCombo =
+          e.key === "F5" ||
+          ((e.metaKey || e.ctrlKey) && (e.key === "r" || e.key === "R"));
+        if (isReloadCombo) {
+          e.preventDefault();
+          e.stopPropagation();
+        }
+      },
+      { capture: true },
+    );
+
+    // Wire the pi-typst-test:// deep-link handler. Auth + billing
+    // callbacks from the system browser come through here.
+    void installDeepLinkBridge({
+      onAuthSuccess: async () => {
+        // Refresh config + reload so the Clerk plugin picks up the
+        // newly-stamped session and the router's beforeEach guard
+        // lets the user past /login.
+        try {
+          await cfg.refresh();
+        } catch {}
+        window.location.replace("/");
+      },
+      onAuthFailure: (reason) => {
+        console.error("[desktop-auth] failed:", reason);
+      },
+      onBillingSuccess: async () => {
+        try {
+          await cfg.refresh();
+        } catch {}
+      },
+      onBillingCancel: () => {
+        console.info("[desktop-auth] checkout cancelled");
+      },
+    });
+  }
 
   const cfg = useConfigStore();
   await cfg.refresh();

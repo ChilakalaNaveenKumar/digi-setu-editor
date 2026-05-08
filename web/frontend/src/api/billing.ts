@@ -103,6 +103,64 @@ export function getUsageEvents(opts: {
   return apiJson(`/api/usage/events${qs ? "?" + qs : ""}`);
 }
 
+/**
+ * One row in the local BYOK ledger (~/.digi-setu/usage.sqlite). Token
+ * counts only — we don't compute USD because the user pays their AI
+ * provider directly and we don't know their actual rate.
+ */
+export interface ByokEvent {
+  ts: string;
+  session_id: string;
+  workspace_id: string;
+  provider: string;
+  model_id: string;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read: number;
+  cache_write: number;
+}
+
+export interface ByokSummary {
+  total: {
+    turns?: number;
+    input_tokens?: number;
+    output_tokens?: number;
+    cache_read?: number;
+    cache_write?: number;
+  };
+  per_model: Array<{
+    model_id: string;
+    provider: string;
+    turns: number;
+    input_tokens: number;
+    output_tokens: number;
+  }>;
+}
+
+export interface ByokUsageResponse {
+  byok_active: boolean;
+  events: ByokEvent[];
+  summary: ByokSummary;
+  limit: number;
+}
+
+/**
+ * Fetch BYOK usage rolled up from the local SQLite ledger. The
+ * response is empty (and `byok_active=false`) in web mode and in
+ * desktop installs without any BYOK keys, so callers don't need to
+ * branch on deployment shape.
+ */
+export function getByokUsage(opts: {
+  limit?: number;
+  since?: string;
+} = {}): Promise<ByokUsageResponse> {
+  const params = new URLSearchParams();
+  if (opts.limit) params.set("limit", String(opts.limit));
+  if (opts.since) params.set("since", opts.since);
+  const qs = params.toString();
+  return apiJson(`/api/usage/byok${qs ? "?" + qs : ""}`);
+}
+
 export interface CheckoutResponse {
   url: string;
   session_id: string;

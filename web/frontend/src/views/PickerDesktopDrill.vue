@@ -1,16 +1,24 @@
 <!--
-  Desktop drill-in view: one workspace's chat sessions.
-  URL: /workspaces/:wsid
+  Desktop /workspaces/:wsid landing — kept around so bookmarks and
+  legacy in-app links keep working, but no longer renders a "pick a
+  chat" UI. The desktop UX is: opening a folder = a ready chat.
+
+  Flow:
+    1. Load workspace registry (wsid must exist; if not, bounce home).
+    2. List chats in this workspace.
+    3. If any exist, redirect to the most-recent one.
+       Else, auto-create a fresh chat and redirect to it.
+    4. While the network calls are inflight, render a tiny spinner so
+       the brief flash isn't a black screen.
 -->
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from "vue";
-import { storeToRefs } from "pinia";
+import { onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
+import { Icon } from "@iconify/vue";
 
 import { useChatSessionStore } from "../stores/chat-session";
 import { useUiStore } from "../stores/ui";
 import { useWorkspaceStore } from "../stores/workspace";
-import type { SessionRecord } from "../api/types";
 
 const props = defineProps<{ wsid: string }>();
 const router = useRouter();
@@ -18,136 +26,51 @@ const ui = useUiStore();
 const ws = useWorkspaceStore();
 const sess = useChatSessionStore();
 
-const { sessions } = storeToRefs(sess);
+const error = ref<string | null>(null);
 
-const busy = ref(false);
-const workspace = computed(() => ws.workspaces.find((w) => w.id === props.wsid) ?? null);
-
-async function load(): Promise<void> {
-  if (!ws.workspaces.length) await ws.refresh();
-  if (!workspace.value) {
-    router.replace({ name: "picker" });
-    return;
-  }
-  await sess.refresh(props.wsid);
-}
-
-onMounted(load);
-watch(() => props.wsid, load);
-
-async function startNewSession(): Promise<void> {
-  busy.value = true;
+async function resolve(): Promise<void> {
   try {
-    const s = await sess.create(props.wsid);
-    router.push({ name: "chat", params: { sid: s.id }, query: { wsid: props.wsid } });
+    if (!ws.workspaces.length) await ws.refresh();
+    const found = ws.workspaces.find((w) => w.id === props.wsid);
+    if (!found) {
+      router.replace({ name: "picker" });
+      return;
+    }
+
+    await sess.refresh(props.wsid);
+    const recent = sess.sessions[0];
+    const target = recent ?? (await sess.create(props.wsid));
+    router.replace({
+      name: "chat",
+      params: { sid: target.id },
+      query: { wsid: props.wsid },
+    });
   } catch (exc) {
-    ui.toastError("Could not create chat", exc);
-  } finally {
-    busy.value = false;
+    const msg = exc instanceof Error ? exc.message : String(exc);
+    error.value = msg;
+    ui.toastError("Could not open workspace", exc);
   }
 }
 
-function open(s: SessionRecord): void {
-  router.push({ name: "chat", params: { sid: s.id }, query: { wsid: props.wsid } });
-}
-
-async function rename(s: SessionRecord): Promise<void> {
-  const next = window.prompt("Rename chat:", s.title || "Untitled chat");
-  if (!next) return;
-  try {
-    await sess.rename(s.id, next);
-  } catch (exc) {
-    ui.toastError("Could not rename", exc);
-  }
-}
-
-async function remove(s: SessionRecord): Promise<void> {
-  const ok = await ui.confirm({
-    title: "Delete this chat?",
-    description: "Files in the workspace are kept.",
-    confirmLabel: "Delete",
-    cancelLabel: "Cancel",
-    variant: "destructive",
-  });
-  if (!ok) return;
-  try {
-    await sess.remove(s.id);
-  } catch (exc) {
-    ui.toastError("Could not delete", exc);
-  }
-}
-
-function timeShort(iso: string | undefined): string {
-  if (!iso) return "";
-  const d = new Date(iso);
-  if (isNaN(d.valueOf())) return "";
-  return d.toLocaleString(undefined, {
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
+onMounted(resolve);
 </script>
 
 <template>
-  <div class="flex h-full w-full items-center justify-center bg-background p-6 text-foreground">
-    <div class="w-full max-w-lg rounded-lg border border-border bg-card p-6 shadow-lg">
+  <div class="flex h-full w-full items-center justify-center bg-background text-foreground">
+    <div v-if="!error" class="flex items-center gap-2 text-sm text-muted-foreground">
+      <Icon icon="codicon:loading" class="h-4 w-4 animate-spin" />
+      Opening workspace…
+    </div>
+    <div v-else class="max-w-sm rounded-md border border-destructive/40 bg-destructive/10 p-4 text-sm text-destructive">
+      <div class="font-medium">Could not open workspace</div>
+      <div class="mt-1 text-xs opacity-80">{{ error }}</div>
       <button
         type="button"
-        class="mb-3 text-xs text-muted-foreground hover:text-foreground"
-        @click="router.push({ name: 'picker' })"
+        class="mt-3 rounded-md border border-border bg-card px-3 py-1 text-xs text-foreground hover:border-primary/40"
+        @click="router.replace({ name: 'picker' })"
       >
-        ← All workspaces
+        Back to home
       </button>
-
-      <div v-if="workspace" class="mb-5">
-        <div class="text-[11px] uppercase tracking-wide text-muted-foreground">Workspace</div>
-        <div class="mt-0.5 truncate text-base font-semibold">{{ workspace.name }}</div>
-        <div class="truncate font-mono text-[11px] text-muted-foreground">{{ workspace.path }}</div>
-      </div>
-
-      <button
-        type="button"
-        class="w-full rounded-md bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground hover:opacity-90 disabled:opacity-60"
-        :disabled="busy"
-        @click="startNewSession"
-      >
-        + New chat in this workspace
-      </button>
-
-      <div v-if="sessions.length" class="mt-5 space-y-1">
-        <div class="text-[11px] uppercase tracking-wide text-muted-foreground">Chats</div>
-        <div
-          v-for="s in sessions"
-          :key="s.id"
-          class="group flex items-center gap-2 rounded-md border border-border bg-background px-3 py-2 hover:border-ring"
-        >
-          <button type="button" class="flex-1 text-left text-xs text-foreground" @click="open(s)">
-            <div class="truncate">{{ s.title || "Untitled chat" }}</div>
-            <div class="text-[10px] text-muted-foreground">{{ timeShort(s.last_used) }}</div>
-          </button>
-          <button
-            type="button"
-            class="rounded p-1 text-muted-foreground opacity-0 hover:text-foreground group-hover:opacity-100"
-            title="Rename"
-            @click="rename(s)"
-          >
-            ✎
-          </button>
-          <button
-            type="button"
-            class="rounded p-1 text-destructive opacity-0 hover:bg-destructive/10 group-hover:opacity-100"
-            title="Delete chat"
-            @click="remove(s)"
-          >
-            ×
-          </button>
-        </div>
-      </div>
-      <div v-else class="mt-3 text-center text-xs text-muted-foreground">
-        No chats in this workspace yet.
-      </div>
     </div>
   </div>
 </template>

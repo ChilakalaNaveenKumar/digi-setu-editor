@@ -45,7 +45,15 @@ PREFS_PATH = DATA_ROOT / "user_prefs.json"
 _USERS_DIR = DATA_ROOT / "users"
 
 VALID_PERMISSION_MODES = ("auto", "approve_risky", "approve_all")
-DEFAULT_PERMISSION_MODE = "approve_risky"
+# `approve_risky` matches the Cursor / Cline / Roo Code default — agent
+# runs everything but pops a confirm prompt for risky shell ops (rm,
+# network, sudo). Override with PI_PERMISSION_MODE_DEFAULT for desktop
+# launches that want a different first-launch posture.
+_DEFAULT_FROM_ENV = os.environ.get("PI_PERMISSION_MODE_DEFAULT", "").strip().lower()
+DEFAULT_PERMISSION_MODE = (
+    _DEFAULT_FROM_ENV if _DEFAULT_FROM_ENV in {"auto", "approve_risky", "approve_all"}
+    else "approve_risky"
+)
 
 # user_id from Clerk looks like "user_2abcXYZ..."; in dev we sometimes
 # pass "anon" or an email. Restrict to filesystem-safe chars to avoid
@@ -191,6 +199,86 @@ class UserPrefs:
         if not path.exists():
             self._write_live_file(user_id, mode)
         return path
+
+    # ── per-workspace last-used model ───────────────────────────────────────
+    #
+    # Desktop UX: each folder remembers its last-used model so opening the
+    # folder again (or starting a fresh chat in it) defaults to whatever the
+    # user picked last time. We store these inline on the user pref blob
+    # under "workspace_models": { wsid: model_id } — flat dict, tiny, no
+    # migration concerns. Web mode uses this too (it doesn't hurt) but the
+    # picker behaves the same as before because users typically only have
+    # one or two workspaces in a session.
+
+    def get_workspace_model(self, user_id: str, wsid: str) -> Optional[str]:
+        """Return the last model id picked in this workspace, or None.
+        The caller (chat_ws) treats None as "no preference; use plan
+        default" — same path it took before this feature existed."""
+        if not user_id or not wsid:
+            return None
+        with self._lock:
+            row = self._data.get(user_id) or {}
+            blob = row.get("workspace_models")
+            if isinstance(blob, dict):
+                value = blob.get(wsid)
+                if isinstance(value, str) and value:
+                    return value
+        return None
+
+    def set_workspace_model(self, user_id: str, wsid: str, model_id: str) -> None:
+        """Record `model_id` as the last-used choice for `wsid`. Idempotent
+        — repeated writes of the same model are cheap (we still flush, but
+        no diff). Empty / falsy inputs are no-ops."""
+        if not user_id or not wsid or not model_id:
+            return
+        with self._lock:
+            row = self._data.setdefault(user_id, {})
+            blob = row.get("workspace_models")
+            if not isinstance(blob, dict):
+                blob = {}
+                row["workspace_models"] = blob
+            if blob.get(wsid) == model_id:
+                return
+            blob[wsid] = model_id
+            self._flush_locked()
+
+    # ── desktop routing default (BYOK vs Cloud) ─────────────────────────────
+    #
+    # When the user has BYOK keys configured the model picker badges each
+    # row as BYOK or CLOUD; this preference is the *default* posture used
+    # when opening a brand-new chat with no model pinned yet. Per-chat
+    # picks always override this.
+
+    VALID_ROUTING_DEFAULTS = ("byok", "cloud")
+
+    def get_routing_default(self, user_id: str, *, fallback: str = "byok") -> str:
+        """Return the user's preferred default route. `fallback` is what
+        we return when nothing's stored yet — caller passes "byok" when
+        BYOK keys are present, "cloud" otherwise."""
+        if not user_id:
+            return fallback
+        with self._lock:
+            row = self._data.get(user_id) or {}
+            chosen = row.get("routing_default")
+        if isinstance(chosen, str) and chosen in self.VALID_ROUTING_DEFAULTS:
+            return chosen
+        return fallback
+
+    def set_routing_default(self, user_id: str, value: str) -> str:
+        """Persist the user's BYOK/Cloud routing default. Returns the
+        value actually stored (may differ if input was invalid)."""
+        if not user_id:
+            return "byok"
+        cleaned = (value or "").strip().lower()
+        if cleaned not in self.VALID_ROUTING_DEFAULTS:
+            cleaned = "byok"
+        with self._lock:
+            row = self._data.setdefault(user_id, {})
+            if row.get("routing_default") == cleaned:
+                return cleaned
+            row["routing_default"] = cleaned
+            self._flush_locked()
+        return cleaned
 
     def snapshot(self, user_id: str) -> dict[str, Any]:
         """Return a copy of all known prefs for the user (useful for /me APIs)."""

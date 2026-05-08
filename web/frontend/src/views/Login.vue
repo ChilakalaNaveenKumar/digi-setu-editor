@@ -28,6 +28,8 @@ import { useRoute, useRouter, RouterLink } from "vue-router";
 import { useClerk } from "@clerk/vue";
 
 import BrandHeader from "../components/BrandHeader.vue";
+import { isDesktop } from "../lib/native-bridge";
+import { startDesktopSignIn } from "../lib/desktop-auth";
 import { useConfigStore } from "../stores/config";
 
 const route = useRoute();
@@ -35,7 +37,7 @@ const router = useRouter();
 const cfg = useConfigStore();
 const clerk = useClerk();
 
-const status = ref<"loading" | "redirecting" | "error">("loading");
+const status = ref<"loading" | "redirecting" | "error" | "waiting-browser">("loading");
 const errMsg = ref("");
 
 const redirectUrl = computed(() => {
@@ -45,6 +47,25 @@ const redirectUrl = computed(() => {
 
 async function handoff(): Promise<void> {
   if (!cfg.authRequired) return;
+
+  // Desktop: bounce sign-in out to the system browser. The Tauri
+  // webview can't host Clerk's UI directly (anti-phishing, passkeys,
+  // autofill all break). After Clerk authenticates the user, the
+  // production web app's /desktop/sign-in page redirects to a
+  // pi-typst-test:// deep link, which the deep-link bridge installed
+  // in main.ts picks up and exchanges for a session.
+  if (isDesktop()) {
+    status.value = "waiting-browser";
+    try {
+      await startDesktopSignIn();
+    } catch (exc) {
+      console.error("[login] startDesktopSignIn failed", exc);
+      errMsg.value = exc instanceof Error ? exc.message : String(exc);
+      status.value = "error";
+    }
+    return;
+  }
+
   const c = clerk.value;
   if (!c) return;
 
@@ -122,8 +143,18 @@ watch(
             <template v-if="status === 'redirecting'">
               Redirecting to Clerk…
             </template>
+            <template v-else-if="status === 'waiting-browser'">
+              Sign in in your browser, then return here. We're listening
+              for the redirect…
+            </template>
             <template v-else>Loading…</template>
           </p>
+          <button
+            v-if="status === 'waiting-browser'"
+            type="button"
+            class="mt-2 rounded-md border border-border bg-card px-3 py-1.5 text-xs font-medium text-foreground hover:border-primary/50"
+            @click="handoff"
+          >Reopen browser</button>
         </template>
       </div>
 

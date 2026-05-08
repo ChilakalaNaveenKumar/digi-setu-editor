@@ -21,6 +21,13 @@ export const useModelsStore = defineStore("models", () => {
   const catalogue = ref<ModelInfo[]>([]);
   const defaultId = ref<string>("claude-sonnet-4-6");
   const planId = ref<string>("free");
+  /**
+   * Mirrors `byok_mode` from /api/models. Frontend uses this to
+   * conditionally surface the BYOK/Cloud hint in the picker — when
+   * the user has no keys configured every row is cloud and the
+   * badge becomes visual noise.
+   */
+  const byokMode = ref(false);
   const loaded = ref(false);
 
   const pinnedModelId = ref<string | null>(null);
@@ -33,6 +40,7 @@ export const useModelsStore = defineStore("models", () => {
       catalogue.value = r.models;
       defaultId.value = r.default;
       planId.value = r.plan;
+      byokMode.value = !!r.byok_mode;
       loaded.value = true;
     } catch (exc) {
       console.warn("[models] refresh failed", exc);
@@ -83,6 +91,7 @@ export const useModelsStore = defineStore("models", () => {
     catalogue,
     defaultId,
     planId,
+    byokMode,
     loaded,
     pinnedModelId,
     activeModelId,

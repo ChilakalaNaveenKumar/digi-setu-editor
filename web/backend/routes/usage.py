@@ -34,8 +34,11 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Query
 
+from config import BYOK_MODE
 from services.auth import require_user
 from services.billing import CreditLedger, plans
+from services.byok_usage import recent_events as byok_recent_events
+from services.byok_usage import summary as byok_summary
 from services.rate_limit import RateLimiter
 
 router = APIRouter(tags=["usage"])
@@ -74,3 +77,32 @@ async def get_usage_events(
         user_id, limit=limit, since_iso=since
     )
     return {"events": events, "limit": limit}
+
+
+@router.get("/api/usage/byok")
+async def get_byok_usage(
+    user_id: str = Depends(require_user),  # noqa: ARG001 — desktop is single-user; require_user gates dev-mode access only
+    limit: int = Query(200, ge=1, le=500),
+    since: Optional[str] = Query(None),
+) -> dict[str, Any]:
+    """Per-turn rows + rollup summary from the local BYOK ledger
+    (SQLite at ~/.digi-setu/usage.sqlite). When called in web mode
+    or in desktop without any BYOK keys, returns empty arrays so the
+    Activity page can render a quiet "no local usage" state without
+    branching on the deployment shape.
+
+    No USD figures are returned — the user pays their AI provider
+    directly and we don't know their actual rate."""
+    if not BYOK_MODE:
+        return {
+            "byok_active": False,
+            "events": [],
+            "summary": {"total": {}, "per_model": []},
+            "limit": limit,
+        }
+    return {
+        "byok_active": True,
+        "events": byok_recent_events(limit=limit, since_iso=since),
+        "summary": byok_summary(since_iso=since),
+        "limit": limit,
+    }

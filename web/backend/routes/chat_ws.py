@@ -28,7 +28,12 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from config import DEPLOY_MODE, PROMPT_TIMEOUT_SECONDS, WORKSPACE_DISK_QUOTA_MB
+from config import (
+    BYOK_MODE,
+    DEPLOY_MODE,
+    PROMPT_TIMEOUT_SECONDS,
+    WORKSPACE_DISK_QUOTA_MB,
+)
 from services.auth import user_for_websocket
 from services.bg_processes import BackgroundProcessHub
 from services.billing import (
@@ -275,17 +280,82 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
     #   1. Use the session's pinned model if set AND still allowed on
     #      the user's current plan (they may have downgraded since
     #      pinning Opus).
-    #   2. Otherwise use the cheapest model their plan can afford,
+    #   2. Else fall back to the workspace's last-used model (desktop
+    #      remembers per-folder so reopening a workspace defaults to
+    #      whatever you used last time there).
+    #   3. Otherwise use the cheapest model their plan can afford,
     #      defaulting to Sonnet for paying tiers.
     plan_id = CreditLedger.instance().get_plan_id(user_id)
     pinned_model = (sess_rec.get("model") or "").strip()
-    active_model_id = (
-        pinned_model
-        if pinned_model and is_allowed(pinned_model, plan_id)
-        else pick_default_for_plan(plan_id)
-    )
+    # The session's parent workspace id — defined here so the
+    # workspace-default lookup can reuse it. We re-bind the same value
+    # below as `workspace_id_for_audit` (kept for the existing audit
+    # log call sites) to avoid touching every reference.
+    session_workspace_id = (sess_rec.get("workspace_id") or "").strip()
+    workspace_default = user_prefs().get_workspace_model(user_id, session_workspace_id) or ""
+    if pinned_model and is_allowed(pinned_model, plan_id):
+        active_model_id = pinned_model
+    elif workspace_default and is_allowed(workspace_default, plan_id):
+        active_model_id = workspace_default
+    else:
+        active_model_id = pick_default_for_plan(plan_id)
     active_model_spec = get_model(active_model_id) or get_model(DEFAULT_MODEL_ID)
     pi_provider = active_model_spec.pi_provider if active_model_spec else None
+
+    # ── BYOK fallback for the default pick ──────────────────────────
+    # In BYOK-only desktop launches (no Clerk subscription), the
+    # plan-default cycle ends in cloud-routed Haiku, which would
+    # then trip the gate below. Substitute the cheapest BYOK-routable
+    # model when there's no explicit pin/workspace default — so the
+    # user gets a chat instead of an upgrade modal on first launch.
+    #
+    # We only do this when nothing was pinned: if the user explicitly
+    # picked a cloud model we want the gate to fire and explain why.
+    if (
+        BYOK_MODE
+        and not pinned_model
+        and not workspace_default
+        and active_model_spec is not None
+    ):
+        from services.byok import (  # noqa: E402
+            byok_default_model,
+            byok_provider_for,
+        )
+        from services.models_registry import _MODELS as _ALL_MODELS  # noqa: E402
+        if byok_provider_for(active_model_spec) is None:
+            fallback = byok_default_model(list(_ALL_MODELS))
+            if fallback is not None:
+                active_model_id = fallback
+                active_model_spec = get_model(fallback) or active_model_spec
+                pi_provider = (
+                    active_model_spec.pi_provider if active_model_spec else None
+                )
+
+    # ── BYOK gate ───────────────────────────────────────────────────
+    # If we're in BYOK mode and the (now-resolved) model has no path
+    # via the user's keys, refuse to spawn — we cannot bill a cloud-
+    # relay request to anything in this state. Tell the SPA which
+    # action to take so it can show an upgrade modal instead of a
+    # generic "spawn failed" toast.
+    #
+    # The frontend ModelPicker also gates this to avoid the user
+    # ever picking a CLOUD model in this state — this is the
+    # belt-and-braces backend defence.
+    if BYOK_MODE and active_model_spec is not None:
+        from services.byok import byok_provider_for as _byok_pf  # noqa: E402
+        if _byok_pf(active_model_spec) is None:
+            await ws.send_json({
+                "type": "_bridge_error",
+                "code": "upgrade_required",
+                "model": active_model_id,
+                "message": (
+                    f"Model '{active_model_spec.name}' requires a Digi Setu "
+                    "subscription. Pick a model badged BYOK (uses your "
+                    "key in ~/.digi-setu/.env) or sign in to use cloud models."
+                ),
+            })
+            await ws.close(code=4402)
+            return
 
     permission_mode = user_prefs().get_permission_mode(user_id, plan_id=plan_id)
     # Materialise the per-user live file before spawn so the extension's
@@ -375,6 +445,7 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
     # loop that would otherwise drain their token budget for hours.
     turn_started_at: dict[str, Optional[float]] = {"ts": None}
     timed_out: dict[str, bool] = {"flag": False}
+    aborted: dict[str, bool] = {"flag": False}
 
     # Background title-generation state. We only ever fire this once per
     # session (the first time we see a non-empty user prompt). Storing
@@ -547,6 +618,28 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
                 "total_usd": cost.total_usd,
             },
         )
+
+        # ── BYOK ledger (desktop only) ──────────────────────────────
+        # When BYOK is active and the picked model has a path through
+        # the user's own keys, also record a token-only row in the
+        # local SQLite. The Activity page reads this so the user can
+        # see usage that never hit our cloud relay (no $ figure
+        # because we don't know their provider's price).
+        if BYOK_MODE and active_model_spec is not None:
+            from services.byok import byok_provider_for as _byok_pf  # noqa: E402
+            from services.byok_usage import record as _byok_record  # noqa: E402
+            _byok_pick = _byok_pf(active_model_spec)
+            if _byok_pick is not None:
+                _byok_record(
+                    session_id=session_id,
+                    workspace_id=workspace_id_for_audit,
+                    provider=_byok_pick[1],
+                    model_id=active_model_id,
+                    input_tokens=int(usage.get("input") or 0),
+                    output_tokens=int(usage.get("output") or 0),
+                    cache_read=int(usage.get("cacheRead") or 0),
+                    cache_write=int(usage.get("cacheWrite") or 0),
+                )
 
     def _maybe_charge_tool_sub_llm(evt: dict[str, Any]) -> None:
         """Bill side-LLM calls that happen *inside* tool execute() bodies.
@@ -896,6 +989,48 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
                     {"type": "_bridge_error", "message": f"Invalid JSON from client: {raw[:120]!r}"}
                 )
                 continue
+            # Client-driven abort. The SPA sends `{type: "abort"}` when
+            # the user clicks the stop button (see web/frontend/src/stores/
+            # chat.ts:507). pi's RPC stream itself has no "abort current
+            # turn" frame — see prompt_watchdog's comment below — so the
+            # only reliable way to interrupt a runaway turn is to kill
+            # the subprocess. We force-kill rather than the polite 5s
+            # grace in `pi.close()` because the user clicked stop *now*;
+            # they don't want to wait 5 seconds for the in-flight Vertex
+            # request to round-trip on its own.
+            #
+            # Order matters: send the bridge_error first so the SPA flips
+            # `isStreaming` false immediately (its `_dispatch` handler
+            # at chat.ts:449 keys off this), then terminate, then return
+            # so the parent's `asyncio.wait` tears down the rest of the
+            # pumps and closes the WS with our 4410 code. The SPA's
+            # bridge handles 4410 by reconnecting automatically (see
+            # ws/chat-bridge.ts) so the user can keep chatting without
+            # an extra click.
+            if command.get("type") == "abort":
+                aborted["flag"] = True
+                print(
+                    f"[ws {session_id}] abort requested by client; force-killing pi",
+                    file=sys.stderr,
+                )
+                try:
+                    await ws.send_json(
+                        {
+                            "type": "_bridge_error",
+                            "code": "aborted",
+                            "message": "Aborted.",
+                        }
+                    )
+                except Exception:
+                    pass
+                try:
+                    await pi.terminate()
+                except Exception as exc:
+                    print(
+                        f"[ws {session_id}] abort: pi.terminate raised {exc!r}",
+                        file=sys.stderr,
+                    )
+                return
             # Permission gate response. We translate the SPA's high-level
             # decision (allow_once / allow_session / deny_once / deny_session)
             # into the extension_ui_response shape pi expects. The pi-side
@@ -974,7 +1109,12 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
                 # agent stop digging the hole and forces the user to
                 # clean up (delete files via the UI, or ask the agent
                 # to delete them) before continuing.
-                if WORKSPACE_DISK_QUOTA_MB > 0:
+                # Desktop runs on the user's own disk — no quota
+                # applies. The whole "you've hit the sandbox cap"
+                # affordance only makes sense for the hosted (web)
+                # product where each chat lives in a sandboxed
+                # workspaces/<wsid>/ directory under our data root.
+                if DEPLOY_MODE == "web" and WORKSPACE_DISK_QUOTA_MB > 0:
                     used_mb = workspace_over_quota(workspace_path, WORKSPACE_DISK_QUOTA_MB)
                     if used_mb is not None:
                         # When a hosted-tier user hits the workspace
@@ -1140,6 +1280,8 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
         # instead of a generic disconnect.
         if timed_out["flag"]:
             await ws.close(code=4408)
+        elif aborted["flag"]:
+            await ws.close(code=4410)
         else:
             await ws.close()
     except Exception:

@@ -78,6 +78,12 @@ export const useChatStore = defineStore("chat", () => {
   const connState = ref<ConnState>("idle");
   const isStreaming = ref(false);
   const lastError = ref<string | null>(null);
+  // Set by `abort()`, cleared by the connect()-side bridge state handler
+  // when the WS subsequently closes. Used to silently respawn pi after
+  // a user-driven abort instead of stranding the chat in "Connection
+  // closed". NOT a `ref` — only the connect/abort code paths read it,
+  // and we don't want a stale render to fire reconnect twice.
+  let _abortedAwaitingReconnect = false;
 
   // Files the user attached (paperclip / paste / drop) that haven't
   // been included in a prompt yet. The composer renders one chip per
@@ -261,6 +267,16 @@ export const useChatStore = defineStore("chat", () => {
    * tail.
    */
   async function connect(sessionId: string, wsid: string): Promise<void> {
+    // Consume any pending "auto-reconnect after abort" intent that hasn't
+    // been picked up yet. We're already in connect() — by definition a
+    // reconnect is happening (whether kicked off by abort, the model
+    // picker, or an explicit reconnect()), so the flag's job is done.
+    // Clearing here also defuses a race where the OLD bridge's async
+    // `onclose` arrives after disconnect() and re-reads the flag; without
+    // this clear that callback can fire a phantom second reconnect()
+    // mid-swap, which manifests as "pi crashed" + needs-browser-refresh
+    // when the user changes models during a streaming turn.
+    _abortedAwaitingReconnect = false;
     disconnect();
 
     router.messages = [];
@@ -290,16 +306,38 @@ export const useChatStore = defineStore("chat", () => {
     // Bail out if a newer connect() raced past us while history was loading.
     if (session.value?.id !== sessionId) return;
 
-    bridge = new ChatBridge({
+    // Bind the bridge identity into the onState closure so a dying old
+    // bridge (whose ws.onclose fires asynchronously after we've already
+    // moved on to a new bridge) cannot mutate the active session's UI
+    // state or re-trigger reconnect. This is a belt-and-suspenders guard
+    // on top of the flag-clear above.
+    const newBridge = new ChatBridge({
       sessionId,
       onState: (state, error) => {
+        if (bridge !== newBridge) return;
         connState.value = state;
         if (state === "error" && error) lastError.value = error;
         if (state === "closed" || state === "error") isStreaming.value = false;
+        // After a client-driven abort the backend closes the WS with code
+        // 4410, which the bridge surfaces as a normal "closed" state. We
+        // set `_abortedAwaitingReconnect` in `abort()` so we can tell
+        // *this* close apart from a real disconnect (network blip, tab
+        // backgrounded, server crash) and silently respawn pi instead of
+        // showing the "Connection closed" banner. Without this the user
+        // would have to click the model picker to reconnect after every
+        // abort, which defeats the purpose of having a stop button.
+        if (state === "closed" && _abortedAwaitingReconnect) {
+          _abortedAwaitingReconnect = false;
+          void reconnect();
+        }
       },
-      onEvent: (raw) => _dispatch(raw as RpcEvent & Record<string, unknown>),
+      onEvent: (raw) => {
+        if (bridge !== newBridge) return;
+        _dispatch(raw as RpcEvent & Record<string, unknown>);
+      },
     });
-    bridge.open();
+    bridge = newBridge;
+    newBridge.open();
   }
 
   /**
@@ -326,6 +364,11 @@ export const useChatStore = defineStore("chat", () => {
   }
 
   function disconnect(): void {
+    // An explicit teardown supersedes any pending abort-reconnect intent.
+    // Without this, navigating to a new session immediately after clicking
+    // stop could let the dying bridge's onclose schedule a reconnect to
+    // the *previous* session id.
+    _abortedAwaitingReconnect = false;
     if (bridge) {
       bridge.close();
       bridge = null;
@@ -506,6 +549,13 @@ export const useChatStore = defineStore("chat", () => {
 
   function abort(): void {
     if (!bridge || !bridge.isOpen) return;
+    // Arm the auto-reconnect flag *before* we send the frame. The
+    // backend closes the WS very fast (the abort handler sends one
+    // bridge_error then returns, killing pi inline), so by the time
+    // we hit the next microtask the close handler may already have
+    // fired. Setting the flag first guarantees the connect() callback
+    // sees it.
+    _abortedAwaitingReconnect = true;
     bridge.send({ type: "abort" });
   }
 
@@ -579,12 +629,18 @@ export const useChatStore = defineStore("chat", () => {
     if (isStreaming.value) {
       abort();
       // Wait for the backend to flip isStreaming false (via _bridge_error
-      // 'aborted' or agent_end). If we send the new prompt before that,
-      // the backend's prompt-in-flight guard will reject it. Time out
-      // after 4s and try anyway — the bridge will surface an error if
-      // the abort genuinely failed.
+      // 'aborted' or agent_end) AND for the bridge to come back online.
+      // The abort path now genuinely tears down the WS (close code 4410)
+      // and auto-reconnects, so we have to wait for connState to settle
+      // back to "open" or our `bridge.send()` would land on the closed
+      // socket and disappear. Time out after 6s and try anyway — the
+      // bridge will surface an error if the abort/reconnect genuinely
+      // failed.
       const start = Date.now();
-      while (isStreaming.value && Date.now() - start < 4000) {
+      while (
+        (isStreaming.value || connState.value !== "open") &&
+        Date.now() - start < 6000
+      ) {
         await new Promise((r) => setTimeout(r, 50));
       }
     }

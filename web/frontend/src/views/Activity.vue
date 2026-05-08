@@ -28,7 +28,14 @@ import { Icon } from "@iconify/vue";
 import { storeToRefs } from "pinia";
 
 import BrandHeader from "../components/BrandHeader.vue";
-import { getUsage, getUsageEvents, type UsageEvent } from "../api/billing";
+import {
+  getByokUsage,
+  getUsage,
+  getUsageEvents,
+  type ByokEvent,
+  type ByokSummary,
+  type UsageEvent,
+} from "../api/billing";
 import { useBillingStore } from "../stores/billing";
 import type { CreditSnapshot } from "../api/types";
 
@@ -44,18 +51,27 @@ const loading = ref(false);
 const errMsg = ref("");
 const credit = ref<CreditSnapshot | null>(null);
 const lastFetchedAt = ref<string | null>(null);
+// BYOK side: separate fetch so the cloud table loads on web installs
+// without paying for a sidecar round-trip on every refresh.
+const byokActive = ref(false);
+const byokEvents = ref<ByokEvent[]>([]);
+const byokSummary = ref<ByokSummary>({ total: {}, per_model: [] });
 let refreshTimer: ReturnType<typeof setInterval> | null = null;
 
 async function refresh(): Promise<void> {
   loading.value = true;
   errMsg.value = "";
   try {
-    const [usage, evts] = await Promise.all([
+    const [usage, evts, byok] = await Promise.all([
       getUsage(),
       getUsageEvents({ limit: 500 }),
+      getByokUsage({ limit: 500 }),
     ]);
     credit.value = usage.credit;
     events.value = evts.events;
+    byokActive.value = byok.byok_active;
+    byokEvents.value = byok.events;
+    byokSummary.value = byok.summary;
     lastFetchedAt.value = new Date().toISOString();
   } catch (exc) {
     errMsg.value = exc instanceof Error ? exc.message : String(exc);
@@ -146,6 +162,17 @@ function eventLabel(e: UsageEvent): string {
   if (e.source === "tool") return e.tool || "tool";
   return "chat";
 }
+
+// ── BYOK derived ──────────────────────────────────────────────────
+const byokTotalTokens = computed(() => {
+  const t = byokSummary.value.total;
+  return (
+    (t.input_tokens || 0) +
+    (t.output_tokens || 0) +
+    (t.cache_read || 0) +
+    (t.cache_write || 0)
+  );
+});
 </script>
 
 <template>
@@ -191,6 +218,20 @@ function eventLabel(e: UsageEvent): string {
       >
         Couldn't load activity: {{ errMsg }}
       </p>
+
+      <!-- Section heading for the cloud-billed events. Hidden when
+           BYOK is the only path (no cloud calls have ever happened
+           on this machine) so the page doesn't scream "you owe $0". -->
+      <h2
+        v-if="byokActive"
+        class="mb-3 flex items-center gap-2 text-sm font-semibold text-foreground"
+      >
+        <Icon icon="codicon:cloud" class="h-4 w-4 text-muted-foreground" />
+        Cloud usage
+        <span class="font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
+          via your Digi Setu subscription
+        </span>
+      </h2>
 
       <!-- SUMMARY CARDS -->
       <section class="mb-6 grid grid-cols-2 gap-3 md:grid-cols-4">
@@ -359,6 +400,168 @@ function eventLabel(e: UsageEvent): string {
             its tokens and cost.
           </p>
         </div>
+      </section>
+
+      <!-- ── BYOK SECTION ──────────────────────────────────────────
+           Only renders when the desktop sidecar has at least one
+           BYOK key in ~/.digi-setu/.env. We deliberately keep this
+           visually distinct from the cloud table — different colour
+           accent, no $ column, footer link to provider dashboards
+           — so the user can't confuse "what we know" with "what
+           your provider billed".  -->
+      <section v-if="byokActive" class="mt-10">
+        <h2 class="mb-3 flex items-center gap-2 text-sm font-semibold text-foreground">
+          <Icon icon="codicon:key" class="h-4 w-4 text-success" />
+          Local usage
+          <span class="font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
+            via your AI keys (BYOK)
+          </span>
+        </h2>
+
+        <p class="mb-4 max-w-2xl text-xs text-muted-foreground">
+          When you pick a model badged
+          <span class="rounded border border-success/40 bg-success/10 px-1 py-px font-mono text-[10px] uppercase text-success">BYOK</span>,
+          the call goes from this machine straight to the AI provider
+          using the key you put in
+          <code class="font-mono text-[11px]">~/.digi-setu/.env</code>.
+          We track tokens here so you can see local activity, but the
+          actual <strong>$ amount</strong> only your provider knows —
+          their dashboard is the source of truth.
+        </p>
+
+        <section class="mb-5 grid grid-cols-2 gap-3 md:grid-cols-4">
+          <article class="rounded-md border border-success/30 bg-success/5 p-3">
+            <p class="font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
+              Local turns
+            </p>
+            <p class="mt-1 text-sm font-semibold">
+              {{ byokSummary.total.turns ?? 0 }}
+            </p>
+            <p class="font-mono text-[10px] text-muted-foreground">all-time</p>
+          </article>
+
+          <article class="rounded-md border border-success/30 bg-success/5 p-3">
+            <p class="font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
+              Input tokens
+            </p>
+            <p class="mt-1 text-sm font-semibold">
+              {{ fmtTokens(byokSummary.total.input_tokens || 0) }}
+            </p>
+            <p class="font-mono text-[10px] text-muted-foreground">prompt + cached</p>
+          </article>
+
+          <article class="rounded-md border border-success/30 bg-success/5 p-3">
+            <p class="font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
+              Output tokens
+            </p>
+            <p class="mt-1 text-sm font-semibold">
+              {{ fmtTokens(byokSummary.total.output_tokens || 0) }}
+            </p>
+            <p class="font-mono text-[10px] text-muted-foreground">model replies</p>
+          </article>
+
+          <article class="rounded-md border border-success/30 bg-success/5 p-3">
+            <p class="font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
+              Total tokens
+            </p>
+            <p class="mt-1 text-sm font-semibold">
+              {{ fmtTokens(byokTotalTokens) }}
+            </p>
+            <p class="font-mono text-[10px] text-muted-foreground">in + out + cache</p>
+          </article>
+        </section>
+
+        <!-- Per-model rollup -->
+        <div v-if="byokSummary.per_model.length > 0" class="mb-5 flex flex-wrap gap-2">
+          <span
+            v-for="row in byokSummary.per_model"
+            :key="row.model_id"
+            class="inline-flex items-center gap-2 rounded-md border border-success/30 bg-success/5 px-2 py-1 font-mono text-[11px]"
+            :title="`${row.turns} turn${row.turns === 1 ? '' : 's'} · ${row.provider}`"
+          >
+            <span class="text-foreground">{{ row.model_id }}</span>
+            <span class="text-muted-foreground">·</span>
+            <span class="text-muted-foreground">{{ row.provider }}</span>
+            <span class="text-muted-foreground">·</span>
+            <span class="text-foreground">{{ row.turns }}×</span>
+          </span>
+        </div>
+
+        <!-- Per-turn table -->
+        <div class="overflow-hidden rounded-md border border-success/30 bg-card">
+          <div class="overflow-x-auto">
+            <table class="w-full text-xs">
+              <thead class="border-b border-border bg-success/5 font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
+                <tr>
+                  <th class="px-3 py-2 text-left font-medium">When</th>
+                  <th class="px-3 py-2 text-left font-medium">Model</th>
+                  <th class="px-3 py-2 text-left font-medium">Provider</th>
+                  <th class="px-3 py-2 text-right font-medium">In</th>
+                  <th class="px-3 py-2 text-right font-medium">Out</th>
+                  <th class="px-3 py-2 text-right font-medium">Cache R</th>
+                  <th class="px-3 py-2 text-right font-medium">Cache W</th>
+                  <th class="px-3 py-2 text-left font-medium">Session</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr
+                  v-for="(e, i) in byokEvents"
+                  :key="`byok-${e.ts}-${i}`"
+                  class="border-b border-border/40 last:border-b-0 hover:bg-success/5"
+                >
+                  <td class="whitespace-nowrap px-3 py-1.5 font-mono text-[11px] text-muted-foreground">
+                    {{ fmtTime(e.ts) }}
+                  </td>
+                  <td class="whitespace-nowrap px-3 py-1.5 font-mono text-[11px]">
+                    {{ e.model_id }}
+                  </td>
+                  <td class="whitespace-nowrap px-3 py-1.5 font-mono text-[11px] text-muted-foreground">
+                    {{ e.provider }}
+                  </td>
+                  <td class="whitespace-nowrap px-3 py-1.5 text-right font-mono tabular-nums">
+                    {{ e.input_tokens ? fmtTokens(e.input_tokens) : "—" }}
+                  </td>
+                  <td class="whitespace-nowrap px-3 py-1.5 text-right font-mono tabular-nums">
+                    {{ e.output_tokens ? fmtTokens(e.output_tokens) : "—" }}
+                  </td>
+                  <td class="whitespace-nowrap px-3 py-1.5 text-right font-mono tabular-nums text-muted-foreground">
+                    {{ e.cache_read ? fmtTokens(e.cache_read) : "—" }}
+                  </td>
+                  <td class="whitespace-nowrap px-3 py-1.5 text-right font-mono tabular-nums text-muted-foreground">
+                    {{ e.cache_write ? fmtTokens(e.cache_write) : "—" }}
+                  </td>
+                  <td class="whitespace-nowrap px-3 py-1.5 font-mono text-[11px] text-muted-foreground">
+                    <RouterLink
+                      v-if="e.session_id"
+                      :to="`/chat/${e.session_id}`"
+                      class="hover:text-foreground hover:underline"
+                      :title="e.session_id"
+                    >{{ shortSession(e.session_id) }}</RouterLink>
+                    <span v-else>—</span>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <!-- Empty state -->
+          <div
+            v-if="!loading && byokEvents.length === 0"
+            class="flex flex-col items-center justify-center gap-1 px-6 py-8 text-xs text-muted-foreground"
+          >
+            <Icon icon="codicon:key" class="h-5 w-5" />
+            <p>No local usage yet — pick a BYOK-badged model in the chat to see rows here.</p>
+          </div>
+        </div>
+
+        <p class="mt-3 text-[11px] text-muted-foreground">
+          Provider dashboards for $ figures:
+          <a href="https://console.anthropic.com/settings/usage" target="_blank" rel="noopener noreferrer" class="font-mono text-foreground/80 hover:text-primary hover:underline">Anthropic</a>
+          ·
+          <a href="https://aistudio.google.com/usage" target="_blank" rel="noopener noreferrer" class="font-mono text-foreground/80 hover:text-primary hover:underline">Google AI Studio</a>
+          ·
+          <a href="https://platform.openai.com/usage" target="_blank" rel="noopener noreferrer" class="font-mono text-foreground/80 hover:text-primary hover:underline">OpenAI</a>
+        </p>
       </section>
 
       <p
