@@ -259,6 +259,58 @@ export const streamSimpleAnthropicVertex = createLazySimpleStream(loadAnthropicV
     "models.generated: anthropic-vertex group",
     `"anthropic-vertex": {`,
   );
+  // ── 4b. Incremental: add Claude Haiku 4.5 to the anthropic-vertex
+  //         group on already-patched installs. The original §4 patch
+  //         shipped without Haiku; this rider adds it without
+  //         requiring a fresh `npm install`. Sentinel is the
+  //         "(Vertex)" display name which is unique to our patched
+  //         entry — it deliberately doesn't collide with the same
+  //         model id in anthropic-direct / bedrock / cloudflare.
+  patch(
+    f,
+    `        "claude-sonnet-4-6": {
+            id: "claude-sonnet-4-6",
+            name: "Claude Sonnet 4.6 (Vertex)",
+            api: "anthropic-vertex",
+            provider: "anthropic-vertex",
+            baseUrl: "https://aiplatform.googleapis.com",
+            reasoning: true,
+            input: ["text", "image"],
+            cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
+            contextWindow: 200000,
+            maxTokens: 64000,
+        },
+    },
+    "azure-openai-responses": {`,
+    `        "claude-sonnet-4-6": {
+            id: "claude-sonnet-4-6",
+            name: "Claude Sonnet 4.6 (Vertex)",
+            api: "anthropic-vertex",
+            provider: "anthropic-vertex",
+            baseUrl: "https://aiplatform.googleapis.com",
+            reasoning: true,
+            input: ["text", "image"],
+            cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
+            contextWindow: 200000,
+            maxTokens: 64000,
+        },
+        "claude-haiku-4-5": {
+            id: "claude-haiku-4-5",
+            name: "Claude Haiku 4.5 (Vertex)",
+            api: "anthropic-vertex",
+            provider: "anthropic-vertex",
+            baseUrl: "https://aiplatform.googleapis.com",
+            reasoning: true,
+            input: ["text", "image"],
+            cost: { input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1.25 },
+            contextWindow: 200000,
+            maxTokens: 64000,
+        },
+    },
+    "azure-openai-responses": {`,
+    "models.generated: anthropic-vertex add Haiku 4.5",
+    `"Claude Haiku 4.5 (Vertex)"`,
+  );
 }
 
 // ── 5. provider-display-names.js ─────────────────────────────────────────
@@ -286,6 +338,140 @@ export const streamSimpleAnthropicVertex = createLazySimpleStream(loadAnthropicV
     anthropic: "claude-opus-4-7",
     "anthropic-vertex": "claude-opus-4-7",`,
     "model-resolver: defaultModelPerProvider",
+  );
+}
+
+// ── 7. google-shared.js: trust thought_signature as opaque token ─────────
+//
+// Vertex docs describe `thought_signature` as an opaque string token —
+// the encoding is NOT promised to be standard base64 (could be URL-safe,
+// unpadded, etc.). The original strict regex silently dropped valid
+// signatures from Google's own response, which on Gemini 3 surfaces as a
+// 400 on the next function-calling turn (since signatures are mandatory).
+// See https://docs.cloud.google.com/vertex-ai/generative-ai/docs/thought-signatures
+{
+  const f = join(PI_AI, "dist/providers/google-shared.js");
+  patch(
+    f,
+    `// Thought signatures must be base64 for Google APIs (TYPE_BYTES).
+const base64SignaturePattern = /^[A-Za-z0-9+/]+={0,2}$/;
+function isValidThoughtSignature(signature) {
+    if (!signature)
+        return false;
+    if (signature.length % 4 !== 0)
+        return false;
+    return base64SignaturePattern.test(signature);
+}`,
+    `// Patched (pi-typst-test/patches): thought_signature is an opaque string
+// token per Vertex docs. Validating it as standard base64 silently drops
+// signatures from Google's own response, breaking Gemini 3 function calling.
+// Trust whatever the SDK returned.
+function isValidThoughtSignature(signature) {
+    return typeof signature === "string" && signature.length > 0;
+}`,
+    "google-shared: drop strict base64 validator",
+    "thought_signature is an opaque string",
+  );
+}
+
+// ── 8. google-shared.js: cross-model functionCall replay uses the
+//      documented `skip_thought_signature_validator` escape hatch instead
+//      of silently omitting the signature (which 400s on Gemini 3). ──────
+{
+  const f = join(PI_AI, "dist/providers/google-shared.js");
+  patch(
+    f,
+    `                else if (block.type === "toolCall") {
+                    const thoughtSignature = resolveThoughtSignature(isSameProviderAndModel, block.thoughtSignature);
+                    const part = {
+                        functionCall: {
+                            name: block.name,
+                            args: block.arguments ?? {},
+                            ...(requiresToolCallId(model.id) ? { id: block.id } : {}),
+                        },
+                        ...(thoughtSignature && { thoughtSignature }),
+                    };
+                    parts.push(part);
+                }`,
+    `                else if (block.type === "toolCall") {
+                    // Patched (pi-typst-test/patches): Gemini 3 returns 400 on a
+                    // functionCall replay without thought_signature. Use the
+                    // documented escape hatch for cross-model history; otherwise
+                    // pass through the captured signature as-is.
+                    const sameModelSig = resolveThoughtSignature(isSameProviderAndModel, block.thoughtSignature);
+                    const thoughtSignature = sameModelSig ?? "skip_thought_signature_validator";
+                    const part = {
+                        functionCall: {
+                            name: block.name,
+                            args: block.arguments ?? {},
+                            ...(requiresToolCallId(model.id) ? { id: block.id } : {}),
+                        },
+                        thoughtSignature,
+                    };
+                    parts.push(part);
+                }`,
+    "google-shared: skip_thought_signature_validator on cross-model toolCall",
+    "skip_thought_signature_validator",
+  );
+}
+
+// ── 9. transform-messages.js: same escape hatch on cross-model toolCall
+//      replay (this gate runs before convertMessages, so we have to fix
+//      both places). ────────────────────────────────────────────────────
+{
+  const f = join(PI_AI, "dist/providers/transform-messages.js");
+  patch(
+    f,
+    `                if (block.type === "toolCall") {
+                    const toolCall = block;
+                    let normalizedToolCall = toolCall;
+                    if (!isSameModel && toolCall.thoughtSignature) {
+                        normalizedToolCall = { ...toolCall };
+                        delete normalizedToolCall.thoughtSignature;
+                    }`,
+    `                if (block.type === "toolCall") {
+                    const toolCall = block;
+                    let normalizedToolCall = toolCall;
+                    if (!isSameModel && toolCall.thoughtSignature) {
+                        // Patched (pi-typst-test/patches): Gemini 3 rejects
+                        // function-call replays without thought_signature. When
+                        // transferring history from a different model, use the
+                        // documented escape hatch instead of silently stripping.
+                        normalizedToolCall = { ...toolCall, thoughtSignature: "skip_thought_signature_validator" };
+                    }`,
+    "transform-messages: skip_thought_signature_validator on cross-model toolCall",
+    "skip_thought_signature_validator",
+  );
+}
+
+// ── 10. google-shared.js: one-line debug log when a signature is dropped.
+//       Quiet by default, gated on PI_VERTEX_GEMINI_DEBUG. ───────────────
+{
+  const f = join(PI_AI, "dist/providers/google-shared.js");
+  patch(
+    f,
+    `/**
+ * Only keep signatures from the same provider/model and with valid base64.
+ */
+function resolveThoughtSignature(isSameProviderAndModel, signature) {
+    return isSameProviderAndModel && isValidThoughtSignature(signature) ? signature : undefined;
+}`,
+    `/**
+ * Only keep signatures from the same provider/model.
+ *
+ * Patched (pi-typst-test/patches): emit a one-line trace so operators can
+ * audit why a signature got dropped. Quiet by default; gate on
+ * PI_VERTEX_GEMINI_DEBUG=1 to avoid spamming production logs.
+ */
+function resolveThoughtSignature(isSameProviderAndModel, signature) {
+    const ok = isSameProviderAndModel && isValidThoughtSignature(signature);
+    if (!ok && signature && process.env.PI_VERTEX_GEMINI_DEBUG) {
+        console.error(\`[google-shared] thoughtSignature dropped (sameModel=\${isSameProviderAndModel}, len=\${signature.length})\`);
+    }
+    return ok ? signature : undefined;
+}`,
+    "google-shared: log dropped signatures under PI_VERTEX_GEMINI_DEBUG",
+    "thoughtSignature dropped (sameModel=",
   );
 }
 

@@ -83,3 +83,19 @@ lerna-debug.log*
 .pi-cache/
 *.probe.json
 scripts/_scratch/
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Vendored pi-coding-agent / pi-ai patch artefacts.
+#
+# `patches/apply-edits.mjs` rewrites files inside the bundled pi runtime
+# (desktop/pi-runtime/vendor/pi/...). It does NOT read patches/backups/*.
+# Those .js files were snapshots of the pre-patch upstream copies kept
+# around in case we ever needed to diff them, but at this point they're
+# 600 KB of stale JavaScript that just makes `git status` noisy. The
+# patcher is idempotent (sentinel-guarded — see apply-edits.mjs#patch),
+# so the backups give us nothing the upstream package versions can't.
+#
+# The historic copies are still tracked from before this rule existed;
+# `git rm -r --cached patches/backups/` (run once, intentionally) is
+# what actually drops them out of the index.
+patches/backups/
