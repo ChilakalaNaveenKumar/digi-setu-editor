@@ -1,5 +1,5 @@
 [package]
-name = "pi-typst-test-desktop"
+name = "digi-setu-desktop"
 version = "0.1.0"
 description = "Digi Setu desktop shell — Tauri wrapper around desktop/backend + desktop/frontend (forked from web/* and now diverging freely)"
 authors = ["Digi Setu"]
@@ -7,11 +7,11 @@ edition = "2021"
 rust-version = "1.77"
 
 [lib]
-name = "pi_typst_test_desktop_lib"
+name = "digi_setu_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [[bin]]
-name = "pi-typst-test-desktop"
+name = "digi-setu-desktop"
 path = "src/main.rs"
 
 [build-dependencies]
@@ -43,6 +43,22 @@ thiserror = "2"
 # Free-port discovery: we ask the OS for an available TCP port before
 # spawning the sidecar so two desktop instances don't fight over 8788.
 portpicker = "0.1"
+
+# Persistent SSO: store the Clerk session id in the OS keychain so the
+# user stays signed in across app restarts (Cursor-style — sign in
+# once, stay signed in for weeks). On macOS this maps to Keychain
+# Services, on Windows to Credential Vault, on Linux to libsecret.
+# We never store JWTs here (those are short-lived and re-minted on
+# demand from the cached session id), only the long-lived id itself.
+keyring = "3"
+
+# `dirs` resolves the platform-correct home directory on every OS
+# without us shelling out to `getent passwd` or pulling in libc. Used
+# by secure_storage.rs's file-fallback for the Clerk session id; we
+# need the home dir at the same place commands.rs::app_data_dir
+# resolves it to so the file-fallback shares ~/.digi-setu with the
+# rest of the desktop's user data.
+dirs = "5"
 
 [features]
 # Tauri's default features pull in `custom-protocol` which we want for prod

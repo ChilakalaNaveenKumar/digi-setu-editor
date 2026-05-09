@@ -203,6 +203,15 @@ export interface AssistantMessage {
     cost: number;
   };
   error?: string;
+  /**
+   * Stable error category emitted alongside `error` when the failure
+   * could be classified (Anthropic 429, Vertex safety block, OpenAI
+   * insufficient_quota, etc.). Maps to an `errors.<code>` i18n key.
+   *
+   * Always present together with `error`; the latter is the raw
+   * upstream string we fall back to if the i18n key isn't translated.
+   */
+  errorCode?: string;
 }
 
 export type ChatMessage = UserMessage | AssistantMessage;

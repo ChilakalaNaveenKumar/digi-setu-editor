@@ -12,7 +12,12 @@ import { defineStore } from "pinia";
 import { computed, reactive, ref, watch } from "vue";
 
 import { fetchSessionHistory } from "../api/sessions";
+import { i18n } from "../i18n";
 import { applyEvent, createRouterState, pushUserMessage } from "../lib/event-router";
+// `appRouter` here is Vue Router (for navigation); `router` later in
+// this module refers to the chat-message router state from
+// event-router. Aliased to avoid the name clash.
+import { router as appRouter } from "../router";
 import type { AssistantMessage, ChatMessage, RpcEvent, ToolCall } from "../types/rpc";
 import { ChatBridge, type ConnState } from "../ws/chat-bridge";
 
@@ -69,6 +74,27 @@ export interface QueuedMessage {
   text: string;
   attachments: PendingAttachment[];
   createdAt: number;
+}
+
+/**
+ * Translate a stable error code (e.g. `provider_rate_limit`,
+ * `session_expired`, `network`) into the localised user-facing
+ * sentence keyed in `errors.<code>`.
+ *
+ * Anything we don't have an explicit translation for collapses to
+ * `errors.internal` ("Something went wrong. Please try again.") so a
+ * raw upstream string never reaches the chat UI.
+ *
+ * Kept identical to the desktop fork (`desktop/frontend/src/stores/chat.ts`)
+ * so both clients render the same wording.
+ */
+function _localiseError(code: string | null | undefined): string {
+  const c = String(code ?? "internal").trim() || "internal";
+  const key = `errors.${c}`;
+  if (i18n.global.te(key)) {
+    return i18n.global.t(key) as string;
+  }
+  return i18n.global.t("errors.internal") as string;
 }
 
 export const useChatStore = defineStore("chat", () => {
@@ -316,7 +342,10 @@ export const useChatStore = defineStore("chat", () => {
       onState: (state, error) => {
         if (bridge !== newBridge) return;
         connState.value = state;
-        if (state === "error" && error) lastError.value = error;
+        // The bridge sends a STABLE CODE (matching errors.<code> in
+        // the locale file), never user-facing text. Translate here so
+        // the rest of the app — and locales — get a friendly sentence.
+        if (state === "error" && error) lastError.value = _localiseError(error);
         if (state === "closed" || state === "error") isStreaming.value = false;
         // After a client-driven abort the backend closes the WS with code
         // 4410, which the bridge surfaces as a normal "closed" state. We
@@ -443,9 +472,12 @@ export const useChatStore = defineStore("chat", () => {
       const model = String(evt.model ?? "");
       const modelName = String(evt.model_name ?? model);
       if (model) useModelsStore().noteSessionInfo(model, modelName);
-      const mode = evt.permission_mode as PermissionMode | undefined;
-      if (mode === "auto" || mode === "approve_risky" || mode === "approve_all") {
-        usePermissionsStore().setMode(mode);
+      // Permission mode arrives over the wire as either a canonical ID
+      // (auto / ask / cautious) or a legacy alias (approve_risky /
+      // approve_all). The store's setMode() normalizes both.
+      const rawMode = evt.permission_mode;
+      if (typeof rawMode === "string" && rawMode.length > 0) {
+        usePermissionsStore().setMode(rawMode);
       }
       return;
     }
@@ -456,7 +488,8 @@ export const useChatStore = defineStore("chat", () => {
     if (evt.type === "permission_request") {
       const id = String(evt.id ?? "");
       const tool = String(evt.tool ?? "tool");
-      const mode = (evt.mode as PermissionMode | undefined) ?? "approve_risky";
+      // The store normalizes legacy aliases (approve_risky → ask, etc).
+      const mode = (typeof evt.mode === "string" ? evt.mode : "ask") as PermissionMode;
       if (!id) return;
       usePermissionsStore().enqueue({
         id,
@@ -484,23 +517,41 @@ export const useChatStore = defineStore("chat", () => {
       return;
     }
 
-    // Inline rate-limit / quota / credit errors from the server. They
-    // arrive as `_bridge_error` with a `code` discriminator. We surface
-    // them as `lastError` for the bottom banner; the credit case ALSO
-    // flips the billing store's `exhausted` flag so the upgrade modal
-    // pops immediately (no need to wait for the next /api/usage poll).
+    // Inline server-side errors arrive as `_bridge_error` with a stable
+    // `code` discriminator. The backend never sends raw exceptions or
+    // file paths — every UI string comes from the i18n table here.
+    //
+    // Special routing:
+    //   - `setup_required` / `session_expired`  → bounce to /login
+    //   - `quota_exceeded` → flips the billing store flag so the
+    //     upgrade modal pops without waiting for the next /api/usage
+    //     poll.
+    //   - everything else surfaces in the bottom banner only.
     if (evt.type === "_bridge_error") {
-      const code = String(evt.code ?? "");
-      const message = String(evt.message ?? "Unknown error");
-      lastError.value = message;
-      if (code === "credit_exhausted") {
-        const snap = (evt.snapshot ?? null) as
-          | import("../api/types").CreditSnapshot
-          | null;
-        useBillingStore().noteExhausted(snap);
+      const code = String(evt.code ?? "internal");
+      // The raw `evt.message` from the backend is for our logs only
+      // — see services/error_codes.py. Always render via the i18n
+      // table so the user sees a friendly sentence in their locale,
+      // never a stack trace, file path, or upstream provider blob.
+      if (evt.message) {
+        // eslint-disable-next-line no-console
+        console.warn(`[chat] bridge_error code=${code} (raw, suppressed in UI):`, evt.message);
       }
+      lastError.value = _localiseError(code);
+
+      if (code === "quota_exceeded") {
+        useBillingStore().noteExhausted(null);
+      }
+      if (code === "setup_required" || code === "session_expired") {
+        queueMicrotask(() => {
+          void appRouter.push({ name: "login" });
+        });
+      }
+
       isStreaming.value = false;
-      return;
+      // Fall through so applyEvent() also stamps the localised error
+      // on the in-progress assistant bubble (the inline red banner
+      // under the message body, in addition to the bottom toast).
     }
 
     if (evt.type === "fs_change") {
@@ -520,6 +571,22 @@ export const useChatStore = defineStore("chat", () => {
     }
 
     applyEvent(router, evt);
+
+    // After applyEvent: if the reducer stamped an `errorCode` on the
+    // tail assistant message (provider failure or _bridge_error), fill
+    // its `error` with the localised sentence. The reducer leaves
+    // `error` empty on purpose so it stays free of i18n coupling and
+    // remains pure / unit-testable.
+    if (evt.type === "message_end" || evt.type === "_bridge_error") {
+      const tail = router.messages[router.messages.length - 1];
+      if (tail && tail.kind === "assistant" && tail.errorCode && !tail.error) {
+        tail.error = _localiseError(tail.errorCode);
+        // Mirror to the bottom banner unless something more specific
+        // already claimed it (e.g. the _bridge_error branch above).
+        if (!lastError.value) lastError.value = tail.error;
+      }
+    }
+
     _syncEditorFromWriteCall();
     messages.value = router.messages.slice();
   }
@@ -527,7 +594,7 @@ export const useChatStore = defineStore("chat", () => {
   // ── outbound ───────────────────────────────────────────────────────
   function sendPrompt(text: string): void {
     if (!bridge || !bridge.isOpen) {
-      lastError.value = "Not connected";
+      lastError.value = _localiseError("not_connected");
       return;
     }
     // Wrap with attachments if any are pending. The wrapping is done
@@ -568,7 +635,7 @@ export const useChatStore = defineStore("chat", () => {
   // messages have different attachment lists without leaking.
   function _sendQueuedItem(item: QueuedMessage): void {
     if (!bridge || !bridge.isOpen) {
-      lastError.value = "Not connected";
+      lastError.value = _localiseError("not_connected");
       return;
     }
     const body = _wrapWithAttachments(item.text, item.attachments);

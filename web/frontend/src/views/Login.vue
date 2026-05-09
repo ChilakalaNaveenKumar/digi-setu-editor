@@ -25,19 +25,26 @@
 <script setup lang="ts">
 import { computed, onMounted, watch, ref } from "vue";
 import { useRoute, useRouter, RouterLink } from "vue-router";
-import { useClerk } from "@clerk/vue";
+import { useClerk, useAuth } from "@clerk/vue";
 
 import BrandHeader from "../components/BrandHeader.vue";
-import { isDesktop } from "../lib/native-bridge";
-import { startDesktopSignIn } from "../lib/desktop-auth";
 import { useConfigStore } from "../stores/config";
 
 const route = useRoute();
 const router = useRouter();
 const cfg = useConfigStore();
 const clerk = useClerk();
+// `useAuth().isLoaded` flips to `true` only AFTER clerk-js has
+// hydrated the session from cookies / fragment. Without this we'd
+// (a) decide "no session" while Clerk is still loading and
+// (b) immediately bounce back to Clerk's hosted page → which then
+// returns to /, which the router guard ALSO sees as signed-out, and
+// we end up in an infinite redirect loop. Symptom: user signs up,
+// Clerk hosted page completes, but the SPA gets stuck on
+// "Redirecting to Clerk…" until they hit F5.
+const { isLoaded, isSignedIn } = useAuth();
 
-const status = ref<"loading" | "redirecting" | "error" | "waiting-browser">("loading");
+const status = ref<"loading" | "redirecting" | "error">("loading");
 const errMsg = ref("");
 
 const redirectUrl = computed(() => {
@@ -48,30 +55,16 @@ const redirectUrl = computed(() => {
 async function handoff(): Promise<void> {
   if (!cfg.authRequired) return;
 
-  // Desktop: bounce sign-in out to the system browser. The Tauri
-  // webview can't host Clerk's UI directly (anti-phishing, passkeys,
-  // autofill all break). After Clerk authenticates the user, the
-  // production web app's /desktop/sign-in page redirects to a
-  // pi-typst-test:// deep link, which the deep-link bridge installed
-  // in main.ts picks up and exchanges for a session.
-  if (isDesktop()) {
-    status.value = "waiting-browser";
-    try {
-      await startDesktopSignIn();
-    } catch (exc) {
-      console.error("[login] startDesktopSignIn failed", exc);
-      errMsg.value = exc instanceof Error ? exc.message : String(exc);
-      status.value = "error";
-    }
-    return;
-  }
-
   const c = clerk.value;
   if (!c) return;
+  // Wait for clerk-js to finish hydrating before deciding whether to
+  // redirect. `isLoaded` is the canonical "hydration done" signal.
+  if (!isLoaded.value) return;
 
-  // Already signed in? Skip Clerk and go straight to the picker /
-  // requested page.
-  if (c.session) {
+  // Hydrated AND signed in (e.g. user opened /login directly while
+  // already authenticated, OR the page just came back from Clerk's
+  // hosted sign-in) → land on the requested URL.
+  if (isSignedIn.value || c.session) {
     await router.replace(redirectUrl.value);
     return;
   }
@@ -95,13 +88,14 @@ onMounted(() => {
   void handoff();
 });
 
-// Clerk loads asynchronously after the plugin is installed; the ref
-// goes from null → instance once `clerk-js` finishes booting. Watch
-// for that and kick off the redirect the moment it's ready.
+// Re-evaluate every time clerk-js' state changes (instance becomes
+// available OR isLoaded flips OR isSignedIn flips). The previous
+// implementation only watched `clerk.value` and fired before the
+// session cookie was hydrated, racing into a redirect loop.
 watch(
-  () => clerk.value,
-  (v) => {
-    if (v) void handoff();
+  [() => clerk.value, () => isLoaded.value, () => isSignedIn.value],
+  () => {
+    void handoff();
   },
 );
 </script>
@@ -121,16 +115,16 @@ watch(
     <main class="flex flex-1 flex-col items-center justify-center px-6 py-12">
       <div
         v-if="cfg.authRequired"
-        class="flex flex-col items-center gap-3 text-sm text-muted-foreground"
+        class="flex flex-col items-center gap-3 text-lead text-muted-foreground"
       >
         <template v-if="status === 'error'">
           <p class="font-medium text-destructive">
             Couldn't redirect to Clerk.
           </p>
-          <p class="font-mono text-[11px]">{{ errMsg }}</p>
+          <p class="font-mono text-caption">{{ errMsg }}</p>
           <button
             type="button"
-            class="mt-2 rounded-md border border-border bg-card px-3 py-1.5 text-xs font-medium text-foreground hover:border-primary/50"
+            class="mt-2 rounded-md border border-border bg-card px-3 py-1.5 text-body font-medium text-foreground hover:border-primary/50"
             @click="handoff"
           >Try again</button>
         </template>
@@ -143,45 +137,35 @@ watch(
             <template v-if="status === 'redirecting'">
               Redirecting to Clerk…
             </template>
-            <template v-else-if="status === 'waiting-browser'">
-              Sign in in your browser, then return here. We're listening
-              for the redirect…
-            </template>
             <template v-else>Loading…</template>
           </p>
-          <button
-            v-if="status === 'waiting-browser'"
-            type="button"
-            class="mt-2 rounded-md border border-border bg-card px-3 py-1.5 text-xs font-medium text-foreground hover:border-primary/50"
-            @click="handoff"
-          >Reopen browser</button>
         </template>
       </div>
 
       <div
         v-else
-        class="w-full max-w-md rounded-lg border border-border bg-card p-6 text-sm text-foreground"
+        class="w-full max-w-md rounded-lg border border-border bg-card p-6 text-lead text-foreground"
       >
         <p class="mb-2 font-medium">Auth is disabled on this server.</p>
         <p class="mb-4 text-muted-foreground">
           The backend is running without
-          <code class="font-mono text-[11px]">CLERK_SECRET_KEY</code>, so
+          <code class="font-mono text-caption">CLERK_SECRET_KEY</code>, so
           every request resolves to the synthetic
-          <code class="font-mono text-[11px]">dev</code> user. Set the
-          <code class="font-mono text-[11px]">CLERK_*</code> env vars in
-          <code class="font-mono text-[11px]">web/backend/.env</code> and
+          <code class="font-mono text-caption">dev</code> user. Set the
+          <code class="font-mono text-caption">CLERK_*</code> env vars in
+          <code class="font-mono text-caption">web/backend/.env</code> and
           restart uvicorn to enable real sign-in.
         </p>
         <RouterLink
           :to="redirectUrl"
-          class="block w-full rounded-md bg-primary px-4 py-2 text-center text-sm font-semibold text-primary-foreground hover:opacity-90"
+          class="block w-full rounded-md bg-primary px-4 py-2 text-center text-lead font-semibold text-primary-foreground hover:opacity-90"
         >
           Continue to picker
         </RouterLink>
       </div>
     </main>
 
-    <footer class="border-t border-border bg-card/40 px-6 py-4 text-center text-[11px] text-muted-foreground">
+    <footer class="border-t border-border bg-card/40 px-6 py-4 text-center text-caption text-muted-foreground">
       © {{ new Date().getFullYear() }} Digi Setu
     </footer>
   </div>

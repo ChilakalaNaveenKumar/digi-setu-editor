@@ -51,6 +51,13 @@ echo "[release-mac] vendoring Node + pi…"
 bash "$DESKTOP/pi-runtime/fetch-node.sh" --current-platform-only
 bash "$DESKTOP/pi-runtime/install-pi.sh"
 
+# 3b. Generate THIRD_PARTY_LICENSES.txt now that node_modules is in
+# place. The sidecar spec bundles this file inside the frozen binary
+# (and Tauri's resources block ships an external copy too) so the
+# Help → Open Source Licenses menu can surface it offline.
+echo "[release-mac] regenerating THIRD_PARTY_LICENSES.txt…"
+node "$DESKTOP/scripts/gen-third-party-licenses.mjs"
+
 # 4. Frontend production build. tauri.conf.json's beforeBuildCommand
 # re-runs this anyway, but doing it here surfaces frontend errors
 # before the (slow) Rust release build kicks off.

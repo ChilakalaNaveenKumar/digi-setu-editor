@@ -26,6 +26,7 @@ from services.billing import CreditLedger
 from services.user_prefs import (
     UserPrefs,
     VALID_PERMISSION_MODES,
+    normalize_permission_mode,
     user_prefs,
 )
 
@@ -64,10 +65,12 @@ async def set_permission_mode(
     payload: PermissionModeUpdate,
     user_id: str = Depends(require_user),
 ) -> dict[str, Any]:
-    if payload.mode not in VALID_PERMISSION_MODES:
-        # We don't silently clamp here — a 400 makes it obvious to the
-        # frontend that its picker drifted from the backend's allowed
-        # list (e.g. after a deploy that adds a new mode).
+    # Accept canonical IDs (auto / ask / cautious) AND legacy aliases
+    # (approve_risky / approve_all). Anything else is a 400 so the
+    # frontend learns its picker drifted from the backend after a
+    # deploy.
+    canonical = normalize_permission_mode(payload.mode)
+    if canonical is None:
         raise HTTPException(
             status_code=400,
             detail=(
@@ -75,7 +78,7 @@ async def set_permission_mode(
                 f"allowed: {', '.join(VALID_PERMISSION_MODES)}"
             ),
         )
-    stored = user_prefs().set_permission_mode(user_id, payload.mode)
+    stored = user_prefs().set_permission_mode(user_id, canonical)
     return {"permission_mode": stored}
 
 

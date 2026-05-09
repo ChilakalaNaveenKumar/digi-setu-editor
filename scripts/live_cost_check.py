@@ -20,7 +20,7 @@ without depending on Clerk auth / a logged-in browser.
 
 Usage
 -----
-    cd pi-typst-test
+    cd <repo root>
     source scripts/env.sh            # sets PI_PROVIDER / PI_MODEL / GOOGLE_CLOUD_*
     python3 scripts/live_cost_check.py [--prompt "..."] [--model claude-haiku-4-5]
 

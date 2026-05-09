@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # cutover-from-typst-agent.sh — replace the legacy typst-agent stack on
-# the SAME VM (digi-setu-live) with this pi-typst-test deployment.
+# the SAME VM (digi-setu-live) with this digi-setu deployment.
 #
 # Assumes you've already run, locally:
 #   scripts/remote-deploy.sh stack        # pushed compose + caddy

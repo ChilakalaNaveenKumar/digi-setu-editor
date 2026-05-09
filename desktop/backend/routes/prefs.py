@@ -22,10 +22,11 @@ from pydantic import BaseModel, Field
 
 from config import BYOK_MODE
 from services.auth import require_user
-from services.billing import CreditLedger
+from services.plan_cache import get_plan_id as _get_plan_id
 from services.user_prefs import (
     UserPrefs,
     VALID_PERMISSION_MODES,
+    normalize_permission_mode,
     user_prefs,
 )
 
@@ -42,7 +43,7 @@ class RoutingDefaultUpdate(BaseModel):
 
 @router.get("/api/me/prefs")
 async def get_my_prefs(user_id: str = Depends(require_user)) -> dict[str, Any]:
-    plan_id = CreditLedger.instance().get_plan_id(user_id)
+    plan_id = _get_plan_id(user_id)
     # When the user has BYOK keys configured we default the routing
     # toggle to "byok" — the whole point of dropping a key in .env is
     # to use it. Otherwise default to "cloud".
@@ -64,10 +65,12 @@ async def set_permission_mode(
     payload: PermissionModeUpdate,
     user_id: str = Depends(require_user),
 ) -> dict[str, Any]:
-    if payload.mode not in VALID_PERMISSION_MODES:
-        # We don't silently clamp here — a 400 makes it obvious to the
-        # frontend that its picker drifted from the backend's allowed
-        # list (e.g. after a deploy that adds a new mode).
+    # Accept canonical IDs (auto / ask / cautious) AND legacy aliases
+    # (approve_risky / approve_all). Anything else is a 400 so the
+    # frontend learns its picker drifted from the backend after a
+    # deploy.
+    canonical = normalize_permission_mode(payload.mode)
+    if canonical is None:
         raise HTTPException(
             status_code=400,
             detail=(
@@ -75,7 +78,7 @@ async def set_permission_mode(
                 f"allowed: {', '.join(VALID_PERMISSION_MODES)}"
             ),
         )
-    stored = user_prefs().set_permission_mode(user_id, payload.mode)
+    stored = user_prefs().set_permission_mode(user_id, canonical)
     return {"permission_mode": stored}
 
 

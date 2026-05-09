@@ -260,31 +260,31 @@ const runtimeBadge = computed(() => {
     class="group my-1.5 overflow-hidden rounded-md border border-border bg-card transition-colors hover:border-border/80"
   >
     <!-- ── HEADER (meta only — full command lives in body) ────────────── -->
-    <div class="flex items-center gap-2 px-2.5 py-1.5 font-mono text-xs">
+    <div class="flex items-center gap-2 px-2.5 py-1.5 font-mono text-body">
       <span
-        class="inline-flex h-4 w-4 items-center justify-center rounded-sm bg-muted text-[10px] font-semibold text-muted-foreground"
+        class="inline-flex h-4 w-4 items-center justify-center rounded-sm bg-muted text-caption font-semibold text-muted-foreground"
       >&gt;_</span>
       <span class="font-semibold text-foreground/90">bash</span>
       <span class="text-muted-foreground">·</span>
       <span
-        :class="['tabular-nums text-[10px]', statusBadge.color, 'rounded-sm px-1.5 py-0.5']"
+        :class="['tabular-nums text-caption', statusBadge.color, 'rounded-sm px-1.5 py-0.5']"
       >{{ statusBadge.label }}</span>
       <span
         v-if="durationLabel"
         :class="[
-          'text-[10px] tabular-nums',
+          'text-caption tabular-nums',
           isStreaming ? 'text-warning' : 'text-muted-foreground',
         ]"
       >{{ durationLabel }}</span>
       <span
         v-if="timeout !== null"
-        class="text-[10px] text-muted-foreground"
+        class="text-caption text-muted-foreground"
       >· timeout {{ timeout }}s</span>
 
       <!-- background hint badge — shown for `cmd &`, nohup, common dev servers -->
       <span
         v-if="runtimeBadge"
-        class="inline-flex items-center gap-1 rounded-sm bg-primary/15 px-1.5 py-0.5 text-[10px] text-primary"
+        class="inline-flex items-center gap-1 rounded-sm bg-primary/15 px-1.5 py-0.5 text-caption text-primary"
         :title="runtimeBadge.title"
       >
         <span class="inline-block h-1 w-1 rounded-full bg-primary"></span>
@@ -298,7 +298,7 @@ const runtimeBadge = computed(() => {
       <button
         v-if="isStreaming"
         type="button"
-        class="flex items-center gap-1 rounded-sm bg-destructive/15 px-1.5 py-0.5 text-[10px] text-destructive hover:bg-destructive/25"
+        class="flex items-center gap-1 rounded-sm bg-destructive/15 px-1.5 py-0.5 text-caption text-destructive hover:bg-destructive/25"
         title="Stop this bash call (aborts the whole agent turn — kills the bash process group)"
         @click="stopRunning"
       >
@@ -322,32 +322,32 @@ const runtimeBadge = computed(() => {
         >
           <button
             type="button"
-            class="flex w-full items-center justify-between px-3 py-1.5 text-left text-xs text-foreground hover:bg-accent"
+            class="flex w-full items-center justify-between px-3 py-1.5 text-left text-body text-foreground hover:bg-accent"
             :disabled="!command"
             @click="copyCommand"
           >
             <span>Copy command</span>
-            <span v-if="copiedFlash === 'command'" class="text-success text-[10px]">copied ✓</span>
+            <span v-if="copiedFlash === 'command'" class="text-success text-caption">copied ✓</span>
           </button>
           <button
             type="button"
-            class="flex w-full items-center justify-between px-3 py-1.5 text-left text-xs text-foreground hover:bg-accent"
+            class="flex w-full items-center justify-between px-3 py-1.5 text-left text-body text-foreground hover:bg-accent"
             :disabled="!output"
             @click="copyOutput"
           >
             <span>Copy output</span>
-            <span v-if="copiedFlash === 'output'" class="text-success text-[10px]">copied ✓</span>
+            <span v-if="copiedFlash === 'output'" class="text-success text-caption">copied ✓</span>
           </button>
           <div class="border-t border-border" />
           <button
             type="button"
-            class="block w-full px-3 py-1.5 text-left text-xs text-foreground hover:bg-accent"
+            class="block w-full px-3 py-1.5 text-left text-body text-foreground hover:bg-accent"
             :disabled="!command || isStreaming"
             @click="rerun"
           >Re-run command</button>
           <button
             type="button"
-            class="block w-full px-3 py-1.5 text-left text-xs text-foreground hover:bg-accent"
+            class="block w-full px-3 py-1.5 text-left text-body text-foreground hover:bg-accent"
             @click="openInTerminal"
           >Open in Terminal Pane</button>
         </div>
@@ -372,7 +372,7 @@ const runtimeBadge = computed(() => {
       <!-- Truncation banner (pi caps bash output to 2K lines / 256KB) -->
       <div
         v-if="truncationInfo.truncation"
-        class="flex items-center justify-between gap-2 border-b border-warning/30 bg-warning/10 px-3 py-1 font-mono text-[10px] text-warning"
+        class="flex items-center justify-between gap-2 border-b border-warning/30 bg-warning/10 px-3 py-1 font-mono text-caption text-warning"
       >
         <span>
           ⚠ truncated by pi: showing
@@ -390,14 +390,14 @@ const runtimeBadge = computed(() => {
 
       <div
         v-if="hiddenLineCount > 0"
-        class="cursor-pointer select-none px-3 py-1 text-[10px] italic text-muted-foreground hover:bg-accent/30"
+        class="cursor-pointer select-none px-3 py-1 text-caption italic text-muted-foreground hover:bg-accent/30"
         @click="expanded = true"
       >
         … {{ hiddenLineCount }} earlier line{{ hiddenLineCount === 1 ? "" : "s" }} hidden · click to expand
       </div>
       <div
         v-if="expanded && outputLines.length > PREVIEW_LINES"
-        class="cursor-pointer select-none px-3 py-1 text-[10px] italic text-muted-foreground hover:bg-accent/30"
+        class="cursor-pointer select-none px-3 py-1 text-caption italic text-muted-foreground hover:bg-accent/30"
         @click="expanded = false"
       >
         ▾ click to collapse
@@ -417,7 +417,7 @@ const runtimeBadge = computed(() => {
     <!-- ── ERROR FOOTER ───────────────────────────────────────────────── -->
     <div
       v-if="call.status === 'error' && !output"
-      class="border-t border-destructive/30 bg-destructive/10 px-3 py-1.5 font-mono text-[11px] text-destructive"
+      class="border-t border-destructive/30 bg-destructive/10 px-3 py-1.5 font-mono text-caption text-destructive"
     >
       {{ call.result?.text || "command failed" }}
     </div>

@@ -19,21 +19,21 @@ const showUpgrade = ref(false);
 
 <template>
   <div
-    class="flex items-start justify-between gap-2 border-t border-destructive/30 bg-destructive/10 px-3 py-1.5 text-[11px] text-destructive"
+    class="flex items-start justify-between gap-2 border-t border-destructive/30 bg-destructive/10 px-3 py-1.5 text-caption text-destructive"
   >
     <span class="flex-1 leading-snug">{{ message }}</span>
     <div class="flex shrink-0 items-center gap-2">
       <button
         v-if="creditExhausted"
         type="button"
-        class="rounded bg-destructive px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-destructive-foreground hover:bg-destructive/90"
+        class="rounded bg-destructive px-2 py-0.5 text-caption font-semibold uppercase tracking-wide text-destructive-foreground hover:bg-destructive/90"
         @click="showUpgrade = true"
       >
         Upgrade
       </button>
       <button
         type="button"
-        class="rounded px-1 text-[12px] hover:bg-destructive/20"
+        class="rounded px-1 text-body hover:bg-destructive/20"
         aria-label="dismiss"
         @click="emit('dismiss')"
       >

@@ -1,46 +1,77 @@
 /**
- * Billing + credit state.
+ * Billing + credit state (DESKTOP).
  *
  * The credit chip in the chat header polls `/api/usage` so the user
- * sees their tank drain in near real time. The Upgrade flow redirects
- * out to Stripe Checkout (we never collect cards in our own UI).
+ * sees their tank drain in near real time. The chip's data comes from
+ * the cloud — the desktop sidecar only forwards. See
+ * desktop/backend/services/cloud_api.py.
  *
- * `enabled=false` means the operator hasn't set STRIPE_SECRET_KEY —
- * the SPA hides upgrade buttons in that case rather than showing a
- * broken redirect.
+ * The Upgrade and Manage Subscription flows are PURE BROWSER
+ * REDIRECTS to digi-setu.com — we never call a local /api/billing/*
+ * route (those return 410 now). Stripe Checkout / Customer Portal
+ * are user-facing pages on the cloud; the user authenticates through
+ * Clerk in their normal browser session and Stripe handles the rest.
+ *
+ * `enabled` is always true now — there's nothing on the desktop that
+ * could be "billing not configured". The cloud is always reachable
+ * for Stripe pages even when this build of the sidecar lacks any
+ * payment-related code. Kept on the public surface for a deprecation
+ * window so any consumer that branches on it doesn't break.
  */
 
 import { defineStore } from "pinia";
 import { computed, ref } from "vue";
 
 import {
+  cloudCheckoutUrl,
+  cloudPortalUrl,
   getBillingStatus,
   getUsage,
-  openPortal as apiOpenPortal,
-  startCheckout as apiStartCheckout,
 } from "../api/billing";
-import { isDesktop, openExternal } from "../lib/native-bridge";
+import { i18n } from "../i18n";
+import { openExternal } from "../lib/native-bridge";
 import type { CreditSnapshot, PlanInfo } from "../api/types";
 
-/**
- * In desktop mode Stripe Checkout / Customer Portal must open in the
- * system browser (3DS, Apple Pay, autofill all break inside Tauri's
- * webview). The deep-link bridge in main.ts listens for the matching
- * pi-typst-test://billing/return URL the user hits after success or
- * cancel, refreshes credit state, and surfaces a confirmation toast.
- *
- * The web build keeps the existing `window.location.href` redirect:
- * it's same-origin, the URL is whitelisted by Stripe, and the
- * post-payment cookie reattaches automatically.
- */
-const DESKTOP_BILLING_RETURN = "pi-typst-test://billing/return";
+import { useUiStore } from "./ui";
+
+// Threshold (in remaining_pct) where we fire the one-shot low-credit
+// toast. Below this and the user starts seeing the warning colour on
+// the gear icon AND a single nudge toast — Cursor pops a similar toast
+// when you cross 20% of your monthly cap. We DON'T want to fire it on
+// every poll once they're below the line, so the store guards on the
+// crossing event.
+const _LOW_CREDIT_PCT_THRESHOLD = 20;
+// Once the user climbs back above this (e.g. they upgraded, the month
+// rolled over, or their plan was bumped), we re-arm the one-shot so a
+// subsequent dip will toast again.
+const _LOW_CREDIT_REARM_PCT = 50;
 
 export const useBillingStore = defineStore("billing", () => {
-  const enabled = ref(false);
+  // Always-on now — the cloud redirect path doesn't depend on any
+  // local Stripe state. Kept reactive so existing components that
+  // bind v-if="billing.enabled" don't need a sweep.
+  const enabled = ref(true);
   const plans = ref<PlanInfo[]>([]);
   const credit = ref<CreditSnapshot | null>(null);
   const lastRefresh = ref(0);
   const exhausted = ref(false);
+
+  // ── one-shot UX flags (NOT exposed on the public surface) ──────
+  // Whether we've already shown the "you're under 20%" toast for the
+  // current low-credit cycle. Resets when remaining climbs back over
+  // _LOW_CREDIT_REARM_PCT. Persists across `refreshUsage` calls but
+  // not across page reloads — that's intentional: a refresh is a
+  // legitimate moment to remind the user.
+  const _shownLowCreditToast = ref(false);
+  // Whether we've already auto-popped the upgrade modal for the
+  // current "exhausted" cycle. Cleared when the user dismisses or
+  // when the credit gauge climbs back above 0.
+  const _shownAutoUpgrade = ref(false);
+  // The reactive flag the chat surface watches to render the modal.
+  // Distinct from `exhausted` so the user can dismiss the modal
+  // without having to also hide the bottom error banner — the banner
+  // stays until the user clicks ✕.
+  const wantsAutoUpgrade = ref(false);
 
   async function refreshStatus(): Promise<void> {
     try {
@@ -55,9 +86,14 @@ export const useBillingStore = defineStore("billing", () => {
   async function refreshUsage(): Promise<void> {
     try {
       const r = await getUsage();
-      credit.value = r.credit;
+      // The sidecar tags the snapshot with `source` so we can tell
+      // an authoritative cloud answer apart from the local fallback
+      // (cloud unreachable / signed-out). The fallback always shows
+      // "spent_usd=0" which superficially looks like "exhausted" if
+      // the cap is 0. Don't fire the exhausted/upgrade UX in that
+      // case — pretend the cloud reading hasn't arrived yet.
+      _applyCredit(r.credit, r.source ?? "cloud");
       lastRefresh.value = Date.now();
-      exhausted.value = r.credit.remaining_usd <= 0;
     } catch (exc) {
       // 401 here means we're on the login page — silent skip.
       if (!String(exc).includes("401")) {
@@ -67,56 +103,154 @@ export const useBillingStore = defineStore("billing", () => {
   }
 
   /**
-   * Note a server-pushed credit_exhausted error from chat_ws so the
-   * UI can pop the upgrade modal without waiting for the next poll.
+   * Apply a new CreditSnapshot — used by both poll-based refresh and
+   * server-push paths. Centralised so the one-shot crossing logic
+   * (low-credit toast, auto-open upgrade modal) lives in exactly one
+   * place and can't drift between callers.
+   *
+   * ``source`` discriminates a real cloud reading from a local
+   * fallback. We only flip exhausted/low-credit UX on real readings —
+   * the offline fallback always reports spent=0, which would
+   * otherwise look like "exhausted" when the plan happens to have
+   * cap=0 (e.g. signed-out + offline). For BYOK and offline-signed-
+   * out we leave the chip in its calm neutral state.
+   */
+  type Source = "cloud" | "offline_byok" | "offline_signed_out";
+
+  const lastSource = ref<Source>("cloud");
+
+  function _applyCredit(snap: CreditSnapshot, source: Source = "cloud"): void {
+    const prev = credit.value;
+    credit.value = snap;
+    lastSource.value = source;
+
+    // Re-arm the one-shot low-credit toast once the user is comfortably
+    // above the threshold again (upgrade, month rollover, refund, …).
+    if (snap.remaining_pct >= _LOW_CREDIT_REARM_PCT) {
+      _shownLowCreditToast.value = false;
+    }
+
+    const isAuthoritative = source === "cloud";
+    const hasRealCap = (snap.plan?.monthly_credit_usd ?? 0) > 0;
+
+    const wasExhausted = !!prev && prev.remaining_usd <= 0;
+    const nowExhausted =
+      isAuthoritative && hasRealCap && snap.remaining_usd <= 0;
+    exhausted.value = nowExhausted;
+
+    if (!nowExhausted) {
+      _shownAutoUpgrade.value = false;
+    }
+
+    if (
+      isAuthoritative &&
+      hasRealCap &&
+      !nowExhausted &&
+      snap.remaining_pct <= _LOW_CREDIT_PCT_THRESHOLD &&
+      !_shownLowCreditToast.value
+    ) {
+      _shownLowCreditToast.value = true;
+      _emitLowCreditToast(snap);
+    }
+
+    if (nowExhausted && !wasExhausted) {
+      _maybeAutoOpenUpgrade();
+    }
+  }
+
+  function _emitLowCreditToast(snap: CreditSnapshot): void {
+    try {
+      const ui = useUiStore();
+      const remaining = `$${snap.remaining_usd.toFixed(2)}`;
+      const budget = `$${snap.plan.monthly_credit_usd.toFixed(0)}`;
+      const msg = i18n.global.te("billing.lowCreditToast")
+        ? (i18n.global.t("billing.lowCreditToast", { remaining, budget }) as string)
+        : `Heads up — only ${remaining} of ${budget} left this month.`;
+      ui.toast({ message: msg, kind: "info", ttl: 8000 });
+    } catch (exc) {
+      // Toast firing must never throw past the billing refresh path —
+      // an i18n hiccup or pinia init order quirk should NOT break
+      // the credit poll. Worst case: no toast, gear icon dot still
+      // signals the state.
+      console.warn("[billing] low-credit toast failed", exc);
+    }
+  }
+
+  function _maybeAutoOpenUpgrade(): void {
+    if (_shownAutoUpgrade.value) return;
+    _shownAutoUpgrade.value = true;
+    wantsAutoUpgrade.value = true;
+  }
+
+  /**
+   * Called by the chat error handler when the backend pushes a
+   * `quota_exceeded` _bridge_error. Lets us pop the upgrade modal
+   * the moment the user hits the cap, instead of waiting up to 30s
+   * for the next /api/usage poll.
    */
   function noteExhausted(snapshot: CreditSnapshot | null = null): void {
     exhausted.value = true;
     if (snapshot) credit.value = snapshot;
+    _maybeAutoOpenUpgrade();
   }
 
+  /** Called by the modal's @close — clears the one-shot so we don't
+   * immediately re-pop. The user can still click the bottom-banner
+   * Upgrade button or the gear icon to reopen on demand. */
+  function dismissAutoUpgrade(): void {
+    wantsAutoUpgrade.value = false;
+  }
+
+  /**
+   * Open digi-setu.com/pricing?plan=... in the user's system
+   * browser. Stripe Checkout runs there inside their Clerk-
+   * authenticated browser session — this app process is never
+   * involved in the payment.
+   */
   async function startCheckout(planId: string): Promise<void> {
-    const desktop = isDesktop();
-    const r = await apiStartCheckout(
-      planId,
-      desktop ? DESKTOP_BILLING_RETURN : undefined,
-    );
-    if (desktop) {
-      await openExternal(r.url);
-    } else {
-      window.location.href = r.url;
-    }
+    await openExternal(cloudCheckoutUrl(planId));
   }
 
+  /**
+   * Open digi-setu.com/account/billing in the user's system browser.
+   * The cloud creates a Stripe Customer Portal session there and
+   * 302s into it; the user can change plan, update payment method,
+   * or cancel — all inside Stripe's hosted UI.
+   */
   async function openPortal(): Promise<void> {
-    const desktop = isDesktop();
-    const r = await apiOpenPortal(
-      desktop ? DESKTOP_BILLING_RETURN : undefined,
-    );
-    if (desktop) {
-      await openExternal(r.url);
-    } else {
-      window.location.href = r.url;
-    }
+    await openExternal(cloudPortalUrl());
   }
 
   const planLabel = computed(() => credit.value?.plan?.label ?? "Free");
   const remainingPct = computed(() => credit.value?.remaining_pct ?? 100);
-  const lowCredit = computed(
-    () => credit.value !== null && credit.value.remaining_pct <= 20,
-  );
+  // `lowCredit` is what tints the chip amber/red. Suppress it for
+  // non-authoritative readings (offline / BYOK) so the user doesn't
+  // see a panic-style chip just because we couldn't reach the cloud
+  // for a poll cycle.
+  const lowCredit = computed(() => {
+    if (credit.value === null) return false;
+    if (lastSource.value !== "cloud") return false;
+    if ((credit.value.plan?.monthly_credit_usd ?? 0) <= 0) return false;
+    return credit.value.remaining_pct <= 20;
+  });
+  const isAuthoritative = computed(() => lastSource.value === "cloud");
+  const isByok = computed(() => credit.value?.plan?.id === "byok");
 
   return {
     enabled,
     plans,
     credit,
     exhausted,
+    wantsAutoUpgrade,
     planLabel,
     remainingPct,
     lowCredit,
+    isAuthoritative,
+    isByok,
     refreshStatus,
     refreshUsage,
     noteExhausted,
+    dismissAutoUpgrade,
     startCheckout,
     openPortal,
   };

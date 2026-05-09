@@ -106,7 +106,13 @@ _PLANS: dict[str, PlanSpec] = {
         id="free",
         label="Free",
         monthly_price_usd=0.0,
-        monthly_credit_usd=_f_env("BILLING_FREE_CREDIT_USD", 2.0),
+        # $10 of credit/month so signed-up users can actually try the
+        # cloud models end-to-end (a typical Sonnet chat costs ~$0.05;
+        # $10 covers ~150–200 prompts before they hit the gate). The
+        # previous $2 was effectively "two short Haiku threads", which
+        # didn't show off what the product can do — and forced the
+        # Upgrade modal to pop after the very first conversation.
+        monthly_credit_usd=_f_env("BILLING_FREE_CREDIT_USD", 10.0),
         stripe_price_id="",
         description="Try it out. Haiku + Gemini Flash models. ~50–100 prompts/month.",
     ),

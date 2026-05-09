@@ -429,7 +429,7 @@ async function onDrop(e: DragEvent): Promise<void> {
         ref="renameInput"
         v-model="renameValue"
         type="text"
-        class="min-w-0 flex-1 rounded-sm border border-primary/50 bg-background px-1 py-[1px] font-mono text-[12px] text-foreground outline-none focus:ring-1 focus:ring-primary"
+        class="min-w-0 flex-1 rounded-sm border border-primary/50 bg-background px-1 py-[1px] font-mono text-body text-foreground outline-none focus:ring-1 focus:ring-primary"
         @click.stop
         @keydown.enter.prevent="commitRename"
         @keydown.esc.prevent="cancelRename"
@@ -460,7 +460,7 @@ async function onDrop(e: DragEvent): Promise<void> {
         v-model="newName"
         type="text"
         :placeholder="creatingHere === 'folder' ? 'new folder name' : 'new file name'"
-        class="min-w-0 flex-1 rounded-sm border border-primary/50 bg-background px-1 py-[1px] font-mono text-[12px] text-foreground outline-none focus:ring-1 focus:ring-primary"
+        class="min-w-0 flex-1 rounded-sm border border-primary/50 bg-background px-1 py-[1px] font-mono text-body text-foreground outline-none focus:ring-1 focus:ring-primary"
         @keydown.enter.prevent="commitCreate"
         @keydown.esc.prevent="cancelCreate"
         @blur="commitCreate"

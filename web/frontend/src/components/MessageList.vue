@@ -86,10 +86,10 @@ onMounted(() => {
     >
       <div
         v-if="messages.length === 0"
-        class="mt-12 text-center text-sm text-muted-foreground"
+        class="mt-12 text-center text-lead text-muted-foreground"
       >
         <p class="mb-2">No messages yet.</p>
-        <p class="text-xs">Type below to start the conversation.</p>
+        <p class="text-body">Type below to start the conversation.</p>
       </div>
 
       <template v-for="m in messages" :key="m.id">
@@ -102,7 +102,7 @@ onMounted(() => {
     <button
       v-if="!stickToBottom && messages.length > 0"
       type="button"
-      class="absolute bottom-3 left-1/2 z-10 -translate-x-1/2 rounded-full border border-border bg-card/95 px-3 py-1 text-[11px] text-muted-foreground shadow-md backdrop-blur transition-colors hover:bg-accent hover:text-foreground"
+      class="absolute bottom-3 left-1/2 z-10 -translate-x-1/2 rounded-full border border-border bg-card/95 px-3 py-1 text-caption text-muted-foreground shadow-md backdrop-blur transition-colors hover:bg-accent hover:text-foreground"
       title="Scroll to latest message"
       @click="stickToBottom = true; scrollToBottom()"
     >↓ jump to latest</button>

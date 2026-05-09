@@ -1,9 +1,33 @@
-# DEPLOY — pi-typst-test → digi-setu.com
+# DEPLOY — Digi Setu (digi-setu.com)
 
 Single-page runbook. Every command is copy-pasteable.
 For the *why* behind each piece read `deploy/README.md`; this doc
 is for the operator who already knows the architecture and just
 wants the sequence.
+
+> **TL;DR — three commands cover 95% of releases.**
+>
+> ```bash
+> # cloud (backend + frontend; secrets pulled from GSM on the VM):
+> deploy/scripts/remote-deploy.sh backend
+> deploy/scripts/remote-deploy.sh frontend
+>
+> # desktop installer (one-command end-to-end: build → sign → DMG → upload):
+> desktop/scripts/release.sh
+> ```
+>
+> The first time you run any of these, also do:
+>
+> ```bash
+> # rotate / seed secrets in Google Secret Manager (digi-setu-dev project)
+> deploy/scripts/secrets-sync.sh push      # local stack.env  → GSM
+> deploy/scripts/secrets-sync.sh seed-iam  # let the VM SA read them
+> deploy/scripts/secrets-sync.sh list      # verify versions
+> ```
+>
+> All secrets (Clerk, Stripe, Cloudflare, Gemini) live in GSM now.
+> `stack.env` on the laptop is for non-secret config only
+> (image refs, price IDs, public keys).
 
 > **Before you cut traffic over to the new stack**, read
 > [`deploy/HARDENING.md`](./HARDENING.md) end-to-end and tick every
@@ -133,7 +157,7 @@ traceability commit + push first.
 cd "$(dirname "$0")/.."   # repo root
 git status                # 91 changes expected
 git add -A
-git commit -m "feat: pi-typst-test ready for production deploy"
+git commit -m "feat: digi-setu ready for production deploy"
 git push origin main
 ```
 

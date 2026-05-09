@@ -1,264 +1,304 @@
 """
-Desktop relay WebSocket — `wss://api.digi-setu.com/v1/ws/desktop-relay`.
+Desktop chat-relay WebSocket endpoint.
 
-Acts as the cloud bridge for desktop clients that have **no BYOK key**
-in `~/.digi-setu/.env`. The desktop's local chat WS dispatcher
-(``desktop/backend/routes/chat_ws.py``) opens a WebSocket to this
-endpoint, forwards user prompts, and streams tokens back. The relay
-runs ``pi`` server-side using the operator's existing Vertex
-credentials brokered through ``services/egress_proxy.py`` — so the
-operator's service-account JSON **never** ships to user laptops.
+Endpoint:
+    /v1/ws/desktop-relay
 
-The full relay-side ``pi`` lifecycle (per-session container, tool
-brokering, file round-trip) lands in M3/M4 of
-``docs/desktop-architecture.md``. This M2 scaffold proves the wire:
+Purpose:
+    The desktop sidecar opens this WS when it needs to route a chat
+    through the cloud (no BYOK key configured but the user is signed
+    in to a paid plan). The pi subprocess that backs the chat runs
+    HERE on the cloud VM — not on the user's laptop — so the user
+    never has to install pi/node/Python locally.
 
-    1. WebSocket upgrade.
-    2. Clerk session verification.
-    3. Plan / BYOK-state echo so the desktop can render UX.
-    4. Heartbeat (ping/pong) so the SPA's connection-status pill works
-       end-to-end before any chat traffic flows.
+Auth:
+    The desktop side ships its Clerk JWT in
+    ``Sec-WebSocket-Protocol: bearer.<token>`` because browser-style
+    WebSockets can't set custom headers. ``services/auth._WsRequestish``
+    already knows how to extract that and feed it to Clerk's verifier.
 
-The wire format mirrors the local chat WS schema 1:1 — when M3 lands,
-the only thing that changes is which side of the relay drives the
-``pi`` subprocess.
+    Relay-only restriction: we additionally require the request to
+    look like it's coming from the desktop (subprotocol-bearer is
+    present). Browser SPAs use ``?clerk_token=`` instead, so that path
+    can't accidentally end up here.
 
-Auth contract:
-    The browser ``new WebSocket(...)`` API doesn't allow custom
-    headers, so the desktop sends the Clerk session token in the
-    ``Sec-WebSocket-Protocol: bearer.<token>`` subprotocol. We accept
-    that subprotocol on the upgrade and verify the token via the
-    existing ``services/auth.py:user_for_websocket`` helper, which
-    already understands both the cookie and bearer paths.
+Lifecycle:
+    Per WS connection we create:
+      * a fresh transient workspace under web/data/workspaces/ws_XYZ/
+        owned by the signed-in user
+      * a fresh session inside that workspace
+    Both are torn down when the connection closes (the registry's
+    background prune sweep is a fallback).
 
-    In dev mode (``CLERK_SECRET_KEY`` empty) auth is best-effort: the
-    helper returns ``DEV_USER_ID`` so local smoke tests don't need a
-    real Clerk session.
+    The user's existing chat history (if any) lives in their other
+    sessions and isn't touched. This endpoint is for ephemeral relay
+    sessions only — the desktop SPA renders the conversation in its
+    own UI and decides whether to persist anything locally.
 
-Versioning:
-    The route is mounted at ``/v1/ws/desktop-relay``. Future protocol
-    changes go to ``/v2/...`` so a desktop binary shipped today keeps
-    working without a forced upgrade. Don't break v1 — branch the
-    schema, don't extend it in place.
+Protocol surface:
+    Identical to /ws/sessions/{sid} — see chat_ws.run_session_loop().
+    The desktop side (services/relay_bridge.py) just pipes everything
+    through, so any envelope the SPA understands works here too.
 
-Origin / CORS:
-    The desktop sends ``Origin: tauri://localhost`` (macOS) or
-    ``Origin: https://tauri.localhost`` (Windows). Caddy doesn't gate
-    WebSocket Origin by default, but we MAY want to add an allowlist
-    once we have a stable list of expected Origins. For v1 we accept
-    any Origin and rely on Clerk auth to gate access — same as the
-    existing ``/ws/sessions/{sid}`` endpoint.
+    Special: we send one ``relay_hello`` envelope right after accept()
+    so the desktop bridge can attach plan info to the local SPA before
+    the chat starts.
 """
 
 from __future__ import annotations
 
-import asyncio
-import json
 import sys
-from typing import Any
+import traceback
+from typing import Optional
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, WebSocket
 
-from config import BYOK_MODE, DEPLOY_MODE
-from services.auth import user_for_websocket
+from config import AUTH_REQUIRED, DEV_USER_ID
+from routes.chat_ws import run_session_loop
+from services.auth import (
+    _WsRequestish,
+    _bearer_from_subprotocol,
+    negotiated_subprotocol,
+    user_for_websocket,
+)
 from services.billing import CreditLedger
-from services.models_registry import DEFAULT_MODEL_ID, get_model
+from services.error_codes import bridge_error, log_error
+from services.rate_limit import RateLimiter
+from services.registry import Registry
 
 router = APIRouter()
 
-# Heartbeat cadence. The desktop dispatcher (M3) sends a ``{type:
-# "ping"}`` every 25 s; if no message of any kind reaches us in
-# IDLE_TIMEOUT_S we assume the connection is dead and close. These
-# numbers are conservative — Caddy's ``write_timeout 24h`` covers the
-# slow streaming case, but we don't need to keep dead WSs around.
-_PING_INTERVAL_S = 25.0
-_IDLE_TIMEOUT_S = 90.0
+# Bumped whenever the relay protocol changes in a way the desktop
+# side has to detect. Today there's only v1 — the existing chat
+# envelope. v2 will land when we add cloud-side BYOK proxying.
+_RELAY_PROTOCOL_VERSION = 1
+
+
+def _has_bearer_subprotocol(ws: WebSocket) -> bool:
+    """True iff the upgrade request carries a `bearer.<jwt>` token in
+    the Sec-WebSocket-Protocol list. Used to gate the endpoint to
+    desktop callers (browsers can't set this header themselves)."""
+    raw = ws.headers.get("sec-websocket-protocol", "")
+    return _bearer_from_subprotocol(raw) is not None
 
 
 @router.websocket("/v1/ws/desktop-relay")
-async def desktop_relay_ws(ws: WebSocket) -> None:
+async def desktop_relay(ws: WebSocket) -> None:
+    """Cloud chat relay for the Digi Setu desktop app.
+
+    See the module docstring for the contract. In short:
+        1. Verify the bearer subprotocol → user_id.
+        2. Rate-limit the WS upgrade.
+        3. Accept (echoing the bearer subprotocol — required by the
+           browser-WS spec even though our client is python-websockets).
+        4. Create a transient workspace + session for this connection.
+        5. Send `relay_hello` so the desktop bridge can hydrate plan
+           info into the local SPA.
+        6. Hand off to chat_ws.run_session_loop — the same machinery
+           that powers /ws/sessions/{sid}.
+        7. Best-effort delete of the transient state on teardown.
     """
-    Cloud-relay WebSocket for desktop clients without BYOK keys.
+    # ── Step 1: auth ───────────────────────────────────────────────
+    # In production we require a real Clerk JWT in the subprotocol.
+    # In dev mode (AUTH_REQUIRED=False) we allow connections without
+    # any token so a developer can poke the endpoint with `wscat`
+    # without standing up Clerk locally — the resolved user_id is
+    # the synthetic DEV_USER_ID.
+    #
+    # IMPORTANT: every rejection branch logs WHY. Without these the
+    # only signal a 403 was caused by `auth failed` vs `bearer
+    # missing` vs `bearer expired` is the tail of the Clerk SDK's
+    # own debug output, which `clerk-backend-api` only emits on
+    # uncaught exceptions. The desktop side only sees "HTTP 403" so
+    # the operator (us) is the only one with enough context to
+    # diagnose — these stderr lines are how we get that context.
+    client_addr = "?"
+    try:
+        if ws.client is not None:
+            client_addr = f"{ws.client.host}:{ws.client.port}"
+    except Exception:
+        pass
 
-    M2 scaffold — accepts upgrade, verifies user, sends a
-    ``relay_hello`` describing plan + entitlements, then enters a
-    ping/pong heartbeat loop. M3 will replace the loop body with the
-    actual chat dispatcher (per-session ``PiSession`` + token stream).
-    """
-    # 1. Accept the subprotocol the desktop will use to ship the Clerk
-    #    JWT. Browsers don't allow custom headers on WS upgrade, so the
-    #    bearer rides as a subprotocol token: e.g.
-    #        Sec-WebSocket-Protocol: bearer.eyJhbGciOi...
-    #    The standard `user_for_websocket` already pulls a token from
-    #    headers OR query params; we extend it here with the
-    #    subprotocol path before delegating.
-    requested_protos = ws.headers.get("sec-websocket-protocol", "")
-    bearer_token = ""
-    accepted_proto = None
-    for proto in (p.strip() for p in requested_protos.split(",")):
-        if proto.startswith("bearer."):
-            bearer_token = proto[len("bearer.") :]
-            accepted_proto = proto
-            break
-    if bearer_token:
-        # Mutate the query params view via a wrapper so
-        # `user_for_websocket` finds the token without us reaching
-        # into Clerk verifier internals.
-        ws.scope.setdefault("query_string", b"")
-        existing = ws.scope["query_string"].decode("utf-8") if ws.scope["query_string"] else ""
-        sep = "&" if existing else ""
-        ws.scope["query_string"] = (existing + sep + f"clerk_token={bearer_token}").encode("utf-8")
-
-    await ws.accept(subprotocol=accepted_proto)
-
-    # 2. Verify the Clerk session. ``user_for_websocket`` returns None
-    #    when CLERK_SECRET_KEY is set but the token is bad/missing, or
-    #    a user_id (``DEV_USER_ID`` in open-dev mode) when valid.
-    user_id = await user_for_websocket(ws)
-    if not user_id:
-        await ws.send_json({
-            "type": "_bridge_error",
-            "code": "unauthenticated",
-            "message": (
-                "Sign in at digi-setu.com to enable cloud chat. "
-                "Or add an AI key to ~/.digi-setu/.env to use BYOK mode."
-            ),
-        })
+    if AUTH_REQUIRED and not _has_bearer_subprotocol(ws):
+        print(
+            f"[desktop_relay] reject reason=missing_bearer_subprotocol "
+            f"client={client_addr} sec_ws_proto="
+            f"{ws.headers.get('sec-websocket-protocol', '')!r}",
+            file=sys.stderr,
+        )
+        # Closing BEFORE accept yields an HTTP 403 on the upgrade
+        # (Starlette hardcodes 403 for pre-accept close). The desktop
+        # bridge maps both 401 and 403 to the same "sign-in needs
+        # refresh" toast — see services/relay_bridge.py.
         await ws.close(code=4401)
         return
 
-    # 3. Compute the entitlement summary. The desktop renders the
-    #    model picker badges off this — "you can pick CLOUD models
-    #    because you're on plan=pro" or "free plan, BYOK only".
-    ledger = CreditLedger.instance()
-    plan = ledger.get_plan(user_id)
-    plan_id = ledger.get_plan_id(user_id)
-    default_model = get_model(DEFAULT_MODEL_ID)
+    user_id = await user_for_websocket(ws)
+    if user_id is None:
+        print(
+            f"[desktop_relay] reject reason=clerk_verify_failed "
+            f"client={client_addr} "
+            f"sec_ws_proto_len={len(ws.headers.get('sec-websocket-protocol', ''))}",
+            file=sys.stderr,
+        )
+        await ws.close(code=4401)
+        return
 
-    await ws.send_json({
-        "type": "relay_hello",
-        "user_id": user_id,
-        "plan_id": plan_id,
-        # Plan-level caps the desktop UI surfaces in Settings/Activity.
-        "plan_caps": {
-            "monthly_credit_usd": plan.monthly_credit_usd,
-            "allowed_models": list(plan.allowed_models or []),
-        },
-        # Server-side defaults the desktop should fall back to when
-        # the user hasn't pinned a model. Mirrors the local chat_ws
-        # picker behaviour.
-        "default_model_id": default_model.id if default_model else None,
-        # Mirror back what the server sees of the *server's* env. The
-        # desktop will re-evaluate locally, but this lets us catch
-        # drift between client/server expectations during M3 testing.
-        "server_byok_mode": BYOK_MODE,
-        "server_deploy_mode": DEPLOY_MODE,
-        # Protocol version. M3+ will branch on this.
-        "protocol_version": 1,
-    })
+    # ── Step 2: rate-limit the upgrade ─────────────────────────────
+    rl = RateLimiter.instance()
+    if not rl.try_take(user_id, "ws.connect"):
+        await ws.close(code=4429)
+        return
 
+    # Concurrent-chat cap: same budget the browser /ws/sessions/* path
+    # uses (services/rate_limit.py:_MAX_CONCURRENT_CHATS, default 5).
+    # A user with 5 desktop windows already at the cap will get a
+    # clean rejection here instead of starving a 6th window forever
+    # waiting for backend-ready. The custom 4409 close code lets the
+    # desktop relay bridge surface "you have N chats open — close one"
+    # rather than a generic disconnect toast.
+    granted, current, cap = rl.acquire_chat_slot(user_id)
+    if not granted:
+        print(
+            f"[desktop_relay] reject reason=too_many_chats "
+            f"user={user_id} current={current} cap={cap}",
+            file=sys.stderr,
+        )
+        await ws.close(
+            code=4409,
+            reason=f"too_many_chats:{current}/{cap}",
+        )
+        return
+
+    # ── Step 3: accept (echo the subprotocol if the client offered) ─
+    # RFC 6455 §4.2.2: if the client offered subprotocols the server
+    # MUST echo one of them or close the handshake. python-websockets
+    # is strict about this on the client side.
+    sub_echo = negotiated_subprotocol(ws)
+    try:
+        if sub_echo:
+            await ws.accept(subprotocol=sub_echo)
+        else:
+            await ws.accept()
+    except Exception as exc:
+        log_error(
+            "internal",
+            user_id=user_id,
+            exc=exc,
+            where="desktop_relay_accept",
+        )
+        return
+
+    # ── Step 4: create the transient workspace + session ───────────
+    reg = Registry.instance()
+    transient_workspace_id: Optional[str] = None
+    transient_session_id: Optional[str] = None
+    try:
+        ws_rec = reg.create_web_workspace(
+            name=f"relay {user_id[:6]}",
+            owner_user_id=user_id,
+        )
+        transient_workspace_id = ws_rec["id"]
+        sess_rec = reg.create_session(workspace_id=transient_workspace_id)
+        transient_session_id = sess_rec["id"]
+    except Exception as exc:
+        log_error(
+            "internal",
+            user_id=user_id,
+            exc=exc,
+            where="desktop_relay_provision",
+        )
+        try:
+            await ws.send_json(bridge_error("internal"))
+        except Exception:
+            pass
+        await ws.close(code=1011)
+        # Best-effort cleanup if we got partway through.
+        if transient_workspace_id is not None:
+            try:
+                reg.delete_workspace(transient_workspace_id)
+            except Exception:
+                pass
+        # Release the chat slot we reserved in step 2 — the connection
+        # never reached the run_session_loop teardown that would
+        # normally do this for us.
+        rl.release_chat_slot(user_id)
+        return
+
+    # ── Step 5: send relay_hello so the bridge can hydrate plan info ─
+    plan_id = "free"
+    try:
+        if user_id != DEV_USER_ID:
+            plan_id = CreditLedger.instance().get_plan_id(user_id)
+    except Exception as exc:
+        # Plan lookup is best-effort — a transient billing-store error
+        # shouldn't kill the chat. Default to "free" and let the SPA
+        # gate models accordingly.
+        print(
+            f"[desktop_relay] get_plan_id({user_id}) failed: {exc}",
+            file=sys.stderr,
+        )
+    try:
+        await ws.send_json({
+            "type": "relay_hello",
+            "protocol_version": _RELAY_PROTOCOL_VERSION,
+            "plan_id": plan_id,
+            "session_id": transient_session_id,
+            "workspace_id": transient_workspace_id,
+        })
+    except Exception as exc:
+        log_error(
+            "internal",
+            user_id=user_id,
+            exc=exc,
+            where="desktop_relay_hello",
+        )
+        # Bail before we spawn pi — if we can't even send the hello
+        # the connection is already broken at the transport layer.
+        try:
+            reg.delete_workspace(transient_workspace_id)
+        except Exception:
+            pass
+        rl.release_chat_slot(user_id)
+        return
+
+    # ── Step 6: hand off to the shared chat loop ───────────────────
     print(
-        f"[desktop_relay] connected user_id={user_id!r} plan={plan_id!r}",
+        f"[desktop_relay] connected user_id={user_id!r} "
+        f"session_id={transient_session_id!r} plan={plan_id!r}",
         file=sys.stderr,
     )
-
-    # 4. Heartbeat loop. Two cooperating tasks:
-    #      - reader: drains client messages, resets the idle deadline,
-    #        echoes pong on ping. Future M3 code will dispatch
-    #        user_message / tool_result / permission_response here.
-    #      - keeper: closes the socket when no message arrives within
-    #        IDLE_TIMEOUT_S.
-    last_seen = asyncio.get_event_loop().time()
-
-    async def _reader() -> None:
-        nonlocal last_seen
+    try:
+        await run_session_loop(ws, user_id, transient_session_id)
+    except Exception as exc:
+        # run_session_loop has its own internal error reporting; this
+        # catch is the last-resort net so a buggy pump can't poison
+        # the relay endpoint's lifecycle.
+        log_error(
+            "internal",
+            user_id=user_id,
+            exc=exc,
+            where="desktop_relay_loop",
+        )
+        traceback.print_exc(file=sys.stderr)
+    finally:
+        # ── Step 7: cleanup transient state ────────────────────────
+        # delete_workspace cascades to its sessions + the on-disk
+        # sandbox. Idempotent; safe to call even if pieces are gone.
         try:
-            while True:
-                raw = await ws.receive_text()
-                last_seen = asyncio.get_event_loop().time()
-                try:
-                    msg = json.loads(raw)
-                except json.JSONDecodeError:
-                    await ws.send_json({
-                        "type": "_bridge_error",
-                        "code": "bad_json",
-                        "message": "relay messages must be JSON objects",
-                    })
-                    continue
-
-                mtype = (msg.get("type") or "").strip()
-                if mtype == "ping":
-                    await ws.send_json({"type": "pong", "ts": msg.get("ts")})
-                elif mtype == "session_init":
-                    # M2 stub. M3 wires this up to spawn a real
-                    # PiSession server-side. For now we ack so the
-                    # desktop knows the connection is healthy.
-                    await ws.send_json({
-                        "type": "_bridge_error",
-                        "code": "relay_not_ready",
-                        "message": (
-                            "Desktop relay is in M2 scaffold mode. "
-                            "Server-side pi spawn lands in M3. Use "
-                            "BYOK locally for now."
-                        ),
-                    })
-                else:
-                    # Unknown / future message types: ack but don't
-                    # process. Forward-compat for desktop clients
-                    # speaking a newer protocol than we know.
-                    await ws.send_json({
-                        "type": "_bridge_warn",
-                        "code": "ignored",
-                        "echo": mtype,
-                    })
-        except WebSocketDisconnect:
-            return
-
-    async def _keeper() -> None:
-        nonlocal last_seen
-        while True:
-            await asyncio.sleep(_PING_INTERVAL_S)
-            now = asyncio.get_event_loop().time()
-            if now - last_seen > _IDLE_TIMEOUT_S:
-                # Client went silent — close cleanly so the desktop
-                # dispatcher can decide whether to reconnect or surface
-                # a "lost connection" toast.
-                try:
-                    await ws.close(code=4000)
-                except Exception:
-                    pass
-                return
-
-    reader_task = asyncio.create_task(_reader())
-    keeper_task = asyncio.create_task(_keeper())
-    done, pending = await asyncio.wait(
-        {reader_task, keeper_task}, return_when=asyncio.FIRST_COMPLETED
-    )
-    for task in pending:
-        task.cancel()
-    for task in pending:
-        try:
-            await task
-        except asyncio.CancelledError:
+            reg.delete_workspace(transient_workspace_id)
+        except KeyError:
             pass
-
-    print(f"[desktop_relay] disconnected user_id={user_id!r}", file=sys.stderr)
-
-
-@router.get("/v1/health")
-async def relay_health() -> dict[str, Any]:
-    """
-    Smoke probe for the api.digi-setu.com Caddy block.
-
-    Returns 200 with a tiny JSON body. Useful for monitoring
-    (Pingdom / Cloudflare health checks) and for the desktop's
-    pre-flight check before opening the relay WebSocket — if /v1/health
-    fails, we know the api subdomain itself is down and can show a
-    cleaner error than a generic WebSocket close code.
-    """
-    return {
-        "status": "ok",
-        "service": "desktop-relay",
-        "deploy_mode": DEPLOY_MODE,
-        "protocol_version": 1,
-    }
+        except Exception as exc:
+            print(
+                f"[desktop_relay] cleanup failed for {transient_workspace_id}: {exc}",
+                file=sys.stderr,
+            )
+        # Always release the chat slot we reserved in step 2, even if
+        # provisioning + the loop succeeded but a teardown step failed.
+        rl.release_chat_slot(user_id)
+        print(
+            f"[desktop_relay] disconnected user_id={user_id!r} "
+            f"session_id={transient_session_id!r}",
+            file=sys.stderr,
+        )

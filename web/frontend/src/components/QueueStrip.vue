@@ -152,7 +152,7 @@ function humanSize(bytes: number): string {
       <!-- Collapsed peek strip — single line, click to expand. -->
       <button
         type="button"
-        class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs hover:bg-muted/40"
+        class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-body hover:bg-muted/40"
         :title="expanded ? 'Hide queue' : 'Show queue'"
         @click="toggleExpanded"
       >
@@ -161,7 +161,7 @@ function humanSize(bytes: number): string {
           class="h-3 w-3 shrink-0 text-muted-foreground"
         />
         <span
-          class="shrink-0 rounded bg-primary/15 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-primary"
+          class="shrink-0 rounded bg-primary/15 px-1.5 py-0.5 font-mono text-caption font-semibold text-primary"
           :title="`${queueCount} message${queueCount === 1 ? '' : 's'} waiting to send`"
         >{{ queueCount }} queued</span>
         <span
@@ -170,7 +170,7 @@ function humanSize(bytes: number): string {
         >{{ headPreview }}</span>
         <span
           v-if="!expanded && isStreaming"
-          class="shrink-0 font-mono text-[10px] text-muted-foreground"
+          class="shrink-0 font-mono text-caption text-muted-foreground"
         >will fire after current turn</span>
       </button>
 
@@ -180,7 +180,7 @@ function humanSize(bytes: number): string {
           v-for="(item, idx) in queuedMessages"
           :key="item.id"
           :class="[
-            'group mt-1.5 rounded-md border bg-card px-2.5 py-2 text-xs transition-colors',
+            'group mt-1.5 rounded-md border bg-card px-2.5 py-2 text-body transition-colors',
             idx === 0
               ? 'border-primary/40 ring-1 ring-primary/20'
               : 'border-border',
@@ -188,10 +188,10 @@ function humanSize(bytes: number): string {
         >
           <!-- Header row: index + head badge + actions -->
           <div class="flex items-center gap-1.5">
-            <span class="font-mono text-[10px] text-muted-foreground">#{{ idx + 1 }}</span>
+            <span class="font-mono text-caption text-muted-foreground">#{{ idx + 1 }}</span>
             <span
               v-if="idx === 0"
-              class="rounded bg-primary/10 px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wide text-primary"
+              class="rounded bg-primary/10 px-1.5 py-0.5 font-mono text-caption uppercase tracking-wide text-primary"
               title="This will run as soon as the current pi turn finishes."
             >next up</span>
             <span class="ml-auto flex items-center gap-0.5">
@@ -239,7 +239,7 @@ function humanSize(bytes: number): string {
               ref="editTextarea"
               v-model="editText"
               rows="3"
-              class="w-full resize-y rounded border border-input bg-background px-2 py-1.5 font-sans text-[12px] outline-none focus:border-ring"
+              class="w-full resize-y rounded border border-input bg-background px-2 py-1.5 font-sans text-body outline-none focus:border-ring"
               placeholder="Edit your queued message…"
               @keydown="(e) => onEditKeydown(e, item.id)"
               @blur="commitEdit(item.id)"
@@ -250,7 +250,7 @@ function humanSize(bytes: number): string {
             >{{ item.text || "(no text — attachments only)" }}</div>
             <div
               v-if="editingId === item.id"
-              class="mt-1 flex items-center gap-2 font-mono text-[9px] text-muted-foreground"
+              class="mt-1 flex items-center gap-2 font-mono text-caption text-muted-foreground"
             >
               <span>⌘/Ctrl + ↵ to save</span>
               <span>·</span>
@@ -268,7 +268,7 @@ function humanSize(bytes: number): string {
             <div
               v-for="att in item.attachments"
               :key="att.localId"
-              class="inline-flex max-w-[14rem] items-center gap-1 rounded border border-border bg-muted/30 px-1.5 py-0.5 text-[10px]"
+              class="inline-flex max-w-[14rem] items-center gap-1 rounded border border-border bg-muted/30 px-1.5 py-0.5 text-caption"
               :title="att.agentPath"
             >
               <Icon

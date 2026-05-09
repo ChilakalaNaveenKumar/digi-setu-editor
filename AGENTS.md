@@ -1,6 +1,6 @@
-# pi-typst-test
+# Digi Setu
 
-A scratch workspace for smoke-testing `pi-coding-agent` on the Typst workflow currently driven by the Google ADK based `typst-agent` next door.
+Monorepo for the Digi Setu coding agent. Wraps `pi-coding-agent` with a Typst-tuned tool surface, ships as a hosted Vue/FastAPI web app and as a cross-platform Tauri desktop app. The repo's filesystem path may still read `pi-typst-test/` for historical reasons; everything that surfaces to users — UI, binary names, deeplink scheme, support email — uses **Digi Setu**.
 
 ## Layout
 

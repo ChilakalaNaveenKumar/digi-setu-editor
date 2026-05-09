@@ -1,20 +1,25 @@
 <!--
-  ChatPane — right column. In web mode: simple header (status dot +
-  model picker + settings gear) → MessageList → Composer. In desktop
-  mode: a Cursor-style tab strip at the top with all chats in the
-  current workspace, plus quick-action icons (+ new, 🕐 history,
-  ⋯ overflow) — so the user can hop between threads in the same
-  folder without leaving the IDE shell.
+  ChatPane — right column.
 
-  Per-turn token/cost stats live inside each assistant bubble; the user's
-  plan-level usage lives in ChatSettingsMenu (gear icon). We deliberately
-  no longer render a session-total ticker here — it conflated raw model
-  cost with billed usage and read as alarming.
+  Desktop mode renders a Cursor-style tab strip at the top with every
+  chat in the current workspace, plus quick-action icons (+ new,
+  🕐 history, ⋯ overflow) — so the user can hop between threads in the
+  same folder without leaving the IDE shell. Web mode renders a thinner
+  header with just the workspace label.
+
+  Connection state, model picker, permission mode, settings gear, and
+  send/stop now ALL live inside the Composer card at the bottom. The
+  status row that previously lived between the tabs and the message
+  list is gone — it duplicated controls and competed with the composer
+  for the user's eye. Credit chip stays in the header so plan + usage
+  is visible from the very top of the chat surface.
+
+  Per-turn token/cost stats live inside each assistant bubble.
 -->
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import { storeToRefs } from "pinia";
-import { useRouter } from "vue-router";
+import { RouterLink, useRouter } from "vue-router";
 import { Icon } from "@iconify/vue";
 
 import { useBillingStore } from "../stores/billing";
@@ -26,9 +31,9 @@ import { useWorkspaceStore } from "../stores/workspace";
 import type { SessionRecord } from "../api/types";
 import ChatErrorBanner from "./ChatErrorBanner.vue";
 import Composer from "./Composer.vue";
-import ChatSettingsMenu from "./ChatSettingsMenu.vue";
+import CreditChip from "./CreditChip.vue";
 import MessageList from "./MessageList.vue";
-import ModelPicker from "./ModelPicker.vue";
+import UpgradeModal from "./UpgradeModal.vue";
 
 const chat = useChatStore();
 const billing = useBillingStore();
@@ -38,8 +43,8 @@ const ws = useWorkspaceStore();
 const ui = useUiStore();
 const router = useRouter();
 
-const { messages, isStreaming, connState, lastError } = storeToRefs(chat);
-const { exhausted } = storeToRefs(billing);
+const { messages, lastError } = storeToRefs(chat);
+const { exhausted, wantsAutoUpgrade, enabled: billingEnabled } = storeToRefs(billing);
 const { sessions, activeId: activeSessionId } = storeToRefs(chatSession);
 const { mode } = storeToRefs(cfg);
 
@@ -82,6 +87,17 @@ async function newChat(): Promise<void> {
   } finally {
     busy.value = false;
   }
+}
+
+/**
+ * Wired to <ChatErrorBanner @reconnect>. Clears the inline error and
+ * asks the chat store to drop the dead WebSocket and re-spawn pi for
+ * the active session. Idempotent — chat.reconnect() no-ops when no
+ * session is loaded.
+ */
+async function onReconnect(): Promise<void> {
+  chat.lastError = null;
+  await chat.reconnect();
 }
 
 async function renameCurrent(): Promise<void> {
@@ -194,7 +210,7 @@ function pickFromHistory(s: SessionRecord): void {
           >
             <button
               type="button"
-              class="flex flex-1 min-w-0 items-center gap-1.5 px-2 py-1 pr-1 text-[11px]"
+              class="flex flex-1 min-w-0 items-center gap-1.5 px-2 py-1 pr-1 text-caption"
               :title="s.title || 'Untitled chat'"
               @click="switchTo(s.id)"
             >
@@ -225,7 +241,7 @@ function pickFromHistory(s: SessionRecord): void {
           </div>
           <div
             v-if="!sessions.length"
-            class="flex items-center px-2 text-[11px] italic text-muted-foreground"
+            class="flex items-center px-2 text-caption italic text-muted-foreground"
           >
             no chats yet
           </div>
@@ -274,7 +290,7 @@ function pickFromHistory(s: SessionRecord): void {
                   v-model="historyQuery"
                   type="search"
                   placeholder="Search chats…"
-                  class="w-full bg-transparent text-[11px] text-foreground outline-none placeholder:text-muted-foreground"
+                  class="w-full bg-transparent text-caption text-foreground outline-none placeholder:text-muted-foreground"
                 />
               </div>
               <div class="max-h-72 overflow-y-auto py-1">
@@ -282,7 +298,7 @@ function pickFromHistory(s: SessionRecord): void {
                   v-for="s in filteredHistory"
                   :key="s.id"
                   type="button"
-                  class="flex w-full items-center justify-between gap-2 px-2 py-1.5 text-left text-[11px] hover:bg-muted/60"
+                  class="flex w-full items-center justify-between gap-2 px-2 py-1.5 text-left text-caption hover:bg-muted/60"
                   :class="
                     s.id === activeSessionId
                       ? 'text-foreground bg-muted/40'
@@ -291,13 +307,13 @@ function pickFromHistory(s: SessionRecord): void {
                   @click="pickFromHistory(s)"
                 >
                   <span class="truncate">{{ s.title || "Untitled chat" }}</span>
-                  <span class="shrink-0 font-mono text-[10px] opacity-60">
+                  <span class="shrink-0 font-mono text-caption opacity-60">
                     {{ timeShort(s.last_used) }}
                   </span>
                 </button>
                 <div
                   v-if="!filteredHistory.length"
-                  class="px-2 py-3 text-center text-[11px] text-muted-foreground"
+                  class="px-2 py-3 text-center text-caption text-muted-foreground"
                 >
                   No chats match "{{ historyQuery }}"
                 </div>
@@ -329,7 +345,7 @@ function pickFromHistory(s: SessionRecord): void {
             >
               <button
                 type="button"
-                class="flex w-full items-center gap-2 px-2 py-1.5 text-left text-[11px] text-foreground hover:bg-muted/60"
+                class="flex w-full items-center gap-2 px-2 py-1.5 text-left text-caption text-foreground hover:bg-muted/60"
                 @click="renameCurrent"
               >
                 <Icon icon="codicon:edit" class="h-3 w-3" />
@@ -337,7 +353,7 @@ function pickFromHistory(s: SessionRecord): void {
               </button>
               <button
                 type="button"
-                class="flex w-full items-center gap-2 px-2 py-1.5 text-left text-[11px] text-destructive hover:bg-destructive/10"
+                class="flex w-full items-center gap-2 px-2 py-1.5 text-left text-caption text-destructive hover:bg-destructive/10"
                 @click="deleteCurrent"
               >
                 <Icon icon="codicon:trash" class="h-3 w-3" />
@@ -348,60 +364,59 @@ function pickFromHistory(s: SessionRecord): void {
         </div>
       </header>
 
-      <!-- Status / model row. Thin and quiet. The connection dot
-           lives here so it doesn't fight the tab text for attention. -->
+      <!-- Credit chip strip. Connection dot, model picker and settings
+           gear moved INTO the Composer card — see Composer.vue. We
+           keep credit visible up here so plan + usage reads at a glance
+           from the top of the pane without opening the gear menu. -->
       <div
-        class="flex items-center justify-between gap-2 border-b border-sidebar-border px-3 py-1.5"
+        class="flex items-center justify-end gap-2 border-b border-sidebar-border px-3 py-1.5"
       >
-        <div class="flex min-w-0 items-center gap-2">
-          <span
-            class="inline-block h-1.5 w-1.5 shrink-0 rounded-full"
-            :class="
-              connState === 'open'
-                ? 'bg-success'
-                : connState === 'error' || connState === 'closed'
-                ? 'bg-destructive'
-                : 'bg-warning'
-            "
-            :title="connState"
-          />
-          <span v-if="isStreaming" class="text-[11px] text-warning">streaming…</span>
-        </div>
-        <div class="flex items-center gap-2">
-          <ModelPicker />
-          <ChatSettingsMenu />
-        </div>
+        <CreditChip />
       </div>
     </template>
 
-    <!-- ── WEB HEADER (original, unchanged) ───────────────────────── -->
+    <!-- ── WEB HEADER ─────────────────────────────────────────────── -->
     <template v-else>
       <header
         class="flex items-center justify-between gap-2 border-b border-sidebar-border px-3 py-2"
       >
-        <div class="flex items-center gap-2 min-w-0">
-          <span
-            class="inline-block h-1.5 w-1.5 shrink-0 rounded-full"
-            :class="
-              connState === 'open'
-                ? 'bg-success'
-                : connState === 'error' || connState === 'closed'
-                ? 'bg-destructive'
-                : 'bg-warning'
-            "
-            :title="connState"
-          />
-          <span class="text-[11px] uppercase tracking-wide text-muted-foreground">chat</span>
-          <span v-if="isStreaming" class="text-[11px] text-warning">streaming…</span>
-        </div>
-        <div class="flex items-center gap-2">
-          <ModelPicker />
-          <ChatSettingsMenu />
-        </div>
+        <span class="text-caption uppercase tracking-wide text-muted-foreground">chat</span>
+        <CreditChip />
       </header>
     </template>
 
     <MessageList :messages="messages" />
+
+    <!-- Setup gate: when the user has neither signed in nor dropped a
+         BYOK key (cfg.requires_setup), there's no usable AI backend.
+         We render a clear inline banner directly above the composer
+         instead of letting the user type into a void and crash the
+         WebSocket bridge with a confusing error. The Composer stays
+         on screen below — disabled — so the user sees what's about
+         to be possible the moment they sign in. -->
+    <div
+      v-if="cfg.requiresSetup"
+      class="border-t border-sidebar-border bg-card/60 px-4 py-3"
+    >
+      <div class="flex flex-wrap items-center gap-3">
+        <Icon
+          icon="codicon:account"
+          class="h-5 w-5 shrink-0 text-primary"
+          aria-hidden="true"
+        />
+        <p class="min-w-0 flex-1 text-body text-foreground">
+          {{ $t("errors.setup_required") }}
+        </p>
+        <RouterLink
+          to="/login"
+          class="inline-flex items-center rounded-md bg-primary px-3 py-1.5 text-body font-semibold text-primary-foreground shadow-sm transition-opacity hover:opacity-90"
+        >{{ $t("nav.signIn") }}</RouterLink>
+        <RouterLink
+          to="/login"
+          class="text-body text-muted-foreground hover:text-foreground hover:underline"
+        >{{ $t("login.byok.title") }}</RouterLink>
+      </div>
+    </div>
 
     <Composer />
 
@@ -410,6 +425,18 @@ function pickFromHistory(s: SessionRecord): void {
       :message="lastError"
       :credit-exhausted="exhausted"
       @dismiss="lastError = null"
+      @reconnect="onReconnect"
+    />
+
+    <!-- Auto-pop the upgrade modal once when the user first crosses
+         into exhausted. The store guards against re-popping after
+         dismiss, so closing this returns the user to a normal chat
+         surface (with the bottom banner still showing the Upgrade CTA
+         in case they change their mind). -->
+    <UpgradeModal
+      v-if="wantsAutoUpgrade"
+      :enabled="billingEnabled"
+      @close="billing.dismissAutoUpgrade()"
     />
   </aside>
 </template>

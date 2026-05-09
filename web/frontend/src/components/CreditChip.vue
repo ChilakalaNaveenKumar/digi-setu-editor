@@ -12,7 +12,7 @@
 -->
 <script setup lang="ts">
 import { storeToRefs } from "pinia";
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, ref } from "vue";
 
 import { useBillingStore } from "../stores/billing";
 
@@ -20,16 +20,17 @@ const billing = useBillingStore();
 const { credit, remainingPct, lowCredit, enabled } = storeToRefs(billing);
 
 const showUpgrade = ref(false);
-let pollHandle: number | null = null;
 
+// We deliberately do NOT spin up a polling interval here even though the
+// chip is one of the most "live"-feeling surfaces in the chat header.
+// `ChatSettingsMenu` (the gear icon, always mounted next to us in the
+// chat header) already polls `/api/usage` every 30s and writes through
+// the shared billing store — adding a second timer here would just
+// duplicate the request. We still kick a one-shot fetch on mount so the
+// chip has a number on cold load, before the gear's interval ticks.
 onMounted(() => {
   void billing.refreshStatus();
   void billing.refreshUsage();
-  pollHandle = window.setInterval(() => void billing.refreshUsage(), 30_000);
-});
-
-onUnmounted(() => {
-  if (pollHandle !== null) window.clearInterval(pollHandle);
 });
 
 const labelLeft = computed(() => {
@@ -51,7 +52,7 @@ defineExpose({ openUpgrade: () => (showUpgrade.value = true) });
 <template>
   <button
     type="button"
-    class="inline-flex items-center gap-1.5 rounded border px-2 py-0.5 text-[11px] font-mono"
+    class="inline-flex items-center gap-1.5 rounded border px-2 py-0.5 text-caption font-mono"
     :class="stateClass"
     :title="
       credit

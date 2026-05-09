@@ -7,7 +7,7 @@ Three jobs:
        leaves `pi-sess-*` containers running with no parent. They eat
        memory + Vertex tokens (the AI inside might still be looping).
        On startup we enumerate every container labelled `pi.app=
-       pi-typst-test` and `docker rm -f` them. Idempotent — fresh boot
+       digi-setu` and `docker rm -f` them. Idempotent — fresh boot
        with no stale containers is a no-op.
 
     2. **Per-user concurrency cap.** Without this, a user could open
@@ -31,7 +31,7 @@ process spawn).
 Labels (applied at `docker run` in services/pi_session.py — that file
 imports `LABEL_*` constants from here so the strings stay in sync):
 
-    pi.app          "pi-typst-test"          identifies our containers
+    pi.app          "digi-setu"              identifies our containers
     pi.user_id      <user_xxx | "dev">       quota / orphan attribution
     pi.session_id   <full session_id>        debug correlation
     pi.created_at   <ISO 8601 UTC>           tiebreaker for "oldest"
@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 # Constants (also imported by services/pi_session.py to keep the
 # label strings authoritative in one place).
 LABEL_APP_KEY = "pi.app"
-LABEL_APP_VALUE = "pi-typst-test"
+LABEL_APP_VALUE = "digi-setu"
 LABEL_USER_ID = "pi.user_id"
 LABEL_SESSION_ID = "pi.session_id"
 LABEL_CREATED_AT = "pi.created_at"
@@ -119,7 +119,7 @@ def _inspect_container_sync(container_id: str, fmt: str) -> Optional[str]:
 # ── Public API ───────────────────────────────────────────────────────
 async def cleanup_orphaned_containers() -> int:
     """
-    Find every pi-typst-test container on the host and force-remove
+    Find every digi-setu container on the host and force-remove
     it. Returns the count removed. Called once from the FastAPI
     lifespan startup so a backend restart leaves no stragglers.
 

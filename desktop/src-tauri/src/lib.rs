@@ -14,8 +14,8 @@
 //!      without baking it into the bundle.
 //!    - `open_external_url(url)` for OAuth/billing flows that must open
 //!      in the user's default browser.
-//! 4. Receive deep-link callbacks (`pi-typst-test://auth/callback?...`,
-//!    `pi-typst-test://billing/return?...`) and forward them into the
+//! 4. Receive deep-link callbacks (`digi-setu://auth/callback?...`,
+//!    `digi-setu://billing/return?...`) and forward them into the
 //!    webview as a custom JS event so the SPA's auth store can pick up
 //!    the Clerk token / Stripe session id.
 //! 5. Kill the sidecar cleanly on app exit so we don't orphan a Python
@@ -28,6 +28,7 @@
 mod commands;
 mod deeplink;
 mod menu;
+mod secure_storage;
 mod sidecar;
 
 use std::sync::Mutex;
@@ -131,6 +132,9 @@ pub fn run() {
             commands::app_data_dir,
             commands::is_desktop,
             commands::open_new_window,
+            secure_storage::secure_store_session,
+            secure_storage::secure_load_session,
+            secure_storage::secure_delete_session,
         ])
         .on_menu_event(|app_handle, event| {
             handle_menu_event(app_handle, event.id().as_ref());
@@ -246,7 +250,58 @@ fn handle_menu_event(app: &tauri::AppHandle, id: &str) {
             "https://github.com/Digi-Setu/digi-setu/issues/new",
         ),
         ids::HELP_HOMEPAGE => open_external(app, "https://digi-setu.com"),
+        ids::HELP_PRIVACY => open_external(app, "https://digi-setu.com/privacy"),
+        ids::HELP_TERMS => open_external(app, "https://digi-setu.com/terms"),
+        ids::HELP_LICENSES => open_bundled_licenses(app),
         _ => log::debug!("Unhandled menu id: {id}"),
+    }
+}
+
+/// Open `THIRD_PARTY_LICENSES.txt` in the user's default text app.
+///
+/// In dev mode the file lives at the repo root next to `desktop/`; in
+/// release mode it's staged into the bundle's resources directory.
+/// Tauri's `path().resource_dir()` resolves to the right location in
+/// both modes (it falls back to `cargo target/<profile>/` during
+/// `cargo run`), so we ask Tauri rather than pretending we know the
+/// install layout.
+fn open_bundled_licenses(app: &tauri::AppHandle) {
+    use tauri_plugin_opener::OpenerExt;
+    let resource_path = app
+        .path()
+        .resource_dir()
+        .ok()
+        .map(|p| p.join("THIRD_PARTY_LICENSES.txt"));
+
+    let candidate = match resource_path {
+        Some(p) if p.exists() => Some(p),
+        _ => {
+            // Dev fallback: relative to the workspace root. tauri::Manager's
+            // resource_dir doesn't always resolve during `cargo run` from a
+            // sibling crate, so we walk up from CARGO_MANIFEST_DIR.
+            let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let dev_path = manifest_dir.join("..").join("THIRD_PARTY_LICENSES.txt");
+            if dev_path.exists() {
+                Some(dev_path)
+            } else {
+                None
+            }
+        }
+    };
+
+    match candidate {
+        Some(path) => {
+            if let Err(err) = app.opener().open_path(path.to_string_lossy(), None::<&str>) {
+                log::error!("Failed to open licenses file: {err}");
+            }
+        }
+        None => {
+            log::warn!(
+                "THIRD_PARTY_LICENSES.txt not found; run desktop/scripts/gen-third-party-licenses.mjs"
+            );
+            // Fall back to the hosted copy.
+            open_external(app, "https://digi-setu.com/licenses");
+        }
     }
 }
 

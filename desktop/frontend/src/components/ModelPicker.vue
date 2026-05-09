@@ -270,7 +270,7 @@ function onKeyDown(e: KeyboardEvent): void {
     <button
       ref="triggerRef"
       type="button"
-      class="flex max-w-[180px] items-center gap-1 truncate rounded border border-border bg-background px-2 py-0.5 text-[11px] font-mono text-foreground hover:bg-muted"
+      class="flex max-w-[180px] items-center gap-1 truncate rounded border border-border bg-background px-2 py-0.5 text-caption font-mono text-foreground hover:bg-muted"
       :title="`active model: ${activeModelId ?? buttonLabel}`"
       @click="open = !open"
     >
@@ -293,7 +293,7 @@ function onKeyDown(e: KeyboardEvent): void {
             ref="searchRef"
             v-model="search"
             type="text"
-            class="w-full bg-transparent font-mono text-[11px] text-foreground placeholder:text-muted-foreground focus:outline-none"
+            class="w-full bg-transparent font-mono text-caption text-foreground placeholder:text-muted-foreground focus:outline-none"
             placeholder="Search models…"
             @keydown="onKeyDown"
           />
@@ -303,7 +303,7 @@ function onKeyDown(e: KeyboardEvent): void {
         <div class="flex-1 overflow-y-auto py-1">
           <div
             v-if="filtered.length === 0"
-            class="px-3 py-6 text-center font-mono text-[11px] text-muted-foreground"
+            class="px-3 py-6 text-center font-mono text-caption text-muted-foreground"
           >
             No matches
           </div>
@@ -311,7 +311,7 @@ function onKeyDown(e: KeyboardEvent): void {
           <template v-for="group in filteredGrouped" :key="group.family">
             <div
               v-if="filteredGrouped.length > 1 || !search"
-              class="px-2.5 pb-0.5 pt-1.5 font-mono text-[9px] uppercase tracking-wide text-muted-foreground/70"
+              class="px-2.5 pb-0.5 pt-1.5 font-mono text-caption uppercase tracking-wide text-muted-foreground/70"
             >
               {{ familyLabels[group.family] || group.family }}
             </div>
@@ -321,7 +321,7 @@ function onKeyDown(e: KeyboardEvent): void {
               type="button"
               role="option"
               :aria-selected="m.id === activeModelId"
-              class="flex w-full items-center gap-2 px-2.5 py-1.5 text-left font-mono text-[11px] disabled:cursor-not-allowed"
+              class="flex w-full items-center gap-2 px-2.5 py-1.5 text-left font-mono text-caption disabled:cursor-not-allowed"
               :class="[
                 m.id === highlightId ? 'bg-muted' : '',
                 m.available ? 'hover:bg-muted' : 'opacity-55',
@@ -338,11 +338,11 @@ function onKeyDown(e: KeyboardEvent): void {
               <span class="flex-1 truncate">{{ m.name }}</span>
               <span
                 v-if="routeBadge(m)"
-                class="shrink-0 rounded border px-1 py-px font-mono text-[9px] uppercase tracking-wide"
+                class="shrink-0 rounded border px-1 py-px font-mono text-caption uppercase tracking-wide"
                 :class="routeBadge(m)!.class"
               >{{ routeBadge(m)!.label }}</span>
               <span
-                class="shrink-0 text-[10px]"
+                class="shrink-0 text-caption"
                 :class="intelligenceBadge(m).class"
               >
                 {{ intelligenceBadge(m).label }}
@@ -354,14 +354,14 @@ function onKeyDown(e: KeyboardEvent): void {
               />
               <span
                 v-else-if="!m.available"
-                class="shrink-0 rounded border border-border px-1 py-px font-mono text-[9px] uppercase text-muted-foreground"
+                class="shrink-0 rounded border border-border px-1 py-px font-mono text-caption uppercase text-muted-foreground"
               >{{ m.min_plan }}</span>
             </button>
           </template>
         </div>
 
         <!-- Footer hint — keeps the rows themselves uncluttered -->
-        <div class="border-t border-border px-2.5 py-1 font-mono text-[9px] text-muted-foreground">
+        <div class="border-t border-border px-2.5 py-1 font-mono text-caption text-muted-foreground">
           ↑↓ navigate · ↵ pick · esc close · hover for price
         </div>
       </div>
@@ -384,20 +384,20 @@ function onKeyDown(e: KeyboardEvent): void {
         >
           <div class="mb-2 flex items-center gap-2">
             <Icon icon="codicon:cloud" class="h-5 w-5 text-warning" />
-            <h2 class="text-base font-semibold text-foreground">Cloud model selected</h2>
+            <h2 class="text-lead font-semibold text-foreground">Cloud model selected</h2>
           </div>
-          <p class="text-[12px] leading-relaxed text-muted-foreground">{{ cloudGateMessage }}</p>
+          <p class="text-body leading-relaxed text-muted-foreground">{{ cloudGateMessage }}</p>
           <div class="mt-4 flex flex-wrap items-center justify-end gap-2">
             <button
               type="button"
-              class="rounded-md border border-border bg-background px-3 py-1.5 text-[11px] text-foreground hover:bg-muted"
+              class="rounded-md border border-border bg-background px-3 py-1.5 text-caption text-foreground hover:bg-muted"
               @click="cloudGateMessage = null"
             >
               Pick a different model
             </button>
             <RouterLink
               to="/pricing"
-              class="rounded-md bg-primary px-3 py-1.5 text-[11px] font-semibold text-primary-foreground hover:opacity-90"
+              class="rounded-md bg-primary px-3 py-1.5 text-caption font-semibold text-primary-foreground hover:opacity-90"
               @click="cloudGateMessage = null"
             >
               See plans

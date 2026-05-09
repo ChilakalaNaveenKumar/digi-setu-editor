@@ -85,7 +85,7 @@ async function copy(): Promise<void> {
 </script>
 
 <template>
-  <div class="my-0.5 px-1 font-mono text-[12px] text-foreground/85">
+  <div class="my-0.5 px-1 font-mono text-body text-foreground/85">
     <div class="flex items-center gap-1.5">
       <button
         type="button"
@@ -110,13 +110,13 @@ async function copy(): Promise<void> {
       <span :class="['inline-block h-1.5 w-1.5 shrink-0 rounded-full', statusDot]" :title="call.status"></span>
       <span
         v-if="statusLabel"
-        class="text-[10px] text-muted-foreground"
+        class="text-caption text-muted-foreground"
       >{{ statusLabel }}</span>
 
       <button
         v-if="copyValue || main"
         type="button"
-        class="rounded-sm px-1 text-[10px] text-muted-foreground hover:bg-accent hover:text-foreground"
+        class="rounded-sm px-1 text-caption text-muted-foreground hover:bg-accent hover:text-foreground"
         :title="copyFlash ? 'Copied!' : `Copy: ${copyValue ?? main}`"
         @click.stop="copy"
       >{{ copyFlash ? "✓" : "⧉" }}</button>
@@ -125,13 +125,13 @@ async function copy(): Promise<void> {
     <pre
       v-if="expanded && resultText"
       :class="[
-        'mt-1 ml-5 max-h-72 overflow-auto whitespace-pre-wrap break-words rounded border border-border/50 bg-background px-2 py-1.5 text-[11px] leading-snug',
+        'mt-1 ml-5 max-h-72 overflow-auto whitespace-pre-wrap break-words rounded border border-border/50 bg-background px-2 py-1.5 text-caption leading-snug',
         call.result?.isError ? 'text-destructive' : 'text-foreground/90',
       ]"
     >{{ resultText }}</pre>
     <div
       v-else-if="expanded"
-      class="mt-1 ml-5 text-[10px] italic text-muted-foreground"
+      class="mt-1 ml-5 text-caption italic text-muted-foreground"
     >no output</div>
   </div>
 </template>

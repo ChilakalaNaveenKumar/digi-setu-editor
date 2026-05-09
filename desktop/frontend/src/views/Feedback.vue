@@ -22,7 +22,7 @@ import { ref } from "vue";
 import { useRouter } from "vue-router";
 import { Icon } from "@iconify/vue";
 
-import BrandHeader from "../components/BrandHeader.vue";
+import AppFooter from "../components/AppFooter.vue";
 import { submitFeedback } from "../api/feedback";
 import { useUiStore } from "../stores/ui";
 
@@ -80,28 +80,18 @@ function backHome(): void {
 </script>
 
 <template>
-  <div class="flex min-h-screen flex-col bg-background text-foreground">
-    <!-- BrandHeader hides its own Feedback button on this route since
-         we already are on the feedback page; the showFeedback prop
-         is left at its default and the link itself simply re-renders
-         the same page (no harm). -->
-    <BrandHeader
-      :links="[
-        { to: '/pricing', label: 'Pricing' },
-        { to: '/privacy', label: 'Privacy' },
-        { to: '/terms', label: 'Terms' },
-      ]"
-      :show-feedback="false"
-    />
-
-    <main class="mx-auto w-full max-w-2xl flex-1 px-6 py-12">
+  <div class="flex min-h-0 flex-1 flex-col bg-background text-foreground">
+    <main class="mx-auto w-full max-w-2xl flex-1 px-6 py-10 md:py-14">
       <header class="mb-8">
-        <h1 class="text-2xl font-semibold tracking-tight md:text-3xl">
+        <h1 class="text-h1 font-semibold tracking-tight text-foreground">
           Send feedback
         </h1>
-        <p class="mt-2 text-sm leading-relaxed text-muted-foreground">
+        <p class="mt-2 text-lead leading-relaxed text-muted-foreground">
           Goes directly to
-          <span class="font-mono text-foreground">nchilaka@digi-setu.com</span>
+          <a
+            href="mailto:support@digi-setu.com"
+            class="font-mono text-foreground underline-offset-2 hover:text-primary hover:underline"
+          >support@digi-setu.com</a>
           — a real human reads it. No ticketing system, no chatbot.
         </p>
       </header>
@@ -114,10 +104,10 @@ function backHome(): void {
         <div class="flex items-start gap-3">
           <Icon icon="codicon:check-all" class="mt-0.5 h-5 w-5 shrink-0 text-success" />
           <div class="flex-1">
-            <h2 class="text-base font-semibold text-foreground">
+            <h2 class="text-lead font-semibold text-foreground">
               Thanks — your feedback was delivered.
             </h2>
-            <p class="mt-1 text-sm text-muted-foreground">
+            <p class="mt-1 text-lead text-muted-foreground">
               Sent to
               <span class="font-mono text-foreground">{{ destination }}</span>.
               We'll reply if you left an email.
@@ -127,14 +117,14 @@ function backHome(): void {
         <div class="mt-5 flex flex-wrap gap-2">
           <button
             type="button"
-            class="rounded-md bg-primary px-3 py-1.5 text-sm font-semibold text-primary-foreground hover:opacity-90"
+            class="rounded-md bg-primary px-3 py-1.5 text-lead font-semibold text-primary-foreground hover:opacity-90"
             @click="reset"
           >
             Send another
           </button>
           <button
             type="button"
-            class="rounded-md border border-border bg-card px-3 py-1.5 text-sm text-muted-foreground hover:border-primary/40 hover:text-foreground"
+            class="rounded-md border border-border bg-card px-3 py-1.5 text-lead text-muted-foreground hover:border-primary/40 hover:text-foreground"
             @click="backHome"
           >
             Back to home
@@ -145,7 +135,7 @@ function backHome(): void {
       <!-- ── FORM ──────────────────────────────────────────────────── -->
       <form v-else class="space-y-6" @submit.prevent="send">
         <fieldset>
-          <legend class="mb-3 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+          <legend class="mb-3 text-body font-semibold uppercase tracking-wide text-muted-foreground">
             What kind of feedback?
           </legend>
           <div class="grid grid-cols-1 gap-2 sm:grid-cols-3">
@@ -165,9 +155,9 @@ function backHome(): void {
                   class="h-4 w-4"
                   :class="category === opt.id ? 'text-primary' : 'text-muted-foreground'"
                 />
-                <span class="text-sm font-semibold">{{ opt.label }}</span>
+                <span class="text-lead font-semibold">{{ opt.label }}</span>
               </div>
-              <span class="text-[11px] leading-snug text-muted-foreground">
+              <span class="text-caption leading-snug text-muted-foreground">
                 {{ opt.description }}
               </span>
             </button>
@@ -177,10 +167,10 @@ function backHome(): void {
         <div>
           <label
             for="feedback-message"
-            class="mb-2 block text-xs font-semibold uppercase tracking-wide text-muted-foreground"
+            class="mb-2 block text-body font-semibold uppercase tracking-wide text-muted-foreground"
           >
             Your message
-            <span class="ml-1 font-mono text-[10px] normal-case text-muted-foreground/70">
+            <span class="ml-1 font-mono text-caption normal-case text-muted-foreground/70">
               {{ message.length }}/4000
             </span>
           </label>
@@ -190,7 +180,7 @@ function backHome(): void {
             rows="8"
             maxlength="4000"
             placeholder="What's broken, or what would you like to see? Be as specific as you can — screenshots help."
-            class="block w-full resize-y rounded-md border border-border bg-card px-3 py-2.5 text-sm leading-relaxed focus:border-primary/50 focus:outline-none"
+            class="block w-full resize-y rounded-md border border-border bg-card px-3 py-2.5 text-lead leading-relaxed focus:border-primary/50 focus:outline-none"
             required
           />
         </div>
@@ -198,7 +188,7 @@ function backHome(): void {
         <div>
           <label
             for="feedback-email"
-            class="mb-2 block text-xs font-semibold uppercase tracking-wide text-muted-foreground"
+            class="mb-2 block text-body font-semibold uppercase tracking-wide text-muted-foreground"
           >
             Reply-to email
             <span class="ml-1 font-normal normal-case text-muted-foreground/70">(optional)</span>
@@ -209,9 +199,9 @@ function backHome(): void {
             type="email"
             maxlength="320"
             placeholder="you@example.com"
-            class="block w-full rounded-md border border-border bg-card px-3 py-2 text-sm focus:border-primary/50 focus:outline-none"
+            class="block w-full rounded-md border border-border bg-card px-3 py-2 text-lead focus:border-primary/50 focus:outline-none"
           />
-          <p class="mt-1 text-[11px] text-muted-foreground">
+          <p class="mt-1 text-caption text-muted-foreground">
             Without this we can't write back, but your message still gets read.
           </p>
         </div>
@@ -219,14 +209,14 @@ function backHome(): void {
         <div class="flex items-center justify-end gap-2 pt-2">
           <button
             type="button"
-            class="rounded-md px-3 py-2 text-sm text-muted-foreground hover:text-foreground"
+            class="rounded-md px-3 py-2 text-lead text-muted-foreground hover:text-foreground"
             @click="backHome"
           >
             Cancel
           </button>
           <button
             type="submit"
-            class="flex items-center gap-1.5 rounded-md bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground hover:opacity-90 disabled:opacity-60"
+            class="flex items-center gap-1.5 rounded-md bg-primary px-4 py-2 text-lead font-semibold text-primary-foreground hover:opacity-90 disabled:opacity-60"
             :disabled="submitting || !message.trim()"
           >
             <Icon
@@ -240,8 +230,6 @@ function backHome(): void {
       </form>
     </main>
 
-    <footer class="border-t border-border bg-card/40 px-6 py-4 text-center text-[11px] text-muted-foreground">
-      © {{ new Date().getFullYear() }} Digi Setu
-    </footer>
+    <AppFooter />
   </div>
 </template>

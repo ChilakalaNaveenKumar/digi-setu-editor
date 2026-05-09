@@ -180,7 +180,7 @@
   - [ ] Production keys (`pk_live_…`, `sk_live_…`) live ONLY in
         `/opt/pi/stack.env` on the VM and the operator's password
         manager. Never in:
-        - `pi-typst-test/web/backend/.env` (laptop dev → use test keys
+        - `<repo>/web/backend/.env` (laptop dev → use test keys
           there)
         - GitHub Actions logs / artifacts
         - Slack / chat
@@ -874,8 +874,8 @@
                                  -X CONNECT https://evil.example.com:443"'
   # Expect: 451
 
-  # 6. No container labelled pi.app=pi-typst-test is orphaned
-  ssh digi-setu-live 'sudo docker ps -a --filter label=pi.app=pi-typst-test --format "{{.Names}}: {{.Status}}"'
+  # 6. No container labelled pi.app=digi-setu is orphaned
+  ssh digi-setu-live 'sudo docker ps -a --filter label=pi.app=digi-setu --format "{{.Names}}: {{.Status}}"'
   # Expect: only currently-active chats (up <N>m) — no Exited containers
 
   # 7. Run the smoke test

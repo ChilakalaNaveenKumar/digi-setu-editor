@@ -62,11 +62,38 @@ export function setTokenResolver(resolver: TokenResolver | null): void {
   _tokenResolver = resolver;
 }
 
+/**
+ * Strip characters HTTP headers cannot legally carry (CR, LF, NUL,
+ * and any other control < 0x20 except TAB). Without this, a stray
+ * newline in a Clerk JWT or a session id (e.g. one read from a file
+ * with a trailing `\n`) produces WebKit's confusing
+ * "TypeError: The string did not match the expected pattern" out of
+ * `fetch()` — and the user sees an unhelpful toast that points
+ * nowhere near the actual cause.
+ */
+function _sanitizeHeaderValue(v: string): string {
+  return v.replace(/[\u0000-\u0008\u000A-\u001F\u007F]/g, "").trim();
+}
+
+function _sanitizeHeaders(
+  raw: Record<string, string>,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(raw)) {
+    if (typeof v !== "string") continue;
+    const clean = _sanitizeHeaderValue(v);
+    if (clean) out[k] = clean;
+  }
+  return out;
+}
+
 async function _authHeader(): Promise<Record<string, string>> {
   if (!_tokenResolver) return {};
   try {
     const token = await _tokenResolver();
-    return token ? { Authorization: `Bearer ${token}` } : {};
+    if (!token) return {};
+    const clean = _sanitizeHeaderValue(token);
+    return clean ? { Authorization: `Bearer ${clean}` } : {};
   } catch (exc) {
     console.warn("[api] token resolver threw", exc);
     return {};
@@ -85,14 +112,41 @@ async function _detail(res: Response): Promise<string> {
 
 async function _request(path: string, init?: RequestInit): Promise<Response> {
   const auth = await _authHeader();
+  // Coerce caller-supplied headers (which may be a Headers / array / object
+  // literal) into a plain record before we sanitize. The fetch spec accepts
+  // all three forms but our sanitizer only handles a record.
+  const callerHeaders: Record<string, string> = {};
+  if (init?.headers) {
+    if (init.headers instanceof Headers) {
+      init.headers.forEach((v, k) => { callerHeaders[k] = v; });
+    } else if (Array.isArray(init.headers)) {
+      for (const [k, v] of init.headers) callerHeaders[k] = v;
+    } else {
+      Object.assign(callerHeaders, init.headers as Record<string, string>);
+    }
+  }
+
   const merged: RequestInit = {
     ...init,
-    headers: {
-      ...auth,
-      ...(init?.headers || {}),
-    },
+    headers: _sanitizeHeaders({ ...auth, ...callerHeaders }),
   };
-  const res = await fetch(_absolutize(path), merged);
+
+  const url = _absolutize(path);
+  let res: Response;
+  try {
+    res = await fetch(url, merged);
+  } catch (exc) {
+    // Surface enough context to actually diagnose the failure. The two
+    // common reasons fetch() throws (vs. resolves with !ok):
+    //   1. Network unreachable — sidecar not yet bound, wifi down, etc.
+    //   2. Invalid request — malformed header or URL, which historically
+    //      produced "The string did not match the expected pattern"
+    //      from WebKit and gave the user a useless toast. Sanitisation
+    //      above covers (2) for the headers we control; if it still
+    //      fires, the URL itself is the culprit and we want to see it.
+    const cause = exc instanceof Error ? exc.message : String(exc);
+    throw new ApiError(0, `cannot reach ${url} — ${cause}`);
+  }
   if (!res.ok) throw new ApiError(res.status, await _detail(res));
   return res;
 }

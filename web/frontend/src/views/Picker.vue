@@ -1,6 +1,5 @@
 <!--
-  Picker — landing view (web mode flat list of sessions, desktop mode
-  workspace-then-session drilldown).
+  Picker — landing view (flat list of recent chats).
 
   Layout:
     BrandHeader      (logo + nav)
@@ -8,32 +7,24 @@
     recent strip     (search + 5 most recent + "view all" toggle)
     "built on pi"    (small footer credit, deliberately understated)
     site footer      (copyright)
-
-  Branches on `useConfigStore().mode` so the same SPA bundle ships to
-  both Tauri (desktop) and Cloud Run (web).
 -->
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
-import { storeToRefs } from "pinia";
 import { useRouter } from "vue-router";
 import { Icon } from "@iconify/vue";
 
 import BrandHeader from "../components/BrandHeader.vue";
-import { pickFolder } from "../lib/native-bridge";
 import { useChatSessionStore } from "../stores/chat-session";
 import { useConfigStore } from "../stores/config";
 import { useUiStore } from "../stores/ui";
 import { useWorkspaceStore } from "../stores/workspace";
-import type { SessionRecord, WorkspaceRecord } from "../api/types";
+import type { SessionRecord } from "../api/types";
 
 const router = useRouter();
 const cfg = useConfigStore();
 const ws = useWorkspaceStore();
 const sess = useChatSessionStore();
 const ui = useUiStore();
-
-const { mode } = storeToRefs(cfg);
-const { workspaces } = storeToRefs(ws);
 
 const busy = ref(false);
 const webSessions = ref<Array<SessionRecord & { workspace_id: string }>>([]);
@@ -49,26 +40,24 @@ const COMPACT_LIMIT = 5;
 
 async function refresh(): Promise<void> {
   await ws.refresh();
-  if (cfg.mode === "web") {
-    const all: Array<SessionRecord & { workspace_id: string }> = [];
-    for (const w of ws.workspaces) {
-      await sess.refresh(w.id);
-      for (const s of sess.sessions) all.push({ ...s, workspace_id: w.id });
-    }
-    webSessions.value = all.sort((a, b) =>
-      (b.last_used || "").localeCompare(a.last_used || ""),
-    );
+  const all: Array<SessionRecord & { workspace_id: string }> = [];
+  for (const w of ws.workspaces) {
+    await sess.refresh(w.id);
+    for (const s of sess.sessions) all.push({ ...s, workspace_id: w.id });
   }
+  webSessions.value = all.sort((a, b) =>
+    (b.last_used || "").localeCompare(a.last_used || ""),
+  );
 }
 
 onMounted(refresh);
 
 // ── derived lists ──────────────────────────────────────────────────
 //
-// `filtered*` apply the search filter (case-insensitive substring on
-// title; falls back to "Untitled chat" when blank). `visible*` then
-// trim to COMPACT_LIMIT unless the user has expanded "view all" or is
-// actively searching (where collapsing hides matches).
+// `filteredSessions` applies the search filter (case-insensitive substring
+// on title; falls back to "Untitled chat" when blank). `visibleSessions`
+// then trims to COMPACT_LIMIT unless the user has expanded "view all" or
+// is actively searching (where collapsing hides matches).
 
 function _matches(haystack: string | undefined, q: string): boolean {
   if (!q) return true;
@@ -86,28 +75,9 @@ const visibleSessions = computed(() => {
   return filteredSessions.value.slice(0, COMPACT_LIMIT);
 });
 
-const filteredWorkspaces = computed(() => {
-  const q = search.value.trim().toLowerCase();
-  if (!q) return workspaces.value;
-  return workspaces.value.filter(
-    (w) =>
-      _matches(w.name, q) ||
-      (w.path || "").toLowerCase().includes(q),
-  );
-});
-
-const visibleWorkspaces = computed(() => {
-  if (showAll.value || search.value.trim()) return filteredWorkspaces.value;
-  return filteredWorkspaces.value.slice(0, COMPACT_LIMIT);
-});
-
-const totalCount = computed(() =>
-  mode.value === "web" ? webSessions.value.length : workspaces.value.length,
-);
+const totalCount = computed(() => webSessions.value.length);
 const hiddenCount = computed(() =>
-  mode.value === "web"
-    ? Math.max(0, filteredSessions.value.length - visibleSessions.value.length)
-    : Math.max(0, filteredWorkspaces.value.length - visibleWorkspaces.value.length),
+  Math.max(0, filteredSessions.value.length - visibleSessions.value.length),
 );
 
 // ── actions ────────────────────────────────────────────────────────
@@ -145,93 +115,6 @@ async function deleteWebSession(s: { id: string; workspace_id: string }): Promis
   }
 }
 
-/**
- * Land the user inside a workspace's chat view with the right session
- * preselected. Shared by the "pick a folder" CTA and the "click a recent
- * folder card" path so they never diverge: both trust the registry's
- * dedup (same canonical path → same wsid → same chat history) and only
- * mint a fresh chat when the folder genuinely has no sessions yet.
- */
-async function _enterDesktopWorkspace(w: WorkspaceRecord): Promise<void> {
-  await sess.refresh(w.id);
-  const recent = sess.sessions[0];
-  const target = recent ?? (await sess.create(w.id));
-  router.push({ name: "chat", params: { sid: target.id }, query: { wsid: w.id } });
-}
-
-async function pickDesktopWorkspace(): Promise<void> {
-  // Tauri shell → native OS folder dialog. Web build → window.prompt
-  // fallback. The same call site works in both deployments because
-  // `pickFolder()` runtime-detects.
-  const path = await pickFolder();
-  if (!path) return;
-  busy.value = true;
-  try {
-    // Backend `register_desktop_workspace` is now idempotent on
-    // (owner, canonical_path), so picking a folder we've already
-    // registered returns the existing wsid (with chats intact). We
-    // only auto-create a fresh chat when this is genuinely a new
-    // workspace — `_enterDesktopWorkspace` does that distinction.
-    const w = await ws.create({ path });
-    await _enterDesktopWorkspace(w);
-  } catch (exc) {
-    // 404 from the backend means the user picked a folder that no
-    // longer exists on disk (deleted or unmounted between dialog and
-    // submit). Promote that to a friendlier message; everything else
-    // falls through to the generic toast.
-    const status = (exc as { status?: number } | null)?.status;
-    if (status === 404) {
-      ui.toastError(
-        "Folder not found — was it moved or deleted? Pick another.",
-        exc,
-      );
-    } else {
-      ui.toastError("Could not open folder", exc);
-    }
-  } finally {
-    busy.value = false;
-  }
-}
-
-async function openDesktopWorkspace(w: WorkspaceRecord): Promise<void> {
-  // Re-opening a folder card on the home page: jump to its most-recent
-  // chat if one exists, otherwise auto-create a new one.
-  busy.value = true;
-  try {
-    await _enterDesktopWorkspace(w);
-  } catch (exc) {
-    ui.toastError("Could not open folder", exc);
-  } finally {
-    busy.value = false;
-  }
-}
-
-async function renameWorkspace(w: WorkspaceRecord): Promise<void> {
-  const next = window.prompt("Rename workspace:", w.name);
-  if (!next) return;
-  try {
-    await ws.rename(w.id, next);
-  } catch (exc) {
-    ui.toastError("Could not rename", exc);
-  }
-}
-
-async function deleteDesktopWorkspace(w: WorkspaceRecord): Promise<void> {
-  const ok = await ui.confirm({
-    title: `Remove "${w.name}" from the picker?`,
-    description: "The folder on disk is left untouched.",
-    confirmLabel: "Remove",
-    cancelLabel: "Cancel",
-    variant: "destructive",
-  });
-  if (!ok) return;
-  try {
-    await ws.remove(w.id);
-  } catch (exc) {
-    ui.toastError("Could not remove", exc);
-  }
-}
-
 async function renameSessionPrompt(s: SessionRecord): Promise<void> {
   const next = window.prompt("Rename chat:", s.title || "Untitled chat");
   if (!next) return;
@@ -265,28 +148,22 @@ const isReady = computed(() => cfg.ready);
     <main class="mx-auto flex w-full max-w-5xl flex-1 flex-col px-6 py-10 md:py-16">
       <!-- HERO -->
       <div class="text-center">
-        <h1 class="text-3xl font-semibold tracking-tight md:text-4xl">
+        <h1 class="text-h1 font-semibold tracking-tight md:text-h1">
           What do you want to build today?
         </h1>
-        <p class="mx-auto mt-3 max-w-xl text-sm leading-relaxed text-muted-foreground">
-          <template v-if="mode === 'web'">
-            Each chat runs in its own sandboxed workspace. Digi Setu writes
-            Typst documents, code, and PDFs for you — start a new one or
-            jump back into a recent thread.
-          </template>
-          <template v-else>
-            Pick a folder on this machine. Each folder hosts as many chats
-            as you like — files, terminals, and snapshots stay local.
-          </template>
+        <p class="mx-auto mt-3 max-w-xl text-lead leading-relaxed text-muted-foreground">
+          Each chat runs in its own sandboxed workspace. Digi Setu writes
+          Typst documents, code, and PDFs for you — start a new one or
+          jump back into a recent thread.
         </p>
       </div>
 
       <!-- PRIMARY CTA -->
       <div class="mx-auto mt-8 w-full max-w-md">
         <button
-          v-if="isReady && mode === 'web'"
+          v-if="isReady"
           type="button"
-          class="flex w-full items-center justify-center gap-2 rounded-lg bg-primary px-5 py-3 text-sm font-semibold text-primary-foreground shadow-md transition-opacity hover:opacity-90 disabled:opacity-60"
+          class="flex w-full items-center justify-center gap-2 rounded-lg bg-primary px-5 py-3 text-lead font-semibold text-primary-foreground shadow-md transition-opacity hover:opacity-90 disabled:opacity-60"
           :disabled="busy"
           @click="startNewWebSession"
         >
@@ -294,20 +171,9 @@ const isReady = computed(() => cfg.ready);
           {{ busy ? "Creating sandbox…" : "New chat" }}
         </button>
 
-        <button
-          v-else-if="isReady && mode === 'desktop'"
-          type="button"
-          class="flex w-full items-center justify-center gap-2 rounded-lg bg-primary px-5 py-3 text-sm font-semibold text-primary-foreground shadow-md transition-opacity hover:opacity-90 disabled:opacity-60"
-          :disabled="busy"
-          @click="pickDesktopWorkspace"
-        >
-          <Icon icon="codicon:folder-opened" class="h-4 w-4" />
-          {{ busy ? "Opening…" : "Open folder…" }}
-        </button>
-
         <div
           v-else
-          class="flex items-center justify-center gap-2 rounded-lg border border-border bg-card px-5 py-3 text-sm text-muted-foreground"
+          class="flex items-center justify-center gap-2 rounded-lg border border-border bg-card px-5 py-3 text-lead text-muted-foreground"
         >
           <Icon icon="codicon:loading" class="h-4 w-4 animate-spin" />
           Loading…
@@ -324,10 +190,10 @@ const isReady = computed(() => cfg.ready);
         class="mt-12"
       >
         <header class="mb-3 flex flex-wrap items-center gap-3">
-          <h2 class="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-            {{ mode === "web" ? "Recent chats" : "Recent folders" }}
+          <h2 class="text-body font-semibold uppercase tracking-wide text-muted-foreground">
+            Recent chats
           </h2>
-          <span class="font-mono text-[11px] text-muted-foreground">
+          <span class="font-mono text-caption text-muted-foreground">
             {{ totalCount }} total
           </span>
 
@@ -344,10 +210,8 @@ const isReady = computed(() => cfg.ready);
             <input
               v-model="search"
               type="search"
-              :placeholder="
-                mode === 'web' ? 'Search your chats…' : 'Search folders…'
-              "
-              class="w-full rounded-md border border-border bg-card py-1.5 pl-8 pr-7 text-xs text-foreground outline-none placeholder:text-muted-foreground focus:border-primary/50"
+              placeholder="Search your chats…"
+              class="w-full rounded-md border border-border bg-card py-1.5 pl-8 pr-7 text-body text-foreground outline-none placeholder:text-muted-foreground focus:border-primary/50"
             />
             <button
               v-if="search"
@@ -363,8 +227,8 @@ const isReady = computed(() => cfg.ready);
           <button
             v-if="!showAll && hiddenCount > 0 && !search"
             type="button"
-            class="rounded-md border border-border bg-card px-2.5 py-1 text-[11px] font-medium text-foreground hover:border-primary/40"
-            :title="`Show all ${totalCount} ${mode === 'web' ? 'chats' : 'folders'}`"
+            class="rounded-md border border-border bg-card px-2.5 py-1 text-caption font-medium text-foreground hover:border-primary/40"
+            :title="`Show all ${totalCount} chats`"
             @click="showAll = true"
           >
             View all ({{ hiddenCount }} more)
@@ -372,7 +236,7 @@ const isReady = computed(() => cfg.ready);
           <button
             v-else-if="showAll && totalCount > COMPACT_LIMIT && !search"
             type="button"
-            class="rounded-md border border-border bg-card px-2.5 py-1 text-[11px] font-medium text-muted-foreground hover:text-foreground"
+            class="rounded-md border border-border bg-card px-2.5 py-1 text-caption font-medium text-muted-foreground hover:text-foreground"
             title="Show only the most recent 5"
             @click="showAll = false"
           >
@@ -380,11 +244,7 @@ const isReady = computed(() => cfg.ready);
           </button>
         </header>
 
-        <!-- WEB MODE GRID -->
-        <div
-          v-if="mode === 'web'"
-          class="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3"
-        >
+        <div class="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
           <article
             v-for="s in visibleSessions"
             :key="s.id"
@@ -397,10 +257,10 @@ const isReady = computed(() => cfg.ready);
                 class="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground"
               />
               <div class="min-w-0 flex-1">
-                <div class="truncate text-sm font-medium text-foreground">
+                <div class="truncate text-lead font-medium text-foreground">
                   {{ s.title || "Untitled chat" }}
                 </div>
-                <div class="font-mono text-[10px] text-muted-foreground">
+                <div class="font-mono text-caption text-muted-foreground">
                   {{ timeShort(s.last_used) }}
                 </div>
               </div>
@@ -426,58 +286,12 @@ const isReady = computed(() => cfg.ready);
           </article>
         </div>
 
-        <!-- DESKTOP MODE GRID -->
-        <div
-          v-else
-          class="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3"
-        >
-          <article
-            v-for="w in visibleWorkspaces"
-            :key="w.id"
-            class="group flex cursor-pointer flex-col gap-2 rounded-lg border border-border bg-card p-4 transition-colors hover:border-primary/40 hover:bg-accent/30"
-            @click="openDesktopWorkspace(w)"
-          >
-            <header class="flex items-start gap-2">
-              <Icon
-                icon="codicon:folder"
-                class="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground"
-              />
-              <div class="min-w-0 flex-1">
-                <div class="truncate text-sm font-medium text-foreground">
-                  {{ w.name }}
-                </div>
-                <div class="truncate font-mono text-[10px] text-muted-foreground">
-                  {{ w.path }}
-                </div>
-              </div>
-            </header>
-            <footer class="mt-auto flex items-center justify-end gap-1 pt-1 opacity-0 transition-opacity group-hover:opacity-100">
-              <button
-                type="button"
-                class="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
-                title="Rename"
-                @click.stop="renameWorkspace(w)"
-              >
-                <Icon icon="codicon:edit" class="h-3.5 w-3.5" />
-              </button>
-              <button
-                type="button"
-                class="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
-                title="Remove from list"
-                @click.stop="deleteDesktopWorkspace(w)"
-              >
-                <Icon icon="codicon:trash" class="h-3.5 w-3.5" />
-              </button>
-            </footer>
-          </article>
-        </div>
-
         <!-- Empty-search hint. Doesn't show on initial state — only
              when the user has typed something that filters everything
              out. -->
         <p
-          v-if="search && (mode === 'web' ? filteredSessions.length === 0 : filteredWorkspaces.length === 0)"
-          class="mt-4 text-center text-xs text-muted-foreground"
+          v-if="search && filteredSessions.length === 0"
+          class="mt-4 text-center text-body text-muted-foreground"
         >
           No matches for "{{ search }}".
         </p>
@@ -486,9 +300,9 @@ const isReady = computed(() => cfg.ready);
       <!-- Empty state for first-time users. -->
       <p
         v-else-if="isReady"
-        class="mt-12 text-center text-xs text-muted-foreground"
+        class="mt-12 text-center text-body text-muted-foreground"
       >
-        No {{ mode === "web" ? "chats" : "folders" }} yet — start your first one above.
+        No chats yet — start your first one above.
       </p>
 
       <!--
@@ -497,7 +311,7 @@ const isReady = computed(() => cfg.ready);
         keep this sub-credit understated so it reads like a tech badge,
         not a competing brand.
       -->
-      <p class="mx-auto mt-16 max-w-md text-center text-[11px] leading-relaxed text-muted-foreground">
+      <p class="mx-auto mt-16 max-w-md text-center text-caption leading-relaxed text-muted-foreground">
         <Icon icon="codicon:circuit-board" class="mr-1 inline h-3 w-3 align-text-bottom" />
         Built on top of
         <a
@@ -512,7 +326,7 @@ const isReady = computed(() => cfg.ready);
     </main>
 
     <footer
-      class="border-t border-border bg-card/40 px-6 py-4 text-center text-[11px] text-muted-foreground"
+      class="border-t border-border bg-card/40 px-6 py-4 text-center text-caption text-muted-foreground"
     >
       © {{ new Date().getFullYear() }} Digi Setu — built for writers,
       coders &amp; everyone in between.

@@ -1,44 +1,45 @@
 """
-Defence-in-depth policy layer.
+Defence-in-depth safety policy for the desktop sidecar.
 
 Three concerns live here:
 
-  1. **bash command policy** — block obviously-dangerous shell
-     invocations the AI might be coaxed into running. With the
-     per-session container architecture (Phase 6) the kernel
-     namespace + egress proxy do most of the heavy lifting, so this
-     layer focuses on:
-         - host-level metadata SSRF attempts (defense in depth — the
-           container subnet can't route to 169.254.169.254 anyway,
-           but we want to log the *attempt* and refuse the bash call
-           before it hits the network)
-         - cryptominers (waste of the user's billed compute)
-         - container-escape probes (`docker socket`, `nsenter`,
-           `mount /proc/host`, etc.)
-     Most "global install" / "curl|sh" / "apt install" rules from
-     the dual-uid era have been REMOVED — those are now legitimate
-     and useful inside the user's per-session container, where the
-     installs evaporate on chat close anyway.
+  1. **bash command policy** — block obviously-hostile shell
+     invocations the model might be coaxed into running. The desktop
+     app runs on the user's actual machine (no container, no kernel
+     namespace, no egress firewall), so the layers below kick in
+     before pi-coding-agent's upstream `permission-gate` extension
+     even sees the command:
+         - cloud-metadata SSRF probes (IMDS exfiltration; reachable
+           if the user happens to run Digi Setu on a cloud VM)
+         - cryptominer / DDoS / brute-force binary names (would burn
+           the user's electricity / get them firewalled by their ISP
+           on someone else's behalf)
 
-  2. **filesystem deny-list** — paths the backend (uid 1100) must
-     never serve to the SPA's file-tree / read endpoints. The AI's
-     bash now lives in a separate per-session container with its own
-     mount namespace; bind mounts only expose `/workspace`. So this
-     list is mostly relevant for the file-tree route which still
-     reads from the host filesystem.
+  2. **filesystem deny-list** — paths the backend must never serve to
+     the SPA's file-tree / read endpoints, even if the user picked a
+     parent directory that happens to contain them. The model's
+     `read` tool goes through pi's own protected-paths extension; the
+     SPA-facing routes (file tree, file_ops) consult this list
+     directly.
 
   3. **secret scrubber** — last-line scrub of any high-entropy
-     token-shaped string in streamed model output. If the agent ever
-     actually does manage to read a secret, we don't want it to leak
-     back into the rendered chat (or, worse, into the saved JSONL
-     log that ships to the next session as context).
+     token-shaped string in streamed model output and tool results.
+     Desktop's SQLite / shadow-git logs persist on the user's disk;
+     even a one-shot leak of a key into a saved JSONL is durable.
 
-This module is **advisory** for tools we don't fully wrap (i.e.
-pi's own bash) — it's authoritative for the routes/file_ops paths
-the SPA hits directly. The OS-level enforcement layers (kernel
-namespaces, nftables egress firewall, MITM auth proxy) are
-documented in deploy/HARDENING.md and are what actually keep a
-determined attacker out.
+Where the trust boundary actually lives:
+    - The pi process runs unprivileged under the user's own UID; OS
+      file permissions are the primary enforcement.
+    - Pi's upstream `protected-paths` extension blocks model writes
+      to `.env`, `.git/`, `node_modules/`.
+    - Pi's upstream `permission-gate` extension prompts the user
+      before `rm -rf`, `sudo`, `chmod 777`.
+    - The desktop APPEND_SYSTEM.md tells the model to stay inside
+      the active workspace and to not touch SSH/AWS/GCP credential
+      files unless the user named them in the current turn.
+This module is the host-side belt to those suspenders: a final
+content-based filter the routes layer applies before tool calls and
+streamed events leave the sidecar.
 """
 
 from __future__ import annotations
@@ -51,7 +52,7 @@ from typing import Optional
 # ── bash command policy ───────────────────────────────────────────
 # Patterns are evaluated against the FULL command line, not per-arg.
 # Each rule has (regex, why) so the rejection message is actionable
-# (the user sees *why* the agent's command was blocked, not just
+# (the user sees *why* the model's command was blocked, not just
 # "denied").
 @dataclass(frozen=True)
 class _BashRule:
@@ -61,6 +62,13 @@ class _BashRule:
 
 _BASH_RULES: tuple[_BashRule, ...] = (
     # ── Cloud metadata / SSRF — IMDS credential theft ────────────
+    # Most desktop installs are on laptops where these IPs route
+    # nowhere, but some users will run Digi Setu on a cloud VM
+    # (Codespaces, GitHub Actions self-hosted, GCE workstation).
+    # Reaching these endpoints is always a hostile signal — the
+    # tokens they expose belong to the host's IAM identity, not the
+    # user's project. Block at the bash layer so the model can't
+    # tunnel via curl/wget/python.
     _BashRule(
         re.compile(r"\b169\.254\.169\.254\b"),
         "blocked: cloud-metadata IP (would expose VM IAM tokens)",
@@ -73,53 +81,33 @@ _BASH_RULES: tuple[_BashRule, ...] = (
         re.compile(r"\b(?:fd00:ec2::254|metadata\.aws|169\.254\.170\.2)\b", re.I),
         "blocked: AWS/ECS metadata endpoint",
     ),
-    # ── Container escape probes ─────────────────────────────────
-    # The per-session container has cap_drop ALL + a small cap_add
-    # set that does NOT include CAP_SYS_ADMIN, CAP_NET_ADMIN, or
-    # CAP_SYS_PTRACE. These tools won't actually do anything inside
-    # the container, but the AI trying to invoke them at all is a
-    # signal of hostile intent — refuse and log.
-    _BashRule(
-        re.compile(r"\b(?:nsenter|unshare\s+--mount|mount\s+--bind\s+/proc/\d+)"),
-        "blocked: container-escape probe (cap_drop ALL + read-only host paths neutralise these anyway)",
-    ),
-    _BashRule(
-        re.compile(r"/var/run/docker\.sock|/host/proc|/host/sys|/host/etc"),
-        "blocked: docker-socket or host-namespace path (container has none of these mounted)",
-    ),
-    # ── Network exfiltration via raw IPs ────────────────────────
-    # Egress proxy already rejects raw-IP CONNECTs (allow-list is by
-    # hostname), but blocking at the bash layer gives a clearer
-    # error message than "connection refused".
-    _BashRule(
-        re.compile(r"\bcurl\b[^\n;]*\bhttp[s]?://[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}"),
-        "blocked: curl to a raw IP — egress allow-list rejects this; "
-        "if the user provided a URL, ask for the hostname instead",
-    ),
-    # ── Cryptominer hints ───────────────────────────────────────
-    # The user IS billed for compute inside the container. Mining
-    # crypto via their session would burn their plan's credits on
-    # something they didn't ask for. This rule predates per-session
-    # containers and remains relevant.
+    # ── Cryptominer / DDoS hints ────────────────────────────────
+    # Burning the user's electricity (and their laptop's CPU
+    # lifespan) on someone else's mining pool is theft from them.
+    # Same rationale for DDoS / brute-force tools — those hurt the
+    # user's IP reputation when their ISP gets the abuse complaint.
     _BashRule(
         re.compile(r"\b(?:xmrig|t-rex|nbminer|ethminer|cgminer|phoenixminer|teamredminer)\b", re.I),
-        "blocked: cryptocurrency miner (would burn the user's billed compute budget)",
+        "blocked: cryptocurrency miner (would burn the user's CPU/electricity for someone else)",
     ),
-    # NOTE: With per-session container architecture the following
-    # bash patterns are now ALLOWED (they were blocked in the dual-
-    # uid era). The container is ephemeral and namespace-isolated;
-    # what the AI does inside is the user's choice.
-    #     - sudo / su / doas — sudo NOPASSWD is configured on purpose
-    #     - apt/yum/dnf/brew/snap install — pkg installs are fine
-    #     - npm install -g, yarn global add, pip --user — fine
-    #     - curl … | sh, bash <(curl …) — fine, container is throwaway
-    #     - editing ~/.bashrc, /etc/, crontab, systemctl — fine, all
-    #       container-local and gone on chat close
-    #     - cat /etc/shadow — fine, the container's shadow file is
-    #       generated at image build time and contains no real users
-    # The trust boundary moved from "regex on bash strings" to
-    # "kernel namespaces + egress allow-list" — we no longer need
-    # to play whack-a-mole on bash patterns for these.
+    _BashRule(
+        re.compile(r"\b(?:hping3|slowloris|loic|hulk|goldeneye)\b", re.I),
+        "blocked: DDoS/flooding tool (would attack a third party from the user's IP)",
+    ),
+    # NOTE: We deliberately do NOT block:
+    #     - sudo / su / doas — the user is on their own machine; the
+    #       upstream permission-gate extension prompts before these
+    #       run, which is the right surface for the consent decision.
+    #     - apt/brew/npm/pip/cargo install — legitimate developer
+    #       workflow on a user's own laptop. The model writes to the
+    #       active workspace by default; system-wide installs need
+    #       sudo, which the permission-gate already gates.
+    #     - curl … | sh — fine on the user's own machine if they
+    #       asked for it. The permission-gate prompts on the sudo
+    #       half if the install needs root.
+    #     - editing ~/.bashrc, /etc/, crontab, systemctl — again,
+    #       prompted by permission-gate when sudo is involved;
+    #       editing dotfiles is the user's own house.
 )
 
 
@@ -155,21 +143,53 @@ def check_bash(cmd: str) -> BashCheck:
 
 # ── filesystem deny-list ─────────────────────────────────────────
 # Substrings (case-insensitive) that, if present anywhere in a
-# requested path, cause file_ops to 403. The OS-level enforcement
-# layer (deploy/README) is what actually keeps these inaccessible;
-# this is a last-line check so the SPA never even *asks* for them.
+# requested path, cause file_ops / file-tree to 403. The model's
+# read tool goes through pi's protected-paths extension, but the
+# SPA-facing routes can be hit directly (e.g. user dragged a path
+# into the file tree picker), so we check them too.
+#
+# Rule of thumb for what goes here: paths that contain credentials
+# the user did NOT explicitly volunteer in the current turn. If
+# they paste a literal `~/.ssh/id_rsa` into the chat, that's their
+# call; we don't second-guess explicit text. We do refuse to
+# enumerate/serve those paths automatically via file ops.
 _FS_DENY_SUBSTRINGS: tuple[str, ...] = (
-    "/srv/pi/state",
-    "/opt/pi",
+    # System credential stores — cross-platform unix layout
     "/etc/shadow",
-    "/etc/passwd",
     "/etc/sudoers",
-    "/.aws/",
-    "/.config/gcloud/",
+    "/etc/passwd-",     # backup of /etc/passwd (often world-readable but writes to it shouldn't go through us)
+    "/private/etc/sudoers",  # macOS canonical path
+    # User credential dotfiles
+    "/.aws/credentials",
+    "/.aws/config",
+    "/.config/gcloud/application_default_credentials.json",
+    "/.config/gcloud/legacy_credentials/",
+    "/.ssh/id_rsa",
+    "/.ssh/id_ed25519",
+    "/.ssh/id_dsa",
+    "/.ssh/id_ecdsa",
+    "/.ssh/identity",
+    "/.gnupg/private-keys-v1.d/",
+    "/.gnupg/secring.gpg",
+    "/.netrc",
+    "/.pypirc",
+    "/.npmrc",
+    "/.cargo/credentials.toml",
+    "/.docker/config.json",
+    "/.kube/config",
+    # Browser secrets (macOS / Linux profile DBs)
+    "/Library/Application Support/Google/Chrome/Default/Cookies",
+    "/Library/Application Support/Google/Chrome/Default/Login Data",
+    "/Library/Application Support/Firefox/Profiles/",
+    "/.config/google-chrome/Default/Cookies",
+    "/.mozilla/firefox/",
+    # Production-style env files outside the active workspace
     ".env.production",
     ".env.local",
-    "id_rsa",
-    "id_ed25519",
+    # Generic per-user secret directories (case-insensitive substring
+    # match catches them anywhere in the path)
+    "/.password-store/",
+    "/.secrets/",
 )
 
 
@@ -185,9 +205,10 @@ def is_path_denied(path: str) -> Optional[str]:
 
 
 # ── secret scrubber ──────────────────────────────────────────────
-# High-confidence prefixes for the secret types we'd actually have on
-# this server. Tuned to skip random base64 chunks (which are common
-# in legitimate output) and only fire on known-shape API tokens.
+# High-confidence prefixes for the secret types we'd actually have
+# in a developer's filesystem / environment / shell history. Tuned
+# to skip random base64 chunks (which are common in legitimate
+# output) and only fire on known-shape API tokens.
 _SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     # Anthropic — has to come BEFORE the generic sk_ pattern because
     # the prefix overlaps. (Anthropic uses `sk-ant-`; Stripe uses
@@ -196,16 +217,15 @@ _SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     # Stripe AND Clerk both use `sk_live_` / `sk_test_` — we can't
     # distinguish without reading the embedded base32 (Stripe
     # encodes the account id; Clerk doesn't). Use a generic label so
-    # we don't lie to the operator about which system the key
-    # belongs to.
+    # we don't lie to the user about which system the key belongs to.
     (re.compile(r"\bsk_(?:live|test)_[A-Za-z0-9_-]{16,}"), "[REDACTED secret-key]"),
     (re.compile(r"\bpk_live_[A-Za-z0-9_-]{16,}"), "[REDACTED clerk-publishable]"),
     (re.compile(r"\brk_live_[A-Za-z0-9_-]{16,}"), "[REDACTED stripe-restricted-key]"),
     (re.compile(r"\bwhsec_[A-Za-z0-9_-]{16,}"), "[REDACTED webhook-secret]"),
-    # GCP service-account private key
+    # PEM-armoured private keys (RSA / EC / generic / OpenSSH)
     (
         re.compile(
-            r"-----BEGIN (?:RSA |EC )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC )?PRIVATE KEY-----"
+            r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"
         ),
         "[REDACTED private-key]",
     ),
@@ -236,12 +256,8 @@ def scrub_secrets(text: str) -> str:
     Replace high-confidence secrets in `text` with a labelled
     placeholder. Idempotent and side-effect free.
 
-    No micro-optimised early-out: the previous version short-
-    circuited if the text had no `[`, `_`, or `.`, which silently
-    skipped scrubbing for hyphen-using tokens (Anthropic, Slack,
-    AWS). The `re.sub` calls themselves are O(len(text)) and the
-    streamed payloads we scrub are kilobytes at worst, so the
-    optimisation wasn't worth the bug.
+    The streamed payloads we scrub are kilobytes at worst, so the
+    O(len(text)) per-pattern cost is acceptable in the hot path.
     """
     if not text:
         return text

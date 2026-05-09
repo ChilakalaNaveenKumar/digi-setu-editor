@@ -222,7 +222,7 @@ watch(
     <div ref="root" class="xterm-canvas flex-1 overflow-hidden p-1"></div>
     <div
       v-if="status !== 'open'"
-      class="absolute right-2 top-2 rounded-sm bg-card/90 px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground shadow"
+      class="absolute right-2 top-2 rounded-sm bg-card/90 px-1.5 py-0.5 font-mono text-caption text-muted-foreground shadow"
     >
       {{ status }}<span v-if="errorMsg"> · {{ errorMsg }}</span>
     </div>

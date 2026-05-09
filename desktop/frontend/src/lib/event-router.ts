@@ -58,6 +58,183 @@ export function createRouterState(): RouterState {
   };
 }
 
+/**
+ * Classify a raw provider error string into a stable category code
+ * the i18n layer can render as a friendly message.
+ *
+ * The function returns ONLY a category code. The raw upstream string
+ * is NEVER part of the user-facing surface — it goes to console.warn
+ * for our debugging only (see `applyEvent` callers that lookup
+ * `errors.<code>` via i18n).
+ *
+ * Why pattern-match instead of relying on structured codes? Because
+ * `pi`'s SDK passes the upstream provider's error verbatim into
+ * `message.errorMessage` — we never see a typed code. Anthropic
+ * returns `{type: "rate_limit_error", message: "..."}`, Vertex returns
+ * gRPC-style `code: 429, message: "Resource has been exhausted..."`,
+ * OpenAI returns `{code: "rate_limit_exceeded", message: "..."}`, and
+ * pi flattens all three into a single English string. So we sniff
+ * known substrings sourced from each vendor's official error doc:
+ *
+ *   - https://docs.anthropic.com/en/api/errors
+ *   - https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/api-errors
+ *   - https://ai.google.dev/gemini-api/docs/safety-settings  (finishReason)
+ *   - https://platform.openai.com/docs/guides/error-codes
+ *
+ * Categories in priority order (first match wins):
+ *
+ *   provider_usage_policy     Anthropic AUP / "violates our Usage Policy"
+ *   provider_safety_block     Gemini SAFETY / PROHIBITED_CONTENT / BLOCKLIST
+ *   provider_context_too_large 413 / request_too_large / context window
+ *   provider_billing          Anthropic 402 billing_error / payment failed
+ *   provider_quota_exhausted  RESOURCE_EXHAUSTED + monthly quota / billing tier hit
+ *   provider_rate_limit       429 / rate_limit_error
+ *   provider_overloaded       529 overloaded_error / 5xx UNAVAILABLE / api_error
+ *   provider_model_unavailable 404 not_found_error / model gated / publisher_model_not_found
+ *   provider_auth             401 authentication_error / 403 permission_error / ADC missing
+ *   provider_invalid_request  400 invalid_request_error / INVALID_ARGUMENT
+ *   provider_timeout          504 timeout_error / DEADLINE_EXCEEDED
+ *   provider_network          DNS / ECONNRESET / fetch failed
+ *   provider_error            unknown — store renders generic "Something went wrong"
+ */
+export function categorizeProviderError(raw: string | undefined | null): {
+  code: string;
+} {
+  const text = String(raw ?? "").trim();
+  if (!text) return { code: "provider_error" };
+  const lc = text.toLowerCase();
+
+  // ── Anthropic Usage Policy (most user-visible block) ──────────
+  // Pattern from real-world reports + official AUP block message.
+  // See e.g. anthropics/claude-code#3035, #6060, #46575.
+  if (
+    /violates? (our )?usage policy|aup\.|anthropic\.com\/legal\/aup|unable to respond to this request/i.test(
+      text,
+    )
+  ) {
+    return { code: "provider_usage_policy" };
+  }
+
+  // ── Gemini safety / Vertex content filter ─────────────────────
+  // finishReason values (from Gemini docs): SAFETY, PROHIBITED_CONTENT,
+  // BLOCKLIST, RECITATION. Vertex sometimes flattens to "blocked by
+  // safety settings".
+  if (
+    /\b(safety|prohibited_content|blocklist|recitation|blocked by safety|content filter|content[_\s-]?policy|harm[_\s-]?category)\b/i.test(
+      text,
+    )
+  ) {
+    return { code: "provider_safety_block" };
+  }
+
+  // ── Context / payload too large ───────────────────────────────
+  // Anthropic: 413 request_too_large (32 MB cap).
+  // Anthropic / OpenAI: "maximum context length is N tokens".
+  if (
+    /(request_too_large|payload too large|\b413\b|context[_\s-]?length|context[_\s-]?window|maximum (context|tokens?)|input is too long|prompt is too long)/i.test(
+      lc,
+    )
+  ) {
+    return { code: "provider_context_too_large" };
+  }
+
+  // ── Billing (Anthropic 402) ───────────────────────────────────
+  if (/\b402\b|billing_error|payment[_\s-]?(failed|required)|insufficient_quota/i.test(lc)) {
+    // OpenAI uses insufficient_quota for paid-account-out-of-credit
+    // which is structurally a billing problem, not a rate limit.
+    return { code: "provider_billing" };
+  }
+
+  // ── Per-second rate limit (vs monthly quota) ──────────────────
+  // Anthropic: 429 rate_limit_error
+  // Vertex:    429 RESOURCE_EXHAUSTED with retry-after under a minute
+  // OpenAI:    rate_limit_exceeded
+  //
+  // Checked BEFORE quota_exhausted because Vertex's RESOURCE_EXHAUSTED
+  // message ("Resource has been exhausted (e.g. check quota)") is
+  // genuinely ambiguous between rate-limit and monthly-quota — only
+  // the retry-after header tells them apart, and pi flattens that
+  // out. Defaulting to rate-limit matches the more common case AND
+  // gives advice ("wait a few seconds") that's safe for both: a true
+  // monthly-quota hit will simply fail again and the user can switch
+  // models.
+  if (
+    /\b429\b|rate[_\s-]?limit|too many requests|requests per (minute|second)|resource[_\s-]?exhausted/i.test(
+      lc,
+    )
+  ) {
+    return { code: "provider_rate_limit" };
+  }
+
+  // ── Quota / monthly tier exhausted (separate from per-second rate) ─
+  // We only land here for messages that EXPLICITLY name a monthly /
+  // credit / billing dimension — bare "resource has been exhausted"
+  // already routed to rate_limit above.
+  if (
+    /(monthly quota|quota.*exceed|out of credits?|credit (limit|exhaust))/i.test(lc)
+  ) {
+    return { code: "provider_quota_exhausted" };
+  }
+
+  // ── Overloaded / 5xx outage ───────────────────────────────────
+  // Anthropic: 529 overloaded_error, 500 api_error
+  // Vertex:    503 UNAVAILABLE, 500 INTERNAL
+  if (
+    /\b5(00|02|03|29)\b|overloaded|api_error|service unavailable|temporarily unavailable|\bunavailable\b|server is (busy|overloaded)|try again later/i.test(
+      lc,
+    )
+  ) {
+    return { code: "provider_overloaded" };
+  }
+
+  // ── Model gated / unavailable ─────────────────────────────────
+  // Anthropic: not_found_error
+  // Vertex:    "Publisher Model ... not found", "model is not supported in region"
+  if (
+    /not_found_error|model.*not[_\s-]?(found|enabled|supported)|publisher.?model.*not found|model.*does not exist|access denied to model|location is not supported|region.*not[_\s-]?support/i.test(
+      lc,
+    )
+  ) {
+    return { code: "provider_model_unavailable" };
+  }
+
+  // ── Auth / permission ─────────────────────────────────────────
+  // Anthropic: 401 authentication_error, 403 permission_error
+  // Vertex:    UNAUTHENTICATED, PERMISSION_DENIED, ADC errors
+  if (
+    /\b401\b|\b403\b|authentication_error|permission_error|permission_denied|unauthenticated|invalid[_\s-]?api[_\s-]?key|invalid_authentication|expired[_\s-]?credentials|application[_\s-]?default[_\s-]?credentials|\badc\b/i.test(
+      lc,
+    )
+  ) {
+    return { code: "provider_auth" };
+  }
+
+  // ── Bad request ───────────────────────────────────────────────
+  if (
+    /\b400\b|\b422\b|invalid_request_error|invalid_argument|failed_precondition|bad request|malformed|unprocessable_entity/i.test(
+      lc,
+    )
+  ) {
+    return { code: "provider_invalid_request" };
+  }
+
+  // ── Timeout ───────────────────────────────────────────────────
+  if (/\b504\b|timeout_error|deadline_exceeded|timed out|request timeout/i.test(lc)) {
+    return { code: "provider_timeout" };
+  }
+
+  // ── Network ───────────────────────────────────────────────────
+  if (
+    /econnreset|enotfound|etimedout|enetunreach|fetch failed|network[_\s-]?error|socket hang up|getaddrinfo|dns lookup failed|tls handshake|ssl[_\s-]?alert|connection (reset|refused|closed|aborted)/i.test(
+      lc,
+    )
+  ) {
+    return { code: "provider_network" };
+  }
+
+  return { code: "provider_error" };
+}
+
 /** Push the user's prompt as a bubble immediately so the UI feels snappy. */
 export function pushUserMessage(state: RouterState, text: string, id: string): void {
   const msg: UserMessage = reactive({ kind: "user", id, text });
@@ -413,8 +590,27 @@ export function applyEvent(state: RouterState, evt: RpcEvent): void {
       // failure inline; the store's onMessage handler reads it back to
       // also drive the bottom banner.
       if (message.stopReason === "error" && message.errorMessage) {
-        const msg = String(message.errorMessage);
-        asst.error = msg;
+        const raw = String(message.errorMessage);
+        // Categorise upstream provider errors (Anthropic 429, Vertex
+        // safety block, OpenAI insufficient_quota, …) and stamp ONLY
+        // the stable code. The store's _localiseError helper turns
+        // the code into a friendly user-visible message; the raw
+        // upstream text is logged to the console for our debugging
+        // and NEVER reaches the chat UI.
+        const { code } = categorizeProviderError(raw);
+        try {
+          // eslint-disable-next-line no-console
+          console.warn(
+            `[chat] provider error category=${code} raw=${JSON.stringify(raw)}`,
+          );
+        } catch {
+          /* console may be unavailable in some contexts */
+        }
+        asst.errorCode = code;
+        // Leave `asst.error` empty — the store fills it in with the
+        // localised message once it processes this tick. AssistantMessage.vue
+        // only renders when `asst.error` is non-empty so there's no
+        // visible flash of empty state.
         asst.done = true;
         closeActiveThinking(state, asst);
         closeActiveText(state, asst);
@@ -436,7 +632,24 @@ export function applyEvent(state: RouterState, evt: RpcEvent): void {
 
     case "_bridge_error": {
       const asst = ensureCurrentAssistant(state);
-      asst.error = String((evt as any).message ?? "Bridge error");
+      // _bridge_error always carries a stable `code` from the backend
+      // (services/error_codes.py + services/relay_bridge.py). Stamp
+      // ONLY the code; the store's _localiseError helper renders the
+      // friendly i18n message. We deliberately drop `evt.message` so
+      // a backend that accidentally leaks a stack trace or an HTTP
+      // status code still results in a friendly, localised UI.
+      const rawCode = (evt as any).code;
+      const rawMsg = (evt as any).message;
+      try {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[chat] bridge error code=${String(rawCode ?? "internal")} ` +
+            `raw=${JSON.stringify(rawMsg ?? "")}`,
+        );
+      } catch {
+        /* console may be unavailable */
+      }
+      asst.errorCode = typeof rawCode === "string" && rawCode ? rawCode : "internal";
       asst.done = true;
       return;
     }

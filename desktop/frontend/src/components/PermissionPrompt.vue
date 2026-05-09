@@ -1,33 +1,44 @@
 <!--
-  PermissionPrompt — compact, inline tool-call approval card.
+  PermissionPrompt — inline tool-call approval card.
 
   Lives at the bottom-right of the chat pane (NOT a screen-blocking
-  modal). Default state shows one line: "pi wants to run X" + 2 primary
-  buttons (Allow / Deny). Click the chevron to expand for intent +
-  command/diff preview + the "always" variants. Cursor / Aider / Goose
-  all use this pattern — the dialog never steals the screen.
+  modal). Default state shows one line: "Digi Setu wants to …" + 4
+  primary buttons. Click the chevron to expand for intent +
+  command/diff preview. Cursor / Aider / Goose all use this pattern —
+  the dialog never steals the screen.
 
-  Decisions go back over the WS via chat.sendPermissionResponse, then we
-  dequeue locally so the next pending request takes the slot.
+  Decisions go back over the WS via chat.sendPermissionResponse, then
+  we dequeue locally so the next pending request takes the slot.
 
   Keyboard (only when no editable element is focused):
-    Esc          → deny_once  (safe default if user dismisses)
+    Esc          → deny_once       (safe default if user dismisses)
     Enter        → allow_once
-    Shift+Enter  → allow_session
+    Shift+Enter  → allow_session   (= "always allow for this chat")
     a            → toggle expanded view (aider muscle memory)
+
+  Typography: Inter (sans) for every label, button, and section
+  caption. JetBrains Mono ONLY for the actual command/argument
+  preview <pre> blocks where the user is reading literal shell
+  syntax that must align character-by-character.
 -->
 <script setup lang="ts">
 import { createPatch } from "diff";
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { useI18n } from "vue-i18n";
 import { Icon } from "@iconify/vue";
 
 import { useChatStore } from "../stores/chat";
-import { usePermissionsStore, type PermissionDecision } from "../stores/permissions";
+import {
+  normalizeMode,
+  usePermissionsStore,
+  type PermissionDecision,
+} from "../stores/permissions";
 
 import DiffView from "./tools/DiffView.vue";
 
 const chat = useChatStore();
 const permissions = usePermissionsStore();
+const { t, te } = useI18n();
 
 const current = computed(() => permissions.current);
 
@@ -43,14 +54,7 @@ watch(
   },
 );
 
-const TOOL_LABELS: Record<string, string> = {
-  bash: "run shell",
-  write: "write file",
-  edit: "edit file",
-  process: "start process",
-  process_start: "start process",
-};
-
+// Icons stay as a JS map (no translation needed for icon names).
 const TOOL_ICONS: Record<string, string> = {
   bash: "codicon:terminal",
   write: "codicon:new-file",
@@ -59,24 +63,22 @@ const TOOL_ICONS: Record<string, string> = {
   process_start: "codicon:server-process",
 };
 
-function toolLabel(tool: string): string {
-  return TOOL_LABELS[tool] || tool;
+/** Resolve the natural-language tool action from the locale file.
+ *  Falls back to "use <tool>" for any tool the locale doesn't list. */
+function toolAction(tool: string): string {
+  const key = `permission.prompt.tools.${tool}`;
+  return te(key) ? t(key) : `use ${tool}`;
 }
 
 function toolIcon(tool: string): string {
   return TOOL_ICONS[tool] || "codicon:tools";
 }
 
-// Short, non-wrapping label for the mode chip in the header. Full label
-// is shown via title attribute on hover.
-const MODE_CHIP: Record<string, string> = {
-  auto: "auto",
-  approve_risky: "risky",
-  approve_all: "all",
-};
-
+/** Render the permission-mode chip label for any mode ID — accepts
+ *  canonical IDs (auto / ask / cautious) AND legacy aliases. */
 function modeChip(mode: string): string {
-  return MODE_CHIP[mode] || mode;
+  const canonical = normalizeMode(mode);
+  return t(`permission.mode.${canonical}.label`);
 }
 
 // Single-line summary used in the collapsed header. We try to surface
@@ -197,33 +199,36 @@ onUnmounted(() => document.removeEventListener("keydown", onKey));
               aria-hidden="true"
             />
             <div class="min-w-0 flex-1">
-              <div id="permission-title" class="truncate font-mono text-[12px]">
-                <span class="text-muted-foreground">pi wants to</span>
-                <span class="ml-1 font-semibold">{{ toolLabel(current.tool) }}</span>
+              <div id="permission-title" class="truncate text-body">
+                <span class="text-muted-foreground">{{ $t("permission.prompt.wantsTo") }}</span>
+                <span class="ml-1 font-semibold">{{ toolAction(current.tool) }}</span>
                 <span v-if="snippet()" class="ml-2 text-muted-foreground">·</span>
+                <!-- The snippet IS code (a shell command or a path) so it
+                     gets the mono treatment — but small, so it sits
+                     comfortably inside the otherwise-Inter header. -->
                 <span
                   v-if="snippet()"
-                  class="ml-2 text-foreground/80"
+                  class="ml-2 font-mono text-caption text-foreground/80"
                   :title="snippet()"
                 >{{ snippet() }}</span>
               </div>
             </div>
             <!-- Mode chip lives in the header so the action row stays a
-                 clean 4-button strip. Use the abbreviated label so it
-                 never wraps; full label shown on hover. -->
+                 clean 4-button strip. Title-cased label so it reads as
+                 a noun, not a wire token. -->
             <span
-              class="shrink-0 rounded bg-muted/70 px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wide text-muted-foreground"
-              :title="`permission mode: ${current.mode.replace('_', ' ')}`"
+              class="shrink-0 rounded bg-muted/70 px-1.5 py-0.5 text-caption font-medium tracking-wide text-muted-foreground"
+              :title="$t('permission.modeLabel', { mode: modeChip(current.mode) })"
             >{{ modeChip(current.mode) }}</span>
             <span
               v-if="permissions.pendingCount > 1"
-              class="shrink-0 rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground"
-              :title="`${permissions.pendingCount - 1} more queued`"
+              class="shrink-0 rounded bg-muted px-1.5 py-0.5 text-caption font-medium text-muted-foreground"
+              :title="$t('common.moreQueued', { count: permissions.pendingCount - 1 })"
             >+{{ permissions.pendingCount - 1 }}</span>
             <button
               type="button"
               class="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground"
-              :title="expanded ? 'Hide details (a)' : 'Show details (a)'"
+              :title="expanded ? $t('permission.prompt.hideDetails') : $t('permission.prompt.showDetails')"
               :aria-expanded="expanded"
               @click="expanded = !expanded"
             >
@@ -240,10 +245,10 @@ onUnmounted(() => document.removeEventListener("keydown", onKey));
           <div v-if="expanded" class="border-t border-border">
             <div class="max-h-[55vh] overflow-auto">
               <section v-if="current.intent" class="border-b border-border px-3 py-2">
-                <div class="mb-0.5 font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
-                  intent
+                <div class="mb-0.5 text-caption font-medium uppercase tracking-wide text-muted-foreground">
+                  {{ $t("permission.prompt.intent") }}
                 </div>
-                <div class="whitespace-pre-wrap font-mono text-[11px] leading-snug">
+                <div class="whitespace-pre-wrap text-body leading-snug">
                   {{ current.intent }}
                 </div>
               </section>
@@ -252,19 +257,19 @@ onUnmounted(() => document.removeEventListener("keydown", onKey));
                 v-if="current.tool === 'bash' || current.tool === 'process' || current.tool === 'process_start'"
                 class="px-3 py-2"
               >
-                <div class="mb-0.5 font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
-                  command
+                <div class="mb-0.5 text-caption font-medium uppercase tracking-wide text-muted-foreground">
+                  {{ $t("permission.prompt.command") }}
                 </div>
-                <pre class="whitespace-pre-wrap break-all rounded bg-muted px-2 py-1.5 font-mono text-[11px] leading-snug">{{ commandText(current.input) }}</pre>
+                <pre class="whitespace-pre-wrap break-all rounded bg-muted px-2 py-1.5 font-mono text-caption leading-snug">{{ commandText(current.input) }}</pre>
               </section>
 
               <section
                 v-else-if="current.tool === 'write' || current.tool === 'edit'"
                 class="px-3 py-2"
               >
-                <div class="mb-0.5 flex items-baseline justify-between font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
-                  <span>{{ current.tool === "write" ? "write" : "edit" }}</span>
-                  <span class="normal-case text-foreground/80">{{ fileTarget(current.input) }}</span>
+                <div class="mb-0.5 flex items-baseline justify-between text-caption font-medium uppercase tracking-wide text-muted-foreground">
+                  <span>{{ current.tool === "write" ? $t("permission.prompt.create") : $t("permission.prompt.modify") }}</span>
+                  <span class="font-mono normal-case text-foreground/80">{{ fileTarget(current.input) }}</span>
                 </div>
                 <DiffView
                   v-if="current.preview && current.preview.kind === 'diff'"
@@ -272,64 +277,63 @@ onUnmounted(() => document.removeEventListener("keydown", onKey));
                   :max-rows="20"
                   :max-diff-lines="600"
                 />
-                <pre v-else class="whitespace-pre-wrap break-all rounded bg-muted px-2 py-1.5 font-mono text-[11px] leading-snug">{{ commandText(current.input) }}</pre>
+                <pre v-else class="whitespace-pre-wrap break-all rounded bg-muted px-2 py-1.5 font-mono text-caption leading-snug">{{ commandText(current.input) }}</pre>
               </section>
 
               <section v-else class="px-3 py-2">
-                <div class="mb-0.5 font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
-                  arguments
+                <div class="mb-0.5 text-caption font-medium uppercase tracking-wide text-muted-foreground">
+                  {{ $t("permission.prompt.arguments") }}
                 </div>
-                <pre class="whitespace-pre-wrap break-all rounded bg-muted px-2 py-1.5 font-mono text-[11px] leading-snug">{{ commandText(current.input) }}</pre>
+                <pre class="whitespace-pre-wrap break-all rounded bg-muted px-2 py-1.5 font-mono text-caption leading-snug">{{ commandText(current.input) }}</pre>
               </section>
             </div>
           </div>
 
           <!-- Action row.
-               Order (left → right): Allow · Allow always · Deny always · Deny.
+               Order (left → right): Allow · Always allow · Always deny · Deny.
                Allow leads because it's the hot-path action — most calls
-               in approve_risky mode are routine and the user wants the
-               click to land on the leftmost button without scanning
-               the row. Deny stays anchored to the right as the safe
-               escape.
+               in Ask mode are routine and the user wants the click to
+               land on the leftmost button without scanning the row.
+               Deny stays anchored to the right as the safe escape.
 
                Keyboard:
                  ↵    → Allow once       (1st button)
-                 ⇧↵   → Allow always     (2nd button)
-                 esc  → Deny once        (last button)
+                 ⇧↵   → Always allow     (2nd button)
+                 esc  → Deny             (last button)
             -->
           <div class="border-t border-border bg-muted/20 px-2 py-1.5">
             <div class="flex h-7 items-stretch gap-1">
               <button
                 type="button"
-                class="flex-1 rounded border border-success/60 bg-success/15 px-1.5 font-mono text-[11px] font-semibold leading-none whitespace-nowrap text-success hover:bg-success/25"
-                title="Allow this single call. Pi will ask again next time. (↵)"
+                class="flex-1 rounded border border-success/60 bg-success/15 px-1.5 text-caption font-semibold leading-none whitespace-nowrap text-success hover:bg-success/25"
+                :title="$t('permission.prompt.buttons.allowTitle')"
                 @click="respond('allow_once')"
-              >Allow</button>
+              >{{ $t("permission.prompt.buttons.allow") }}</button>
               <button
                 type="button"
-                class="flex-1 rounded border border-transparent bg-background px-1.5 font-mono text-[10px] leading-none whitespace-nowrap text-success/80 hover:border-success/40 hover:bg-success/10 hover:text-success"
-                title="Allow this AND every future call with the same arguments for the rest of this chat. (⇧↵)"
+                class="flex-1 rounded border border-transparent bg-background px-1.5 text-caption font-medium leading-none whitespace-nowrap text-success/80 hover:border-success/40 hover:bg-success/10 hover:text-success"
+                :title="$t('permission.prompt.buttons.alwaysAllowTitle')"
                 @click="respond('allow_session')"
-              >Allow&nbsp;always</button>
+              >{{ $t("permission.prompt.buttons.alwaysAllow") }}</button>
               <button
                 type="button"
-                class="flex-1 rounded border border-transparent bg-background px-1.5 font-mono text-[10px] leading-none whitespace-nowrap text-destructive/75 hover:border-destructive/30 hover:bg-destructive/10 hover:text-destructive"
-                title="Deny this AND every future call with the same arguments for the rest of this chat."
+                class="flex-1 rounded border border-transparent bg-background px-1.5 text-caption font-medium leading-none whitespace-nowrap text-destructive/75 hover:border-destructive/30 hover:bg-destructive/10 hover:text-destructive"
+                :title="$t('permission.prompt.buttons.alwaysDenyTitle')"
                 @click="respond('deny_session')"
-              >Deny&nbsp;always</button>
+              >{{ $t("permission.prompt.buttons.alwaysDeny") }}</button>
               <button
                 type="button"
-                class="flex-1 rounded border border-border bg-background px-1.5 font-mono text-[11px] leading-none whitespace-nowrap hover:border-destructive/40 hover:bg-destructive/5 hover:text-destructive"
-                title="Deny this single call. Pi will ask again next time. (esc)"
+                class="flex-1 rounded border border-border bg-background px-1.5 text-caption font-semibold leading-none whitespace-nowrap hover:border-destructive/40 hover:bg-destructive/5 hover:text-destructive"
+                :title="$t('permission.prompt.buttons.denyTitle')"
                 @click="respond('deny_once')"
-              >Deny</button>
+              >{{ $t("permission.prompt.buttons.deny") }}</button>
             </div>
             <!-- Keyboard hint strip — half-height, dimmed, non-clickable.
                  Aligned to the buttons above so each shortcut sits
                  directly under its action. Skipped on touch devices
                  via the no-hover media query. -->
             <div
-              class="mt-0.5 hidden h-3 items-center gap-1 font-mono text-[9px] uppercase tracking-wide text-muted-foreground/60 sm:flex"
+              class="mt-0.5 hidden h-3 items-center gap-1 text-caption uppercase tracking-wide text-muted-foreground/60 sm:flex"
               aria-hidden="true"
             >
               <span class="flex-1 text-center">↵</span>

@@ -58,6 +58,122 @@ export function createRouterState(): RouterState {
   };
 }
 
+/**
+ * Classify a raw provider error string into a stable category code
+ * the i18n layer can render as a friendly user-facing message.
+ *
+ * The returned code is the ONLY thing the rest of the app should
+ * surface — the raw upstream string is for our debugging (logged
+ * via console.warn) and MUST NOT reach the UI.
+ *
+ * Pattern sources (real production strings, not guesses):
+ *   - https://docs.anthropic.com/en/api/errors
+ *   - https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/api-errors
+ *   - https://ai.google.dev/gemini-api/docs/safety-settings  (finishReason)
+ *   - https://platform.openai.com/docs/guides/error-codes
+ *
+ * Categories (priority order, first match wins):
+ *
+ *   provider_usage_policy     Anthropic AUP / "violates our Usage Policy"
+ *   provider_safety_block     Gemini SAFETY / PROHIBITED_CONTENT / BLOCKLIST
+ *   provider_context_too_large 413 / request_too_large / context window
+ *   provider_billing          Anthropic 402 billing_error / OpenAI insufficient_quota
+ *   provider_rate_limit       429 / rate_limit_error / RESOURCE_EXHAUSTED
+ *   provider_quota_exhausted  monthly quota / out of credits (explicit)
+ *   provider_overloaded       529 overloaded_error / 5xx UNAVAILABLE / api_error
+ *   provider_model_unavailable 404 not_found_error / model gated
+ *   provider_auth             401 / 403 / unauthenticated / bad ADC
+ *   provider_invalid_request  400 invalid_request_error / INVALID_ARGUMENT
+ *   provider_timeout          504 / timeout_error / DEADLINE_EXCEEDED
+ *   provider_network          DNS / ECONNRESET / fetch failed
+ *   provider_error            unknown — store renders generic "Something went wrong"
+ *
+ * NOTE: kept in sync (line-for-line) with the desktop fork at
+ * desktop/frontend/src/lib/event-router.ts. Any pattern change here
+ * MUST land in the desktop file the same commit.
+ */
+export function categorizeProviderError(raw: string | undefined | null): {
+  code: string;
+} {
+  const text = String(raw ?? "").trim();
+  if (!text) return { code: "provider_error" };
+  const lc = text.toLowerCase();
+
+  if (
+    /violates? (our )?usage policy|aup\.|anthropic\.com\/legal\/aup|unable to respond to this request/i.test(
+      text,
+    )
+  ) {
+    return { code: "provider_usage_policy" };
+  }
+  if (
+    /\b(safety|prohibited_content|blocklist|recitation|blocked by safety|content filter|content[_\s-]?policy|harm[_\s-]?category)\b/i.test(
+      text,
+    )
+  ) {
+    return { code: "provider_safety_block" };
+  }
+  if (
+    /(request_too_large|payload too large|\b413\b|context[_\s-]?length|context[_\s-]?window|maximum (context|tokens?)|input is too long|prompt is too long)/i.test(
+      lc,
+    )
+  ) {
+    return { code: "provider_context_too_large" };
+  }
+  if (/\b402\b|billing_error|payment[_\s-]?(failed|required)|insufficient_quota/i.test(lc)) {
+    return { code: "provider_billing" };
+  }
+  if (
+    /\b429\b|rate[_\s-]?limit|too many requests|requests per (minute|second)|resource[_\s-]?exhausted/i.test(
+      lc,
+    )
+  ) {
+    return { code: "provider_rate_limit" };
+  }
+  if (/(monthly quota|quota.*exceed|out of credits?|credit (limit|exhaust))/i.test(lc)) {
+    return { code: "provider_quota_exhausted" };
+  }
+  if (
+    /\b5(00|02|03|29)\b|overloaded|api_error|service unavailable|temporarily unavailable|\bunavailable\b|server is (busy|overloaded)|try again later/i.test(
+      lc,
+    )
+  ) {
+    return { code: "provider_overloaded" };
+  }
+  if (
+    /not_found_error|model.*not[_\s-]?(found|enabled|supported)|publisher.?model.*not found|model.*does not exist|access denied to model|location is not supported|region.*not[_\s-]?support/i.test(
+      lc,
+    )
+  ) {
+    return { code: "provider_model_unavailable" };
+  }
+  if (
+    /\b401\b|\b403\b|authentication_error|permission_error|permission_denied|unauthenticated|invalid[_\s-]?api[_\s-]?key|invalid_authentication|expired[_\s-]?credentials|application[_\s-]?default[_\s-]?credentials|\badc\b/i.test(
+      lc,
+    )
+  ) {
+    return { code: "provider_auth" };
+  }
+  if (
+    /\b400\b|\b422\b|invalid_request_error|invalid_argument|failed_precondition|bad request|malformed|unprocessable_entity/i.test(
+      lc,
+    )
+  ) {
+    return { code: "provider_invalid_request" };
+  }
+  if (/\b504\b|timeout_error|deadline_exceeded|timed out|request timeout/i.test(lc)) {
+    return { code: "provider_timeout" };
+  }
+  if (
+    /econnreset|enotfound|etimedout|enetunreach|fetch failed|network[_\s-]?error|socket hang up|getaddrinfo|dns lookup failed|tls handshake|ssl[_\s-]?alert|connection (reset|refused|closed|aborted)/i.test(
+      lc,
+    )
+  ) {
+    return { code: "provider_network" };
+  }
+  return { code: "provider_error" };
+}
+
 /** Push the user's prompt as a bubble immediately so the UI feels snappy. */
 export function pushUserMessage(state: RouterState, text: string, id: string): void {
   const msg: UserMessage = reactive({ kind: "user", id, text });
@@ -391,7 +507,8 @@ export function applyEvent(state: RouterState, evt: RpcEvent): void {
     case "message_end": {
       const role = (evt as any).message?.role;
       if (role && role !== "assistant") return;
-      const usage = (evt as any).message?.usage;
+      const message = (evt as any).message ?? {};
+      const usage = message.usage;
       const asst = ensureCurrentAssistant(state);
       if (usage) {
         asst.usage = {
@@ -401,6 +518,29 @@ export function applyEvent(state: RouterState, evt: RpcEvent): void {
           cacheWrite: Number(usage.cacheWrite ?? 0),
           cost: Number(usage.cost?.total ?? 0),
         };
+      }
+      // Provider-side failure: pi finished the turn but stopped because
+      // the upstream model returned an error envelope (Anthropic 429,
+      // Vertex SAFETY, OpenAI insufficient_quota, …). The raw string is
+      // useful for our diagnostics but MUST NOT reach the user — we
+      // categorise it into a stable code and let the chat store
+      // localise it via i18n.
+      if (message.stopReason === "error") {
+        const raw =
+          typeof message.errorMessage === "string"
+            ? message.errorMessage
+            : typeof message.error === "string"
+            ? message.error
+            : "";
+        if (raw) {
+          // eslint-disable-next-line no-console
+          console.warn("[chat] provider error (raw, suppressed in UI):", raw);
+        }
+        const { code } = categorizeProviderError(raw);
+        asst.errorCode = code;
+        // Leave asst.error empty here — the store fills it with the
+        // localised string so unit tests for this reducer don't have
+        // to depend on i18n being initialised.
       }
       return;
     }
@@ -418,8 +558,18 @@ export function applyEvent(state: RouterState, evt: RpcEvent): void {
     }
 
     case "_bridge_error": {
+      // Server emits {type:"_bridge_error", code, message}. The `code`
+      // is our stable contract (see services/error_codes.py); the
+      // `message` is for our logs only — the SPA ALWAYS renders the
+      // i18n string keyed off `code`, never the raw server text.
+      const code = String((evt as any).code ?? "internal");
+      const raw = (evt as any).message;
+      if (raw) {
+        // eslint-disable-next-line no-console
+        console.warn(`[chat] bridge_error code=${code} (raw, suppressed in UI):`, raw);
+      }
       const asst = ensureCurrentAssistant(state);
-      asst.error = String((evt as any).message ?? "Bridge error");
+      asst.errorCode = code;
       asst.done = true;
       return;
     }

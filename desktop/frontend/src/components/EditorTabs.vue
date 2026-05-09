@@ -185,7 +185,7 @@ const hasTabs = computed(() => openTabs.value.length > 0);
         v-for="tab in openTabs"
         :key="tab.path"
         :class="[
-          'group/tab relative flex max-w-[240px] min-w-[100px] shrink-0 cursor-pointer items-center gap-1.5 border-r border-border px-3 py-1.5 text-[12px] transition-colors',
+          'group/tab relative flex max-w-[240px] min-w-[100px] shrink-0 cursor-pointer items-center gap-1.5 border-r border-border px-3 py-1.5 text-body transition-colors',
           tab.path === activeTabPath
             ? 'tab-active bg-editor text-foreground'
             : 'bg-card text-foreground/70 hover:bg-accent/40',
@@ -254,17 +254,17 @@ const hasTabs = computed(() => openTabs.value.length > 0);
         <template v-if="!menu.overflow">
           <button
             type="button"
-            class="block w-full px-3 py-1.5 text-left text-[12px] hover:bg-accent"
+            class="block w-full px-3 py-1.5 text-left text-body hover:bg-accent"
             @click="ctxClose"
           >Close</button>
           <button
             type="button"
-            class="block w-full px-3 py-1.5 text-left text-[12px] hover:bg-accent"
+            class="block w-full px-3 py-1.5 text-left text-body hover:bg-accent"
             @click="ctxCloseOthers"
           >Close Others</button>
           <button
             type="button"
-            class="block w-full px-3 py-1.5 text-left text-[12px] hover:bg-accent"
+            class="block w-full px-3 py-1.5 text-left text-body hover:bg-accent"
             @click="ctxCloseAll"
           >Close All</button>
         </template>
@@ -276,7 +276,7 @@ const hasTabs = computed(() => openTabs.value.length > 0);
               :key="t.path"
               type="button"
               :class="[
-                'flex w-full items-center gap-1.5 px-3 py-1.5 text-left text-[12px] hover:bg-accent',
+                'flex w-full items-center gap-1.5 px-3 py-1.5 text-left text-body hover:bg-accent',
                 t.path === activeTabPath ? 'bg-primary/10 text-primary' : '',
               ]"
               :title="t.path"

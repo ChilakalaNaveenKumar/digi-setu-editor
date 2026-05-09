@@ -30,7 +30,6 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from config import (
     BYOK_MODE,
-    DEPLOY_MODE,
     PROMPT_TIMEOUT_SECONDS,
     WORKSPACE_DISK_QUOTA_MB,
 )
@@ -52,6 +51,7 @@ from services.models_registry import (
     pick_default_for_plan,
 )
 from services.audit import record as audit_record
+from services.error_codes import bridge_error, log_error
 from services.pi_session import PiSession
 from services.policy import check_bash, scrub_secrets
 from services.sandbox_layout import stamp_sandbox_dir
@@ -191,27 +191,83 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
         await ws.close(code=4429)
         return
 
-    await ws.accept()
+    # Concurrent-chat cap. Distinct from the burst limit above: this
+    # bounds the number of LIVE pi subprocesses one user can hold open
+    # simultaneously (web tabs that have a chat WS connected). Cursor's
+    # web product has the same model — N concurrent chats max. We
+    # close with 4409 (custom: "conflict / capacity") and a JSON close
+    # reason so the SPA can render "you have N chats open — close one
+    # before starting a new one" instead of a generic disconnect.
+    granted, current, cap = rl.acquire_chat_slot(user_id)
+    if not granted:
+        await ws.close(
+            code=4409,
+            reason=f"too_many_chats:{current}/{cap}",
+        )
+        return
 
+    try:
+        await ws.accept()
+        await run_session_loop(ws, user_id, session_id)
+    finally:
+        rl.release_chat_slot(user_id)
+
+
+async def run_session_loop(
+    ws: WebSocket, user_id: str, session_id: str
+) -> None:
+    """Run the chat WebSocket pumps after the upgrade is accepted.
+
+    Extracted from session_ws() so the desktop relay endpoint
+    (routes/desktop_relay.py) can reuse the full chat protocol surface
+    (tool calls, permission prompts, file watcher, background processes,
+    billing, snapshots, titles, watchdog) without duplicating ~1100
+    lines of state machine.
+
+    Caller responsibilities:
+      * Verify the user with services/auth.user_for_websocket.
+      * Apply the WS-upgrade rate-limit (services/rate_limit:ws.connect).
+      * Call ws.accept() — including any subprotocol echo for browsers
+        that demand it (RFC 6455 §4.2.2).
+      * Ensure (session_id, owner_user_id=user_id) is in the registry
+        before calling. The owner check below will refuse mismatches.
+      * Tear down any transient session/workspace this user created
+        for the call after this coroutine returns (this function does
+        NOT garbage-collect transient relay state).
+    """
+    rl = RateLimiter.instance()
     reg = Registry.instance()
     sess_rec = reg.get_session(session_id)
     if not sess_rec:
-        await ws.send_json({"type": "_bridge_error", "message": f"unknown session id: {session_id}"})
+        log_error("session_unknown", session_id=session_id, user_id=user_id, where="ws_open")
+        await ws.send_json(bridge_error("session_unknown"))
         await ws.close()
         return
 
     ws_rec = reg.get_workspace(sess_rec["workspace_id"])
     if not ws_rec:
-        await ws.send_json(
-            {"type": "_bridge_error", "message": f"workspace gone: {sess_rec['workspace_id']}"}
+        log_error(
+            "workspace_missing",
+            session_id=session_id,
+            user_id=user_id,
+            workspace_id=sess_rec["workspace_id"],
+            where="ws_open",
         )
+        await ws.send_json(bridge_error("workspace_missing"))
         await ws.close()
         return
 
     # Owner check: collapsing into the same "unknown session" message
     # so a hostile client can't enumerate session ids.
     if ws_rec.get("owner_user_id") != user_id:
-        await ws.send_json({"type": "_bridge_error", "message": f"unknown session id: {session_id}"})
+        log_error(
+            "session_unknown",
+            session_id=session_id,
+            user_id=user_id,
+            where="owner_check",
+            actual_owner=ws_rec.get("owner_user_id"),
+        )
+        await ws.send_json(bridge_error("session_unknown"))
         await ws.close()
         return
 
@@ -252,11 +308,15 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
                 file=sys.stderr,
             )
         except OSError as exc:
-            await ws.send_json({
-                "type": "_bridge_error",
-                "message": f"workspace directory could not be created: {exc}",
-                "code": "workspace_missing",
-            })
+            log_error(
+                "workspace_missing",
+                session_id=session_id,
+                user_id=user_id,
+                exc=exc,
+                where="recreate_workspace_dir",
+                workspace_path=str(workspace_path),
+            )
+            await ws.send_json(bridge_error("workspace_missing"))
             await ws.close()
             return
 
@@ -265,14 +325,14 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
     # cheap WS upgrade so a hostile client can't burn a thousand
     # subprocesses by reconnecting in a tight loop.
     if not rl.try_take(user_id, "pi.spawn"):
-        await ws.send_json(
-            {
-                "type": "_bridge_error",
-                "message": "You're starting chats too quickly. Wait a moment and try again.",
-                "code": "rate_limit",
-                "bucket": "pi.spawn",
-            }
+        log_error(
+            "rate_limit",
+            session_id=session_id,
+            user_id=user_id,
+            where="pi_spawn_throttle",
+            bucket="pi.spawn",
         )
+        await ws.send_json(bridge_error("rate_limit"))
         await ws.close(code=4429)
         return
 
@@ -344,15 +404,17 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
     if BYOK_MODE and active_model_spec is not None:
         from services.byok import byok_provider_for as _byok_pf  # noqa: E402
         if _byok_pf(active_model_spec) is None:
+            log_error(
+                "setup_required",
+                session_id=session_id,
+                user_id=user_id,
+                where="dispatch_no_route_web",
+                model=active_model_id,
+                model_name=getattr(active_model_spec, "name", None),
+            )
             await ws.send_json({
-                "type": "_bridge_error",
+                **bridge_error("setup_required"),
                 "code": "upgrade_required",
-                "model": active_model_id,
-                "message": (
-                    f"Model '{active_model_spec.name}' requires a Digi Setu "
-                    "subscription. Pick a model badged BYOK (uses your "
-                    "key in ~/.digi-setu/.env) or sign in to use cloud models."
-                ),
             })
             await ws.close(code=4402)
             return
@@ -391,27 +453,39 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
         from services import container_pool as _pool
         await _pool.enforce_quotas(user_id)
     except _pool.GlobalCapacityExceeded as exc:
-        await ws.send_json({
-            "type": "_bridge_error",
-            "code": "vm_capacity",
-            "message": (
-                "The VM is currently at maximum capacity. "
-                "Please try again in a minute."
-            ),
-            "detail": str(exc),
-        })
+        log_error(
+            "capacity",
+            session_id=session_id,
+            user_id=user_id,
+            exc=exc,
+            where="container_pool_quota",
+        )
+        await ws.send_json(bridge_error("capacity"))
         await ws.close(code=1013)  # Try Again Later
         return
     except Exception as exc:
-        print(f"[ws {session_id}] WARN container_pool quota check failed: {exc}", file=sys.stderr)
+        log_error(
+            "internal",
+            session_id=session_id,
+            user_id=user_id,
+            exc=exc,
+            where="container_pool_quota_check",
+            severity="warn",
+        )
         # Don't refuse the chat on a transient docker error; let
         # PiSession.start() decide.
 
     try:
         await pi.start()
     except Exception as exc:
-        print(f"[ws {session_id}] failed to start pi: {exc}", file=sys.stderr)
-        await ws.send_json({"type": "_bridge_error", "message": f"Failed to start pi: {exc}"})
+        log_error(
+            "internal",
+            session_id=session_id,
+            user_id=user_id,
+            exc=exc,
+            where="pi_session_start",
+        )
+        await ws.send_json(bridge_error("internal"))
         await ws.close()
         return
 
@@ -699,8 +773,6 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
         documented in deploy/README) is what actually keeps the
         request from succeeding. This filter makes the agent feel
         the policy in its own context window so it stops trying."""
-        if DEPLOY_MODE != "web":
-            return None
         if evt.get("type") not in ("tool_execution_start", "tool_execution"):
             return None
         if evt.get("toolName") != "bash":
@@ -883,11 +955,10 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
             except Exception as exc:
                 print(f"[ws {session_id}] serialize failed: {exc}", file=sys.stderr)
                 continue
-            if DEPLOY_MODE == "web":
-                # Last-line secret scrub on outbound text. Cheap because
-                # `scrub_secrets` short-circuits when no marker chars are
-                # present, which is the common case.
-                payload = scrub_secrets(payload)
+            # Last-line secret scrub on outbound text. Cheap because
+            # `scrub_secrets` short-circuits when no marker chars are
+            # present, which is the common case.
+            payload = scrub_secrets(payload)
             try:
                 await ws.send_text(payload)
             except Exception as exc:
@@ -952,26 +1023,16 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
             elapsed = loop.time() - started
             if elapsed >= PROMPT_TIMEOUT_SECONDS:
                 timed_out["flag"] = True
-                print(
-                    f"[ws {session_id}] prompt timeout: turn ran {elapsed:.0f}s "
-                    f"(limit {PROMPT_TIMEOUT_SECONDS}s) — tearing down",
-                    file=sys.stderr,
+                log_error(
+                    "timeout",
+                    session_id=session_id,
+                    user_id=user_id,
+                    where="prompt_watchdog",
+                    elapsed_seconds=int(elapsed),
+                    limit_seconds=PROMPT_TIMEOUT_SECONDS,
                 )
                 try:
-                    await ws.send_json(
-                        {
-                            "type": "_bridge_error",
-                            "message": (
-                                f"Your prompt ran for over "
-                                f"{PROMPT_TIMEOUT_SECONDS // 60} minutes "
-                                "and was stopped to protect your budget. "
-                                "Try a smaller request or break the work "
-                                "into steps."
-                            ),
-                            "code": "prompt_timeout",
-                            "elapsed_seconds": int(elapsed),
-                        }
-                    )
+                    await ws.send_json(bridge_error("timeout"))
                 except Exception:
                     pass
                 return
@@ -985,9 +1046,14 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
             try:
                 command = json.loads(raw)
             except json.JSONDecodeError:
-                await ws.send_json(
-                    {"type": "_bridge_error", "message": f"Invalid JSON from client: {raw[:120]!r}"}
+                log_error(
+                    "internal",
+                    session_id=session_id,
+                    user_id=user_id,
+                    where="ws_to_pi_json_decode",
+                    raw_head=raw[:120],
                 )
+                await ws.send_json(bridge_error("internal"))
                 continue
             # Client-driven abort. The SPA sends `{type: "abort"}` when
             # the user clicks the stop button (see web/frontend/src/stores/
@@ -1009,26 +1075,25 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
             # an extra click.
             if command.get("type") == "abort":
                 aborted["flag"] = True
-                print(
-                    f"[ws {session_id}] abort requested by client; force-killing pi",
-                    file=sys.stderr,
+                log_error(
+                    "aborted",
+                    session_id=session_id,
+                    user_id=user_id,
+                    where="user_abort",
                 )
                 try:
-                    await ws.send_json(
-                        {
-                            "type": "_bridge_error",
-                            "code": "aborted",
-                            "message": "Aborted.",
-                        }
-                    )
+                    await ws.send_json(bridge_error("aborted"))
                 except Exception:
                     pass
                 try:
                     await pi.terminate()
                 except Exception as exc:
-                    print(
-                        f"[ws {session_id}] abort: pi.terminate raised {exc!r}",
-                        file=sys.stderr,
+                    log_error(
+                        "internal",
+                        session_id=session_id,
+                        user_id=user_id,
+                        exc=exc,
+                        where="abort_terminate",
                     )
                 return
             # Permission gate response. We translate the SPA's high-level
@@ -1041,14 +1106,25 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
                 req_id = command.get("id")
                 decision = command.get("decision")
                 if not isinstance(req_id, str) or not isinstance(decision, str):
-                    await ws.send_json(
-                        {"type": "_bridge_error", "message": "permission_response missing id/decision"}
+                    log_error(
+                        "internal",
+                        session_id=session_id,
+                        user_id=user_id,
+                        where="permission_response_validate",
+                        reason="missing_id_or_decision",
                     )
+                    await ws.send_json(bridge_error("internal"))
                     continue
                 if decision not in ("allow_once", "allow_session", "deny_once", "deny_session"):
-                    await ws.send_json(
-                        {"type": "_bridge_error", "message": f"unknown decision: {decision!r}"}
+                    log_error(
+                        "internal",
+                        session_id=session_id,
+                        user_id=user_id,
+                        where="permission_response_validate",
+                        reason="unknown_decision",
+                        decision=decision,
                     )
+                    await ws.send_json(bridge_error("internal"))
                     continue
                 pending = pending_permissions.pop(req_id, None)
                 tool_name = (
@@ -1068,9 +1144,14 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
                         {"type": "extension_ui_response", "id": req_id, "value": decision}
                     )
                 except Exception as exc:
-                    await ws.send_json(
-                        {"type": "_bridge_error", "message": f"Failed to forward decision to pi: {exc}"}
+                    log_error(
+                        "internal",
+                        session_id=session_id,
+                        user_id=user_id,
+                        exc=exc,
+                        where="forward_permission_decision",
                     )
+                    await ws.send_json(bridge_error("internal"))
                 continue
             if command.get("type") == "prompt":
                 # Pre-flight rate limit + daily-token check. We block
@@ -1080,27 +1161,25 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
                 # chat pane can render an inline notice instead of
                 # closing the WS (the user can retry after the cooldown).
                 if not rl.try_take(user_id, "chat.message"):
-                    await ws.send_json(
-                        {
-                            "type": "_bridge_error",
-                            "message": "You're sending prompts too quickly. Slow down for a moment.",
-                            "code": "rate_limit",
-                            "bucket": "chat.message",
-                        }
+                    log_error(
+                        "rate_limit",
+                        session_id=session_id,
+                        user_id=user_id,
+                        where="prompt_rate_limit",
+                        bucket="chat.message",
                     )
+                    await ws.send_json(bridge_error("rate_limit"))
                     continue
                 if not rl.can_send_message(user_id):
                     remaining = rl.remaining_tokens(user_id)
-                    await ws.send_json(
-                        {
-                            "type": "_bridge_error",
-                            "message": (
-                                "Daily token budget reached. Resets at UTC midnight. "
-                                f"({remaining} tokens left)"
-                            ),
-                            "code": "token_quota",
-                        }
+                    log_error(
+                        "quota_exceeded",
+                        session_id=session_id,
+                        user_id=user_id,
+                        where="daily_token_budget",
+                        remaining_tokens=remaining,
                     )
+                    await ws.send_json(bridge_error("quota_exceeded"))
                     continue
                 # Workspace storage cap. We enforce *between* prompts
                 # rather than during a tool call — by the time we see
@@ -1108,47 +1187,27 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
                 # can't unwrite it. Refusing the next prompt makes the
                 # agent stop digging the hole and forces the user to
                 # clean up (delete files via the UI, or ask the agent
-                # to delete them) before continuing.
-                # Desktop runs on the user's own disk — no quota
-                # applies. The whole "you've hit the sandbox cap"
-                # affordance only makes sense for the hosted (web)
-                # product where each chat lives in a sandboxed
-                # workspaces/<wsid>/ directory under our data root.
-                if DEPLOY_MODE == "web" and WORKSPACE_DISK_QUOTA_MB > 0:
+                # to delete them) before continuing. Each chat lives
+                # in a sandboxed workspaces/<wsid>/ directory under
+                # our data root, which is what the quota counts.
+                if WORKSPACE_DISK_QUOTA_MB > 0:
                     used_mb = workspace_over_quota(workspace_path, WORKSPACE_DISK_QUOTA_MB)
                     if used_mb is not None:
-                        # When a hosted-tier user hits the workspace
-                        # cap they're almost always trying to install
-                        # heavyweight tooling (rust/go toolchains,
-                        # multi-GB datasets, media projects). Rather
-                        # than asking them to delete files and stay on
-                        # the web — where they'll just hit the same
-                        # ceiling on the next install — we steer them
-                        # to the desktop app, which uses their local
-                        # disk and has no quota. This is also the
-                        # signal we use to drive desktop-app adoption
-                        # for the ~5% of power users who'd otherwise
-                        # churn on a "your sandbox is full" wall.
-                        def _fmt(mb: float) -> str:
-                            return f"{mb / 1024:.1f} GB" if mb >= 1024 else f"{mb:.0f} MB"
-
-                        await ws.send_json(
-                            {
-                                "type": "_bridge_error",
-                                "message": (
-                                    f"You hit the workspace storage limit "
-                                    f"({_fmt(used_mb)} of {_fmt(WORKSPACE_DISK_QUOTA_MB)}). "
-                                    "Use the local version instead "
-                                    "for better storage options that "
-                                    "run on your own machine — "
-                                    "https://digi-setu.com/download"
-                                ),
-                                "code": "storage_quota",
-                                "used_mb": round(used_mb, 1),
-                                "quota_mb": WORKSPACE_DISK_QUOTA_MB,
-                                "download_url": "https://digi-setu.com/download",
-                            }
+                        # Hosted-tier user hit the workspace cap.
+                        # Numbers and the desktop-app marketing CTA
+                        # belong on the Settings / Usage page; the
+                        # error toast just signals the condition. The
+                        # SPA detects `code: "storage_full"` and
+                        # routes the user there.
+                        log_error(
+                            "storage_full",
+                            session_id=session_id,
+                            user_id=user_id,
+                            where="workspace_disk_quota",
+                            used_mb=round(used_mb, 1),
+                            quota_mb=WORKSPACE_DISK_QUOTA_MB,
                         )
+                        await ws.send_json(bridge_error("storage_full"))
                         continue
 
                 # Subscription credit gate. The token bucket above is
@@ -1158,19 +1217,15 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
                 # upgrade or wait for the next billing month.
                 if not ledger.can_spend(user_id):
                     snap = ledger.snapshot(user_id)
-                    await ws.send_json(
-                        {
-                            "type": "_bridge_error",
-                            "message": (
-                                f"You've used your {snap['plan']['label']} "
-                                f"plan's ${snap['plan']['monthly_credit_usd']:.2f} "
-                                f"of credit for {snap['month']}. "
-                                "Upgrade your plan or wait for the next month."
-                            ),
-                            "code": "credit_exhausted",
-                            "snapshot": snap,
-                        }
+                    log_error(
+                        "quota_exceeded",
+                        session_id=session_id,
+                        user_id=user_id,
+                        where="monthly_credit",
+                        plan=snap.get("plan", {}).get("id"),
+                        month=snap.get("month"),
                     )
+                    await ws.send_json(bridge_error("quota_exceeded"))
                     continue
                 rl.note_message(user_id)
 
@@ -1217,9 +1272,14 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
             try:
                 await pi.send(command)
             except Exception as exc:
-                await ws.send_json(
-                    {"type": "_bridge_error", "message": f"Failed to forward command to pi: {exc}"}
+                log_error(
+                    "internal",
+                    session_id=session_id,
+                    user_id=user_id,
+                    exc=exc,
+                    where="forward_command",
                 )
+                await ws.send_json(bridge_error("internal"))
                 return
 
     pump_out = asyncio.create_task(pi_to_ws(), name=f"pi_to_ws[{session_id}]")

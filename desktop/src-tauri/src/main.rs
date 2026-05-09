@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    pi_typst_test_desktop_lib::run()
+    digi_setu_desktop_lib::run()
 }

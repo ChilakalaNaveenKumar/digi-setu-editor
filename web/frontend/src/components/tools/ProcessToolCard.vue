@@ -138,8 +138,8 @@ function killProcess(processId: string): void {
     class="group my-1.5 overflow-hidden rounded-md border border-border bg-card transition-colors hover:border-border/80"
   >
     <!-- ── HEADER ─────────────────────────────────────────────────────── -->
-    <div class="flex items-center gap-2 px-2.5 py-1.5 font-mono text-xs">
-      <span class="inline-flex h-4 w-4 items-center justify-center rounded-sm bg-muted text-[10px] font-semibold text-muted-foreground">
+    <div class="flex items-center gap-2 px-2.5 py-1.5 font-mono text-body">
+      <span class="inline-flex h-4 w-4 items-center justify-center rounded-sm bg-muted text-caption font-semibold text-muted-foreground">
         ⌘
       </span>
       <span class="font-semibold text-foreground/90">process</span>
@@ -159,19 +159,19 @@ function killProcess(processId: string): void {
 
       <span class="flex-1"></span>
 
-      <span :class="['rounded-sm px-1.5 py-0.5 text-[10px]', statusBadge.color]">{{ statusBadge.label }}</span>
+      <span :class="['rounded-sm px-1.5 py-0.5 text-caption', statusBadge.color]">{{ statusBadge.label }}</span>
 
       <!-- For successful start: open terminal + kill buttons -->
       <template v-if="!isStreaming && startedProcess?.id">
         <button
           type="button"
-          class="rounded-sm bg-muted px-1.5 py-0.5 text-[10px] hover:bg-accent hover:text-foreground"
+          class="rounded-sm bg-muted px-1.5 py-0.5 text-caption hover:bg-accent hover:text-foreground"
           title="Open this process in the terminal pane (live tail)"
           @click="focusTerminalForProcess(startedProcess.id!)"
         >open</button>
         <button
           type="button"
-          class="rounded-sm bg-destructive/15 px-1.5 py-0.5 text-[10px] text-destructive hover:bg-destructive/25"
+          class="rounded-sm bg-destructive/15 px-1.5 py-0.5 text-caption text-destructive hover:bg-destructive/25"
           title="SIGTERM this process directly via the backend"
           @click="killProcess(startedProcess.id!)"
         >stop</button>
@@ -195,7 +195,7 @@ function killProcess(processId: string): void {
       >{{ resultText }}</pre>
       <div
         v-if="startedProcess && startedProcess.id && startedProcess.pid"
-        class="border-t border-border/60 bg-muted/30 px-3 py-1 font-mono text-[10px] text-muted-foreground"
+        class="border-t border-border/60 bg-muted/30 px-3 py-1 font-mono text-caption text-muted-foreground"
       >
         id: <span class="text-foreground/80">{{ startedProcess.id }}</span>
         · pid: <span class="text-foreground/80 tabular-nums">{{ startedProcess.pid }}</span>
@@ -207,7 +207,7 @@ function killProcess(processId: string): void {
 
     <div
       v-else-if="isStreaming"
-      class="border-t border-border bg-background px-3 py-2 font-mono text-[11px] italic text-muted-foreground"
+      class="border-t border-border bg-background px-3 py-2 font-mono text-caption italic text-muted-foreground"
     >waiting for tool result…</div>
   </div>
 </template>

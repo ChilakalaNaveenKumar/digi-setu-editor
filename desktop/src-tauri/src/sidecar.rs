@@ -107,12 +107,18 @@ fn resolve_paths(app: &AppHandle) -> Result<ResolvedPaths, SidecarError> {
         .map(Path::to_path_buf)
         .unwrap_or(manifest_dir.clone());
 
+    // Order matters: in a `cargo tauri build` release the bundled
+    // `Resources/sidecar/dist/pi-typst-sidecar` MUST win over the
+    // developer's `~/workarea/.../desktop/sidecar/dist/...` even
+    // when both exist on the same machine. Otherwise the packaged
+    // .app launches with whatever stale dev binary the developer
+    // last built, which silently uses the wrong Clerk keys / wrong
+    // backend / wrong .env and the user sees a "Lost connection"
+    // banner with no obvious cause. We therefore prefer the
+    // bundle-relative locations first, and only fall back to the
+    // CARGO_MANIFEST_DIR-anchored dev tree (which only resolves on
+    // the original build machine) when no bundled binary exists.
     let candidates: Vec<(PathBuf, PathBuf)> = vec![
-        // Dev: anchored on CARGO_MANIFEST_DIR. Works from any cwd.
-        (
-            dev_desktop_root.join("sidecar").join("dist"),
-            dev_desktop_root.join("pi-runtime").join("vendor"),
-        ),
         // Bundled: Tauri's bundle.resources mapping puts `../sidecar/dist`
         // → `<resource_dir>/sidecar/dist` (and same for pi-runtime).
         (
@@ -123,6 +129,12 @@ fn resolve_paths(app: &AppHandle) -> Result<ResolvedPaths, SidecarError> {
         (
             resource_dir.join("_up_").join("sidecar").join("dist"),
             resource_dir.join("_up_").join("pi-runtime").join("vendor"),
+        ),
+        // Dev fallback: anchored on CARGO_MANIFEST_DIR. Only meaningful
+        // for `cargo tauri dev` runs straight out of the source tree.
+        (
+            dev_desktop_root.join("sidecar").join("dist"),
+            dev_desktop_root.join("pi-runtime").join("vendor"),
         ),
     ];
 
@@ -233,10 +245,65 @@ fn home_dir() -> Option<PathBuf> {
     }
 }
 
+/// Kill any orphan `pi-typst-sidecar` processes from prior runs of
+/// this app (or prior dev launches). Tauri's single-instance plugin
+/// already prevents two GUI processes from running simultaneously,
+/// but the *sidecar* can survive the GUI in three real-world cases:
+///
+///   1. The user force-quits Digi Setu from Activity Monitor /
+///      `kill -9` before the GUI can SIGTERM its sidecar.
+///   2. The Tauri process itself crashes (segfault, OOM) without
+///      running its `Drop` cleanup.
+///   3. The user installs a new build over a running app — the new
+///      .app launches but the old binary's sidecar is still listening
+///      on its loopback port and holding a Clerk session in memory.
+///
+/// In all three cases the next launch finds zombie sidecars eating
+/// ports and (worse) intercepting `127.0.0.1:<random>` traffic the
+/// new GUI thinks it's talking to. The user sees "Lost connection
+/// to backend" with no obvious cause.
+///
+/// Fix: at startup, before allocating a fresh port and spawning a
+/// new sidecar, sweep the process table for any executable named
+/// `pi-typst-sidecar` (including the platform suffix variants) and
+/// SIGKILL them. Cheap, idempotent, and matches what every other
+/// "single-process" desktop app does (Slack, Discord, VS Code all
+/// do this on boot).
+fn kill_orphan_sidecars() {
+    #[cfg(unix)]
+    {
+        // pgrep + kill -9 by name. We deliberately do NOT match the
+        // full path so this also clears dev-tree sidecars left over
+        // from `cargo tauri dev` runs on the developer's machine —
+        // they would otherwise outlive the dev process and confuse a
+        // subsequent packaged-app launch.
+        let _ = std::process::Command::new("pkill")
+            .arg("-9")
+            .arg("-f")
+            .arg("pi-typst-sidecar")
+            .status();
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .arg("/F")
+            .arg("/IM")
+            .arg("pi-typst-sidecar.exe")
+            .arg("/T")
+            .status();
+    }
+}
+
 pub async fn spawn_sidecar(
     app: &AppHandle,
 ) -> Result<(SidecarHandle, u16), SidecarError> {
     let paths = resolve_paths(app)?;
+
+    // Sweep zombie sidecars from prior crashed / force-quit launches
+    // BEFORE we pick a port — otherwise a stale sidecar could already
+    // be holding the port we'd hand to FastAPI, and the SPA would
+    // happily talk to the wrong (stale) process.
+    kill_orphan_sidecars();
 
     // Make sure data root exists before the sidecar tries to write
     // to it. Python's `mkdir(parents=True, exist_ok=True)` would
@@ -270,6 +337,15 @@ pub async fn spawn_sidecar(
         // This is the same flag the existing config.py (line 82) reads.
         .env("PI_MODE", "desktop")
         .env("PI_DATA_ROOT", &paths.data_root)
+        // Make sure the Python sidecar's _session_file_path() agrees
+        // with the Rust shell's secure_storage::data_root() about
+        // where to read/write `.session_id`. Both default to
+        // ~/.digi-setu but if the user (or our test rigs) override
+        // DIGI_SETU_HOME on the parent process we MUST forward it
+        // here — otherwise Rust writes /custom/.session_id and
+        // Python reads /home/.digi-setu/.session_id and SSO breaks
+        // silently.
+        .env("DIGI_SETU_HOME", &paths.data_root)
         // Force subprocess runtime — desktop never uses Docker.
         .env("PI_SESSION_RUNTIME", "subprocess")
         // Tell pi_session.py where the bundled Node + pi live so the
@@ -290,6 +366,36 @@ pub async fn spawn_sidecar(
         )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+
+    // Forward the build-time-baked Clerk + cloud-target env vars to
+    // the sidecar. Finder-launched .app processes do NOT inherit the
+    // user's shell env, so without this the sidecar would boot with
+    // empty Clerk creds and `auth_required = false` — the SPA would
+    // hide the sign-in button entirely. See build.rs for how these
+    // values get embedded at compile time. We only set the var when
+    // it has a non-empty value so the runtime config.py's normal
+    // resolution chain (shell-env > .env > unset) is preserved
+    // for any key we didn't bake in.
+    let baked = [
+        ("CLERK_PUBLISHABLE_KEY", env!("DIGI_SETU_CLERK_PUBLISHABLE_KEY")),
+        ("CLERK_SECRET_KEY", env!("DIGI_SETU_CLERK_SECRET_KEY")),
+        (
+            "CLERK_PUBLISHABLE_KEY_PROD",
+            env!("DIGI_SETU_CLERK_PUBLISHABLE_KEY_PROD"),
+        ),
+        (
+            "CLERK_SECRET_KEY_PROD",
+            env!("DIGI_SETU_CLERK_SECRET_KEY_PROD"),
+        ),
+        ("PI_CLOUD_API_BASE", env!("DIGI_SETU_PI_CLOUD_API_BASE")),
+        ("PI_RELAY_BASE", env!("DIGI_SETU_PI_RELAY_BASE")),
+        ("CLERK_TENANT", env!("DIGI_SETU_CLERK_TENANT")),
+    ];
+    for (key, value) in baked.iter() {
+        if !value.is_empty() {
+            cmd.env(key, value);
+        }
+    }
 
     // On Windows, hide the console window the child would otherwise
     // pop. Without this the user sees a flash of cmd.exe on every

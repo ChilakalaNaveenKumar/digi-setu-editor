@@ -1,0 +1,126 @@
+# syntax=docker/dockerfile:1.6
+#
+# Reproducible Linux build environment for Digi Setu desktop.
+#
+# Why a dedicated Dockerfile (vs `tauri-action`'s prebuilt image):
+#   - Our sidecar is PyInstaller-frozen; PyInstaller binaries are
+#     OS-specific. We need to build the sidecar in the SAME Linux
+#     userland we ship to so glibc / OpenSSL / etc. all match.
+#   - Tauri 2 needs the GTK3 + WebKit2GTK 4.1 dev headers, which the
+#     official rust:bullseye image doesn't carry.
+#   - Pinning to ubuntu:22.04 (jammy) gives a glibc 2.35 baseline.
+#     A .AppImage built here runs unmodified on every reasonably
+#     recent Linux desktop (Ubuntu 22.04+, Debian 12+, Fedora 36+,
+#     openSUSE Leap 15.5+).
+#
+# Build:
+#   docker build -f desktop/scripts/Dockerfile.linux-build \
+#       -t digi-setu/linux-builder:latest .
+#
+# Run via desktop/scripts/build-linux.sh — that script owns the
+# bind-mount + env-passing dance.
+
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PATH="/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+
+# System packages: split into compile-time vs runtime deps for clarity.
+# - build-essential / pkg-config: classic C toolchain Tauri+Rust needs
+# - libgtk-3-dev / libsoup-3.0-dev / libwebkit2gtk-4.1-dev:
+#     Tauri 2's webview backend on Linux
+# - libayatana-appindicator3-dev: tray-icon support (Tauri default)
+# - librsvg2-dev / xdg-utils: required by Tauri's bundler when it
+#     emits .desktop entries + svg icons
+# - libssl-dev / libffi-dev / zlib1g-dev: PyInstaller bootloader +
+#     Python C extensions
+# - desktop-file-utils + fakeroot + dpkg-dev: Tauri's .deb packager
+# - file + wget + curl + ca-certificates + git: misc fetchers
+# - python3.11 toolchain via deadsnakes (matches our Mac venv exactly,
+#     which keeps the frozen sidecar binary-compatible if a user
+#     unpacks the AppImage and inspects with strings)
+# - nodejs 22 via NodeSource (Tauri prefers >=18; we ship 22 in our
+#     vendored runtime so pin the build env to the same major).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl wget git file build-essential pkg-config \
+        libgtk-3-dev libsoup-3.0-dev libwebkit2gtk-4.1-dev \
+        libayatana-appindicator3-dev librsvg2-dev xdg-utils \
+        libssl-dev libffi-dev zlib1g-dev libsqlite3-dev libbz2-dev \
+        liblzma-dev libreadline-dev tk-dev libncurses-dev \
+        desktop-file-utils fakeroot dpkg-dev rpm \
+        software-properties-common gnupg lsb-release \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        python3.11 python3.11-venv python3.11-dev python3.11-distutils \
+    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rust toolchain pinned to stable; Tauri 2 needs >= 1.77.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --default-toolchain stable --profile minimal \
+    && /root/.cargo/bin/rustup target add x86_64-unknown-linux-gnu
+
+# Tauri's AppImage path needs `appimagetool` AND `linuxdeploy`. Both
+# ship as AppImages, which need FUSE — and Docker containers don't
+# have `/dev/fuse` by default. The standard workaround is the
+# `--appimage-extract-and-run` flag (or the equivalent
+# `APPIMAGE_EXTRACT_AND_RUN=1` env var), which makes the AppImage
+# self-extract to a tmpdir and exec from there. Tauri's bundler
+# spawns these tools as plain `./linuxdeploy.AppImage args…` though,
+# so just exporting the env var isn't enough — we have to give
+# linuxdeploy a wrapper that knows to extract first.
+#
+# We extract once at image-build time, install the AppDir-style payload
+# under /opt/linux-tools, and drop a tiny shim into /usr/local/bin
+# that Tauri can exec. Same idea for appimagetool. This keeps the
+# desktop release reproducible (FUSE-free) and avoids `--privileged`
+# / `--cap-add SYS_ADMIN` (which would weaken container isolation).
+RUN mkdir -p /opt/linux-tools && cd /opt/linux-tools \
+    && wget -q https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage \
+    && wget -q https://github.com/tauri-apps/binary-releases/releases/download/linuxdeploy/linuxdeploy-x86_64.AppImage \
+    && wget -q https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/continuous/linuxdeploy-plugin-appimage-x86_64.AppImage \
+    && chmod +x *.AppImage \
+    && for f in appimagetool linuxdeploy linuxdeploy-plugin-appimage; do \
+         mkdir -p $f.dir && cd $f.dir && \
+         ../$f-x86_64.AppImage --appimage-extract >/dev/null && \
+         cd ..; \
+       done \
+    && ln -sf /usr/bin/python3.11 /usr/local/bin/python3 \
+    && ln -sf /usr/bin/python3.11 /usr/local/bin/python
+
+# Each shim has to be its own RUN because Dockerfile heredocs only
+# work as the body of a single RUN, not chained with `&&`.
+RUN printf '%s\n' \
+        '#!/bin/sh' \
+        'exec /opt/linux-tools/appimagetool.dir/squashfs-root/AppRun "$@"' \
+        > /usr/local/bin/appimagetool \
+    && chmod +x /usr/local/bin/appimagetool
+
+RUN printf '%s\n' \
+        '#!/bin/sh' \
+        '# linuxdeploy looks for plugins on PATH; the appimage plugin' \
+        '# shim below is on /usr/local/bin so discovery just works.' \
+        'exec /opt/linux-tools/linuxdeploy.dir/squashfs-root/AppRun "$@"' \
+        > /usr/local/bin/linuxdeploy \
+    && chmod +x /usr/local/bin/linuxdeploy
+
+RUN printf '%s\n' \
+        '#!/bin/sh' \
+        'exec /opt/linux-tools/linuxdeploy-plugin-appimage.dir/squashfs-root/AppRun "$@"' \
+        > /usr/local/bin/linuxdeploy-plugin-appimage \
+    && chmod +x /usr/local/bin/linuxdeploy-plugin-appimage
+
+# Make the workspace bind-mount the default cwd. The build-linux.sh
+# wrapper mounts the repo at /workspace and invokes
+# `bash /workspace/desktop/scripts/build-linux-inside.sh` as the
+# container entrypoint.
+WORKDIR /workspace
+
+# Smoke-check that the toolchain is wired up so failures show up at
+# `docker build` time, not 20 minutes into a release.
+RUN node --version && npm --version && python3 --version \
+    && rustc --version && cargo --version

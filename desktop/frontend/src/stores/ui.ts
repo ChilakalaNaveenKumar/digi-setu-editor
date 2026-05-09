@@ -8,12 +8,48 @@
 import { defineStore } from "pinia";
 import { ref } from "vue";
 
+import { i18n } from "../i18n";
+import { ApiError } from "../api/client";
+
 export type ToastKind = "info" | "success" | "error";
 
 export interface ToastEntry {
   id: string;
   message: string;
   kind: ToastKind;
+}
+
+/**
+ * Translate an HTTP-layer failure into a user-friendly message.
+ *
+ * Plain `${prefix}: ${exc.message}` leaks the FastAPI `detail` string
+ * straight to the UI ("not signed in", "permission denied", "503
+ * Service Unavailable"). Worse, we used to also feed those strings
+ * through the AI-provider error classifier, which would then label a
+ * 503 from the local sidecar as "The AI service is overloaded right
+ * now" — flat-out wrong.
+ *
+ * This helper centralises the mapping. Callers like
+ * ``stores/workspace.ts`` get ONE consistent translation so 401/403/
+ * 5xx surfaces the same in every screen, and the raw detail string
+ * is preserved as a fallback for unknown statuses.
+ */
+function _httpErrorMessage(exc: unknown): string {
+  const t = i18n.global.t.bind(i18n.global);
+  if (exc instanceof ApiError) {
+    if (exc.status === 401) return t("toast.notSignedIn");
+    if (exc.status === 403) return t("toast.permissionDenied");
+    if (exc.status === 404) return t("toast.notFound");
+    if (exc.status === 408 || exc.status === 504) return t("toast.timeout");
+    if (exc.status === 429) return t("toast.tooManyRequests");
+    // 5xx from our own sidecar / cloud — never call this an "AI
+    // provider overload" because it isn't necessarily about an LLM.
+    if (exc.status >= 500 && exc.status < 600) return t("toast.serverError");
+    if (exc.message) return exc.message;
+    return t("toast.requestFailed");
+  }
+  if (exc instanceof Error && exc.message) return exc.message;
+  return String(exc) || t("toast.requestFailed");
 }
 
 export interface ConfirmSpec {
@@ -43,7 +79,7 @@ export const useUiStore = defineStore("ui", () => {
   }
 
   function toastError(prefix: string, exc: unknown): void {
-    const msg = exc instanceof Error ? exc.message : String(exc);
+    const msg = _httpErrorMessage(exc);
     toast({ message: `${prefix}: ${msg}`, kind: "error" });
   }
 

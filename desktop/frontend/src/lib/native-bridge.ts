@@ -120,7 +120,7 @@ export type DeepLinkPayload = { url: string };
 export type DeepLinkHandler = (payload: DeepLinkPayload) => void;
 
 /**
- * Subscribe to `pi-typst-test://` and `digi-setu://` deep-link URLs
+ * Subscribe to `digi-setu://` deep-link URLs
  * the OS hands us when the user finishes an OAuth/Stripe flow in
  * their browser. Returns an unsubscribe function.
  *

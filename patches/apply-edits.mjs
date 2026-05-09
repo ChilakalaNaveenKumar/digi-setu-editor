@@ -362,7 +362,7 @@ function isValidThoughtSignature(signature) {
         return false;
     return base64SignaturePattern.test(signature);
 }`,
-    `// Patched (pi-typst-test/patches): thought_signature is an opaque string
+    `// Patched (digi-setu/patches): thought_signature is an opaque string
 // token per Vertex docs. Validating it as standard base64 silently drops
 // signatures from Google's own response, breaking Gemini 3 function calling.
 // Trust whatever the SDK returned.
@@ -394,7 +394,7 @@ function isValidThoughtSignature(signature) {
                     parts.push(part);
                 }`,
     `                else if (block.type === "toolCall") {
-                    // Patched (pi-typst-test/patches): Gemini 3 returns 400 on a
+                    // Patched (digi-setu/patches): Gemini 3 returns 400 on a
                     // functionCall replay without thought_signature. Use the
                     // documented escape hatch for cross-model history; otherwise
                     // pass through the captured signature as-is.
@@ -433,7 +433,7 @@ function isValidThoughtSignature(signature) {
                     const toolCall = block;
                     let normalizedToolCall = toolCall;
                     if (!isSameModel && toolCall.thoughtSignature) {
-                        // Patched (pi-typst-test/patches): Gemini 3 rejects
+                        // Patched (digi-setu/patches): Gemini 3 rejects
                         // function-call replays without thought_signature. When
                         // transferring history from a different model, use the
                         // documented escape hatch instead of silently stripping.
@@ -459,7 +459,7 @@ function resolveThoughtSignature(isSameProviderAndModel, signature) {
     `/**
  * Only keep signatures from the same provider/model.
  *
- * Patched (pi-typst-test/patches): emit a one-line trace so operators can
+ * Patched (digi-setu/patches): emit a one-line trace so operators can
  * audit why a signature got dropped. Quiet by default; gate on
  * PI_VERTEX_GEMINI_DEBUG=1 to avoid spamming production logs.
  */

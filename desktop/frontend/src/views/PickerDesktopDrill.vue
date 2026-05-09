@@ -33,7 +33,7 @@ async function resolve(): Promise<void> {
     if (!ws.workspaces.length) await ws.refresh();
     const found = ws.workspaces.find((w) => w.id === props.wsid);
     if (!found) {
-      router.replace({ name: "picker" });
+      router.replace({ name: "sessions" });
       return;
     }
 
@@ -57,17 +57,17 @@ onMounted(resolve);
 
 <template>
   <div class="flex h-full w-full items-center justify-center bg-background text-foreground">
-    <div v-if="!error" class="flex items-center gap-2 text-sm text-muted-foreground">
+    <div v-if="!error" class="flex items-center gap-2 text-lead text-muted-foreground">
       <Icon icon="codicon:loading" class="h-4 w-4 animate-spin" />
       Opening workspace…
     </div>
-    <div v-else class="max-w-sm rounded-md border border-destructive/40 bg-destructive/10 p-4 text-sm text-destructive">
+    <div v-else class="max-w-sm rounded-md border border-destructive/40 bg-destructive/10 p-4 text-lead text-destructive">
       <div class="font-medium">Could not open workspace</div>
-      <div class="mt-1 text-xs opacity-80">{{ error }}</div>
+      <div class="mt-1 text-body opacity-80">{{ error }}</div>
       <button
         type="button"
-        class="mt-3 rounded-md border border-border bg-card px-3 py-1 text-xs text-foreground hover:border-primary/40"
-        @click="router.replace({ name: 'picker' })"
+        class="mt-3 rounded-md border border-border bg-card px-3 py-1 text-body text-foreground hover:border-primary/40"
+        @click="router.replace({ name: 'sessions' })"
       >
         Back to home
       </button>

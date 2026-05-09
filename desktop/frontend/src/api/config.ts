@@ -24,6 +24,14 @@ export interface ServerConfig {
    * the SPA's "using your own key" chip can show what's wired up.
    */
   byok_keys?: string[];
+  /**
+   * Desktop only: true when the user has neither a cached Clerk
+   * session NOR any BYOK keys. The router gate forces every
+   * protected route to /login (Welcome screen) until one of those
+   * is satisfied. Web mode never sets this flag — auth_required
+   * already covers it there.
+   */
+  requires_setup?: boolean;
 }
 
 export function getConfig(): Promise<ServerConfig> {

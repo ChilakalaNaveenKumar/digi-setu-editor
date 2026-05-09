@@ -286,7 +286,7 @@ def _scrub_env_for_subprocess(full_env: dict[str, str]) -> dict[str, str]:
 
 def _load_env_sh() -> dict[str, str]:
     """
-    Source pi-typst-test/scripts/env.sh in a child shell and capture the
+    Source digi-setu's scripts/env.sh in a child shell and capture the
     resulting environment. Used by the subprocess runtime to inherit the
     operator's interactive defaults. The docker runtime ignores this
     (the container has its own baked-in defaults).
@@ -410,7 +410,7 @@ class PiSession:
         provider: Optional[str] = None,
         model: Optional[str] = None,
         session_dir: Optional[Path] = None,
-        permission_mode: str = "approve_risky",
+        permission_mode: str = "ask",
         permission_mode_file: Optional[Path] = None,
         user_id: Optional[str] = None,
     ):
@@ -437,16 +437,24 @@ class PiSession:
         self._provider = provider or full_env.get("PI_PROVIDER", "anthropic-vertex")
         self._model = model or full_env.get("PI_MODEL", "claude-sonnet-4-6")
 
-        mode = (permission_mode or "approve_risky").strip().lower()
-        if mode not in {"auto", "approve_risky", "approve_all"}:
-            mode = "approve_risky"
-        self._permission_mode = mode
+        # Accept canonical IDs (auto / ask / cautious) AND legacy
+        # aliases (approve_risky / approve_all) so a stale spawn from
+        # an older client doesn't blow up; user_prefs.normalize_-
+        # permission_mode is the single source of truth for the mapping.
+        try:
+            from services.user_prefs import normalize_permission_mode  # local import to avoid cycle
+        except Exception:  # noqa: BLE001
+            normalize_permission_mode = None  # type: ignore[assignment]
+        cleaned: Optional[str] = None
+        if normalize_permission_mode is not None:
+            cleaned = normalize_permission_mode(permission_mode or "")
+        self._permission_mode = cleaned or "ask"
 
         # Materialise the permission_mode_file with mode 0644 so the
         # container's sandbox uid (1000) can read it via the bind mount.
-        # The mode token itself ("auto" / "approve_risky" / "approve_all")
-        # is not a secret — it's a UI preference — so widening read perms
-        # does not leak anything sensitive.
+        # The mode token itself ("auto" / "ask" / "cautious") is not a
+        # secret — it's a UI preference — so widening read perms does
+        # not leak anything sensitive.
         self._permission_mode_file_host: Optional[Path] = None
         if permission_mode_file is not None:
             try:
@@ -747,14 +755,27 @@ class PiSession:
             # `node <pi-shim>` to avoid relying on the shebang (which
             # points at /usr/bin/env node — fine on Mac, fails inside
             # a sandboxed app bundle on Win).
-            # The package's `bin` field points at `dist/cli.js`, which
-            # is what `node_modules/.bin/pi` symlinks to. We invoke
-            # that file directly because the symlink doesn't survive a
-            # Tauri bundle copy on Windows (NTFS junction limitations
-            # vs the npm-created reparse point).
-            _pi_shim = _pi_dir / "node_modules" / "@mariozechner" / "pi-coding-agent" / "dist" / "cli.js"
+            _pi_pkg = _pi_dir / "node_modules" / "@mariozechner" / "pi-coding-agent"
+            _pi_shim = _pi_pkg / "dist" / "cli.js"
+            # Our project's typst-tools extension stays — it's the
+            # search_docs / list_fonts / list_packages surface, not a
+            # safety hook. Safety on desktop is delegated to upstream
+            # pi extensions (see below); we no longer ship a custom
+            # permission interceptor.
             _ext_typst = _vendor_root / "extensions" / "typst-tools.ts"
-            _ext_perm = _vendor_root / "extensions" / "permission.ts"
+            # Upstream pi safety extensions (shipped under
+            # examples/extensions/ inside pi-coding-agent itself).
+            #   protected-paths.ts → blocks write/edit to .env / .git/ /
+            #     node_modules/ — keeps the model from corrupting repos
+            #     and overwriting secrets.
+            #   permission-gate.ts → prompts the user before running
+            #     `rm -rf`, `sudo`, `chmod/chown 777`. Pi's RPC UI shim
+            #     surfaces the prompt to the SPA.
+            # The Python-side host policy (services/policy.py) still
+            # blocks genuinely-malicious bash patterns (cloud metadata
+            # IPs, miners, …) before they reach pi at all.
+            _ext_protected = _pi_pkg / "examples" / "extensions" / "protected-paths.ts"
+            _ext_perm_gate = _pi_pkg / "examples" / "extensions" / "permission-gate.ts"
             cmd = [
                 desktop_node,
                 str(_pi_shim),
@@ -765,8 +786,30 @@ class PiSession:
             ]
             if _ext_typst.exists():
                 cmd += ["--extension", str(_ext_typst)]
-            if _ext_perm.exists():
-                cmd += ["--extension", str(_ext_perm)]
+            if _ext_protected.exists():
+                cmd += ["--extension", str(_ext_protected)]
+            if _ext_perm_gate.exists():
+                cmd += ["--extension", str(_ext_perm_gate)]
+            # Append the desktop-mode system prompt so the model knows
+            # it's on the user's actual machine (no container, no
+            # allow-list) and which paths to leave alone by default.
+            # Lives under desktop/backend/.pi/ in source mode; the
+            # PyInstaller spec stages it at <MEIPASS>/.pi/ inside the
+            # frozen binary.
+            if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+                _append_md = _Path(sys._MEIPASS) / ".pi" / "APPEND_SYSTEM.md"
+            else:
+                _append_md = _Path(__file__).resolve().parent.parent / ".pi" / "APPEND_SYSTEM.md"
+            if _append_md.exists():
+                try:
+                    _prompt_text = _append_md.read_text(encoding="utf-8")
+                    if _prompt_text.strip():
+                        cmd += ["--append-system-prompt", _prompt_text]
+                except OSError as exc:
+                    print(
+                        f"[pi_session {self.session_id}] could not read APPEND_SYSTEM.md: {exc}",
+                        file=sys.stderr,
+                    )
             # NODE_PATH lets jiti / require resolve the extensions'
             # deps (@google/genai, typebox, …) which live next to the
             # bundled pi install, not in the user's picked folder.

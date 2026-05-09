@@ -22,6 +22,10 @@ export const useConfigStore = defineStore("config", () => {
   // pay the AI provider directly, our subscription is irrelevant).
   const byokMode = ref(false);
   const byokKeys = ref<string[]>([]);
+  // Desktop only: backend says "neither Clerk session nor BYOK keys
+  // configured — every route must redirect to /login until the user
+  // does one of the two." See router.ts and Login.vue for the UX.
+  const requiresSetup = ref(false);
   const ready = ref(false);
 
   async function refresh(): Promise<void> {
@@ -32,6 +36,7 @@ export const useConfigStore = defineStore("config", () => {
       clerkPublishableKey.value = cfg.clerk_publishable_key || "";
       byokMode.value = !!cfg.byok_mode;
       byokKeys.value = Array.isArray(cfg.byok_keys) ? cfg.byok_keys : [];
+      requiresSetup.value = !!cfg.requires_setup;
     } catch (exc) {
       console.warn("[config] failed to fetch deploy config", exc);
     } finally {
@@ -45,6 +50,7 @@ export const useConfigStore = defineStore("config", () => {
     clerkPublishableKey,
     byokMode,
     byokKeys,
+    requiresSetup,
     ready,
     refresh,
   };

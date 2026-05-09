@@ -8,6 +8,9 @@
 import { defineStore } from "pinia";
 import { ref } from "vue";
 
+import { i18n } from "../i18n";
+import { categorizeProviderError } from "../lib/event-router";
+
 export type ToastKind = "info" | "success" | "error";
 
 export interface ToastEntry {
@@ -42,9 +45,36 @@ export const useUiStore = defineStore("ui", () => {
     if (idx >= 0) toasts.value.splice(idx, 1);
   }
 
+  /**
+   * Show a user-facing error toast WITHOUT leaking raw exception
+   * text. The raw exception is logged to the console so we can still
+   * diagnose issues; the toast only ever shows:
+   *
+   *   <prefix> — <localised friendly sentence>
+   *
+   * `prefix` is the operation context the caller already provides as
+   * a human sentence (e.g. "Failed to delete file"). The friendly
+   * second half is derived by classifying the exception against the
+   * same provider-error catalog the chat uses, so a fetch 503 becomes
+   * "The service is overloaded right now…" and a stack trace becomes
+   * "Something went wrong. Please try again."
+   *
+   * NEVER use `${prefix}: ${exc.message}` — random callers can pass
+   * us anything (DOM exceptions, fetch errors, HTTP status blobs)
+   * and we don't want them rendered to end users.
+   */
   function toastError(prefix: string, exc: unknown): void {
-    const msg = exc instanceof Error ? exc.message : String(exc);
-    toast({ message: `${prefix}: ${msg}`, kind: "error" });
+    const raw = exc instanceof Error ? exc.message : String(exc ?? "");
+    if (raw) {
+      // eslint-disable-next-line no-console
+      console.warn(`[ui.toastError] ${prefix} (raw, suppressed in UI):`, exc);
+    }
+    const { code } = categorizeProviderError(raw);
+    const key = `errors.${code}`;
+    const friendly = i18n.global.te(key)
+      ? (i18n.global.t(key) as string)
+      : (i18n.global.t("errors.internal") as string);
+    toast({ message: `${prefix} — ${friendly}`, kind: "error" });
   }
 
   function confirm(spec: ConfirmSpec): Promise<boolean> {

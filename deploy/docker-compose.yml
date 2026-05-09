@@ -84,7 +84,7 @@ services:
       CLERK_SECRET_KEY: ${CLERK_SECRET_KEY:-}
       CLERK_WEBHOOK_SECRET: ${CLERK_WEBHOOK_SECRET:-}
       OAUTH_REDIRECT_BASE: ${OAUTH_REDIRECT_BASE:-https://digi-setu.com}
-      FEEDBACK_EMAIL_TO: ${FEEDBACK_EMAIL_TO:-nchilaka@digi-setu.com}
+      FEEDBACK_EMAIL_TO: ${FEEDBACK_EMAIL_TO:-support@digi-setu.com}
 
       # Rate-limit overrides. Empty = use defaults from
       # backend/services/rate_limit.py. See stack.env.example for the
@@ -277,6 +277,11 @@ services:
       # Static SPA build — produced by scripts/remote-deploy.sh and
       # streamed to /srv/pi/www on the VM.
       - /srv/pi/www:/srv/pi/www:ro
+      # Public installer artefacts (.dmg / .pkg / .zip). The operator
+      # uploads new releases here via scripts/upload-installer.sh; the
+      # /downloads/* handler in Caddyfile serves them. Read-only mount
+      # — Caddy never writes here.
+      - /srv/pi/downloads:/srv/pi/downloads:ro
       - /srv/caddy/data:/data
       - /srv/caddy/config:/config
     depends_on:

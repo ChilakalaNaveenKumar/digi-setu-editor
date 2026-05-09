@@ -1,0 +1,372 @@
+# 0.5.0
+- **BREAKING** The default matrix changed to id (#967)
+- Fixed a coordinate rounding issue when placing `angle` elements (#968)
+- Added a new `content.wrap` style key that takes a function to wrap content in, useful for applying Typst styling, such as text color (#964)
+- Fixed a division by zero bug when shortening paths to zero length (#962)
+- The content element now supports the `wrap:` style to apply a function to they Typst content (e.g. applying text attributes) (#964)
+- The PDF API-Reference is back: manual.pdf (#974)
+- All docstrings are now written in Typst (#974)
+- Custom marks now support dedicated `reverse-tip`, `-base` and `-center`
+  anchors (#1003)
+- The `register-mark` function now supports passing anchor coordinates (#1003)
+- Fixed mark elements inheriting element styles (#1008)
+- **BREAKING** The `ortho` element no longer accepts a `name:` argument but
+  leaks elements (like `scope` does) (#1004)
+- Fixed a bug that prevented the leakage of elements of `scope` elements inside
+  a `group` (#930)
+- Added a new element `svg-path` that accepts a subset of SVG
+  commands to construct paths
+- Fixed a bug with `brace` and `flip: true` (#1017)
+- Added a new `transform` function that multiplies a given transformation matrix with the current one (#1019)
+- **BREAKING** Renamed `on-yz` to `on-zy` (#1020)
+- New `perspective` element for perspective division
+  There is a known issue with intersections of perspective elements
+  outsides the `perspective` environment! (#1033)
+- Fixed a bug when passing a coordinate to the `angle:` argument of
+  `content` and a transformation matrix ≠ id
+- Fixed a bug with cetz creating invalid stroke objects for `stroke: none` (#1059)
+- Increased the rounding digits from 8 to 10, fixing some rounding bugs
+  with `ortho`
+- Added a `flatten: (bool)` argument to `ortho`, that allows setting all z
+  components to zero
+- Placing marks on a path bypasses custom coordinate resolvers (#1070).
+- Fixed multilevel style roots (#1072)
+- Content elements now (correctly) support path- and border-anchors (#1073)
+- **BREAKING** The `draw-edge` and `draw-node` callback signatures changed (#979)
+- The tree node-group prefix is now configurable (#979)
+
+# 0.4.2
+- The `tree` element now has a `anchor:` argument to position the tree (#929)
+- Fixed the tree node anchor documentation. (#929)
+- Fixed named element access inside `compound-path` (#938)
+- Added a new `curved-stealth` (short `)>`) mark (#941)
+- Added the shortcut `>>` for the `stealth` mark (#941)
+- Fixed a division by zero bug when placing marks on zero-length paths (#936)
+- Added `"near"` and `"far"` directions to the `angle` API (#945)
+- Added missing `register-mark` and `register-coordinate-resolver` API to the docs (#932)
+- Fixed element access inside `compound-path` (#932)
+- The `tangent` coordinate now supports ellipses (#925)
+- Grid lines now correctly connect at the corners (#921)
+- Grid now supports a `shift: (x, y)` argument to offset grid-lines.
+- The styling algorithm now folds strokes (#923)
+- Fixed path decoration styling (#947)
+- Fixed path shortening (#948)
+- The `merge-path` element now support `mark:`; by default,
+  marks of the source elements get removed (#922, #948)
+- The `intersections` element ignores mark shapes by default (see `ignore-marks:`) (#948)
+- Added a new `(project: <coordinate>, onto: (<coordinate>, <coordinate>))` 
+  coordinate for projecting a point onto a line (short form: `(pt, "_|_", a, b)`)
+- Debug shapes (bounding boxes) are ignored by `merge-path` (#575)
+- **BREAKING** The `n-star` element now takes the inner radius as a separate style key `inner-radius` (ratio or number) (#920)
+- Fixed an issue with multiline text and baseline anchors in `content` (#956)
+
+# 0.4.1
+- Added a `n-star` shape for drawing n-pointed stars
+- Added `breakable: false` to the `block` element of the canvas
+- A new tree layout algorithm, implemented by @MichaelGoodale in Rust, can handle differently sized tree nodes
+- **BREAKING** The `tree` callback for drawing nodes does not pass the parent node's name anymore (new signature is `(node) => elements`)
+- **BREAKING** The `parent-position` argument of `tree` got removed
+- Tree nodes now support anchors: custom anchors from the `draw-node` callback
+  are accessible (#904)
+- `styles.resolve` now supports nested roots by passing an array (#914)
+- Fixed debug frames (#917)
+- Fixed a regression with `merge-path`'s `close:` argument (#910)
+
+# 0.4.0
+- Fixed a bug where passing a length as a radius to a polygon resulted in an error
+- Added `ctx.shared-state`, a context field to share canvas-global state
+- **BREAKING** Removed the `flex` attribute for marks (default to `true`)
+- Changed the internal path model to support multiple subpaths
+- Braces are now drawn tapered by default (#828)
+- Brace styling changed; see the documentation of `decorations.brace`
+- **BREAKING** Removed support for using ratios as canvas lengths. To get back the removed behavior, wrap your canvas in a `layout(ly => canvas(length: ly.width * <ratio>, ...))`
+- Added support for specifying a baseline offset via `canvas(baseline: <coordinate>, ...)`. The canvas switches to an inline `box` as the top-level element if set
+- Added support for passing a stroke style to the canvas top-level element; see `canvas(stroke: <stroke>, ...)`
+- Added support for user-defined coordinate systems. See `register-coordinate-resolver(<callback>)`
+- The default style value for `mark.transform-shape` changed to `false`
+- Harpoon marks changed sides (on a line from (0, 0) to (1, 0), the end mark now appears on the left side/top)
+
+# 0.3.4
+- Fixed a bug with rendering curves with Typst 0.13.1
+
+# 0.3.3
+- Circle supports two-point construction, using the distance as the radius
+- Require Typst 0.13.0, port test cases over to Tytanic
+- Add note about contents `auto-scale` feature
+- Various performance improvements
+- Make use of the new `curve` API
+- **BREAKING** Matrix `ident` function signature changed
+- New `matrix.diag` function
+- Added a `background` to the context, set to the canvas background
+- Fixed mark styling issues with empty or incomplete style dictionaries
+- Fixed a division by zero bug when trying to calculate some intersections
+
+# 0.3.2
+
+- Added a new `polygon` element for drawing regular polygons
+- Closed lines now have a default anchor
+- You can now sort `intersections`
+- Added back the invisible default frame for `content`
+- Fixed some type checks using strings
+- Fixed some angle library bugs
+- Fixed `bezier-through` calculation
+- Fixed `tree` node/edge order
+- Support variable decoration amplitude
+- Fixed `hobby` default omega value
+- Fixed `flat-brace` missing `fill`
+- Added canvas content scaling via style key `auto-scale`
+
+# 0.3.1
+
+CeTZ 0.3.1 requires Typst 0.12.0.
+
+- Added a new `padding` parameter to the canvas element.
+- Some elements now support Typst 0.12.0 `fill-rule` style.
+- Fixed an issue with reversed marks and `anchor: "center"`. 
+
+# 0.3.0
+
+CeTZ 0.3.0 requires Typst 0.11.0.
+The license changed from Apache-2.0 to LGPLv3.
+
+CeTZ' plotting and charting functionality has been moved to a separate 
+package called `cetz-plot`.
+
+## Canvas
+- Add runtime cetz version check support (see `assert-version`).
+- Fixed a bug with `#set place(float: true)` affecting the canvas.
+- Transformation matrices are now rounded.
+- The default coordinate system changed to a right-hand side system.
+  Use `scale(z: -1)` if you want to change back to a left-hand system.
+- The `on-<axes>` functions lead to wrong anchors and got fixed. The offset
+  argument is now behaving as translation instead of hard setting the coordinate!
+- A new `scope(...)` element got added that behaves like an unnamed group, but
+  leaking child elements to the outside. This element can be used for scoping
+  transformations, without having to scope children under a group name.
+- The center anchor of `content()` with two coordinates got fixed when using
+  negative coordinates.
+- Element names are now checked to not contain a "." character.
+- Fixed intersection bug for content with `anchor:` set.
+- **BREAKING** The winding order of _all_ elements has been changed to CCW.
+- You can now add custom marks via `register-mark`.
+- Mark anchor (tip, base, center) calculation got fixed.
+- Content border anchors for `text` now default to the text's bounds.
+- Content emits new anchors for accessing the baseline of the content.
+
+## Draw
+- Added the `floating` function for drawing elements without affecting bounding boxes.
+- The `ortho` function gained a `sorted` and `cull-face` argument to enable
+  depth ordering and face culling of drawables. Ordering is enabled by default.
+- Closed `line` and `merge-path` elements now have a `"centroid"` anchor that
+  is the calculated centroid of the (non self-intersecting!) shape.
+
+## Marks
+- Added support for the mark `anchor` style key, to adjust mark placement and
+  allow for centered marks.
+
+## Plot
+- **BREAKING** The plot library has been moved out of cetz.
+- Added support for automatically adding axis breaks (sawtooth lines) by setting the `break`
+  attribute of an axis to `true`.
+- Added a new error bar function: `add-errorbar`
+- Added error bar support to the `add-bar` function
+- Improved the performance & memory consumption of the clipping algorithm
+- **BREAKING** Legend anchors got renamed and do not use the legend prefix anymore
+
+## Chart
+- **BREAKING** The chart library has been moved out of cetz
+- Added error bar support for bar- and columncharts
+- Piecharts now support a legend (see `legend.label` style)
+- **BREAKING** Legend anchors got renamed and do not use the legend prefix anymore
+
+## Anchors
+- `copy-anchors` no longer requires copied anchors to have a default, allowing the copying of an element's anchors from a group as expected.
+
+## Util
+- `apply-transform` now allows passing a function that takes and returns a vector, instead of a transformation matrix.
+- Fixed matrix-vector multiplication.
+
+# 0.2.2
+
+## Anchors
+- Support for accessing anchors within groups.
+- Support string shorthand for path and border anchors.
+
+## 3D
+- CeTZ gained some helper functions for drawing 3D figures in orthographic projection: `ortho`, `on-xy`, `on-xz` and `on-yz`.
+
+## Plot
+- New axes style key `tick.label.show` to force showing tick labels on mirrored axes.
+- Axes tick format can now be set to `none` or content, without defaulting to floating point ticks.
+
+## Fixes
+- Fixed piechart styles when using `clockwise: true`.
+- Fixed `decorations.flat-brace` vertical positioning
+- Fixed drawing of mirrored plot axis ticks.
+- Fixed plots with only annotations.
+- Added matrix rounding to fix rounding errors when using lots of transforms
+
+# 0.2.1
+
+## Anchors
+- Changing a group's "center" anchor now affects how border anchors are calculated.
+- Allowed changing of the default anchor for groups.
+- Re-added "a", "b", and "c" anchors for `circle-through`
+- Open arcs are no longer modified for anchors, invalid border anchors will panic.
+- Grids now actually support border anchors.
+
+## Marks
+- Marks can now be placed on a path after that path got transformed. See the new `transform-shape` style key.
+
+## Misc
+- The `hide` function now supports an additional `bounds:` parameter to enable canvas bounds adjustment for hidden elements
+- The default transformation matrix changed
+
+## Charts
+- Default pie chart rotation changed from counterclockwise to clockwise
+- Default pie chart start/stop angles changed so that the first item
+  starts at 90° (ccw)
+
+## Libs
+### Plot
+- The default style of plots changed
+- New style keys for enabling/disabling the shared zero tick for `"school-book"` style plots
+- New style keys for specifying the layer of different plot elements (`grid-layer`, `axis-layer`, `background-layer`)
+- Fixed annotation bounds calculation
+- Marks inside annotations are now unaffected by the plot's canvas scaling by default (see marks new post-transform style key)
+
+# 0.2.0
+CeTZ 0.2.0 requires Typst 0.10.0
+
+## Libs
+### Draw
+- **BREAKING** Default anchors are now using TikZ like compass names: north, south, east, west, north-west, north-east, south-west and south-east
+- **BREAKING** Element anchors have changed! See the documentation for details.
+- **BREAKING** Rotation direction changed to CCW
+- **BREAKING** Removed the `shadow` function
+- **BREAKING** Changed the behaviour of `mark`
+- **BREAKING** Changed the behaviour of `translate` by changing the transformation order, changed arguments of `scale` and `translate`
+- **BREAKING** LERP coordinates now use ratio instead of float for relative interpolation.
+- **BREAKING** Removed `place-marks` and `place-anchors` functions, use the new mark `pos:` attribute and path anchors `(name: <element>, anchor: <number, ratio>)` instead.
+- Content padding has been improved to be configurable per side
+- Groups support same padding options as content
+- Overhauled marks, see manual for the new mark symbols, placement- and styling options
+- Fixed and improved intersection calculation
+- Fixed and improved the styling algorithm
+- Catmull-Rom curves, Hobby curves and arcs now can have marks
+- Line elements now use border intersection coordinates if first and/or last coordinate is an element name with a "default" anchor
+- Added element `arc-through` to draw an arc through three points
+- Added Hobby curves (`hobby`) in addition to catmull (thanks to @Enivex)
+- Added `radius` style to `rect` for drawing rounded rects
+- Added `hide` function for hiding elements
+- Added distance, ratio and angle anchors to elements
+
+### Plot
+- Added `plot.add-contour(..)` for plotting contour plots
+- Added `plot.add-hline(..)` and `plot.add-vline(..)` for plotting h/v lines
+- Added `plot.add-between(..)` for filling the area between two line plots
+- Added `plot.add-boxwhisker(..)` for displaying boxwhisker plots (thanks to @JamesxX)
+- Added `fill-type` option to `plot.add(..)` for specifying a fill type (axis or shape)
+- Changed default samples from 100 to 50!
+- Fixed plot filling in some cases
+- Axes can now be locked (equal) to keep aspect ratio
+- Axes can be reversed by setting min > max
+- Axis orientation can be changed, enabling rotation of plots
+- Plots now support legends!
+
+### Chart
+- Added `piechart` for drawing pie- and donut charts
+- Added `boxwhisker` for drawing boxwhisker charts
+
+### Decorations
+- New path decorations `zigzag`, `wave` and `coil`
+
+# 0.1.2
+CeTZ requires Typst 0.8.0.
+
+## Draw
+- New `on-layer(layer, body)` function for drawing with a given layer/z-index
+- New `catmull(..)` function for drawing catmull-rom curves
+- Changed default anchors of circles and arcs to anchors on the elliptical path
+- Added style option to specify triangle mark angle
+- Fixed rect anchors if coordinates were swapped
+- Fixed bezier extrema/aabb calculation
+- Fixed bug with `content` and `intersections`
+- Fixed automatic mark offset for lines
+- Fixed problems with style inheritance
+
+## Libs
+### Plot
+- Added `sample-at: (..)` option to `plot.add(..)` for specifying extra sample points
+- Added `line: <linear|spline|vh|hv|vhv>` support
+- The plot lib tries to linearize data to reduce draw calls
+- Fixed custom tick plot formatting
+- Allow plots without data
+
+### Decorations
+- New decoration library by @RubixDev for drawing braces
+
+# 0.1.1
+## Libs
+### Angle
+- New `angle` library for drawing angles
+
+### Axes
+- Support tick label rotation
+- Support negative tick mark direction
+
+## Draw
+- Fixed `arc` with negative delta
+- Fixed division by 0 error when calculating bezier extremas
+- Added `mark: (..)` support for `bezier` and `bezier-through`
+- Changed `content` to allow for a second coordinate to span content between
+- Added `content: (frame: "rect"|"circle")` style for drawing a frame around content
+- Default triangle mark angle changed. It can now be set via the style attribute `angle`.
+- Arrowheads on lines are now offset so the tip of the triangle points exactly on the
+  target position
+
+# 0.1.0
+## Plot
+- Added arguments `plot-style` and `mark-style` to the `plot(..)` base function
+  that allow providing a base style that gets inherited by all graphs.
+  Plots now default to the color pattern (blue, red, green, yellow, black) for
+  stroking & filling graphs.
+
+## Axes
+- Fixed axis label alignment.
+
+## Draw
+- Fixed issue #24, assert if line has fewer than two points.
+- Fixed an issue with calculating bounding boxes for some transformed paths
+
+## Chart
+- Fixed barchart bars getting labeled in reversed order
+
+# 0.0.2
+## Content
+- The `content` function now supports a second coordinate as `angle`, to
+  compute the rotation angle between the origin.
+- Anchors of the `content` function are now properly rotated.
+
+## Tree
+- Added the `tree` module for laying out trees.
+
+## Canvas
+- Changed transformation matrix multiplication order from `Local * World to`
+  World * Local.
+- Added `set-viewport` function for setting up scaling and translation to draw
+  inside a rectangular region.
+- The function `rect` now emits rotated anchors,
+  before it did not set anchors but used the bounding box.
+- New function `copy-anchors` to copy anchors of an element into a group.
+- Arcs are now approximated using up to 4 bezier curves instead of using
+  sampling with straight lines.
+- New function `intersections` that emits anchors at all child element
+  intersection points.
+
+## Chart
+- Added new library `chart` for drawing charts, currently only bar- and columncharts are supported.
+
+## Plot
+- Added new library `plot` for drawing line charts (of functions), replacing `typst-plot`.
+

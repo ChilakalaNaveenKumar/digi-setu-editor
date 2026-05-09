@@ -153,14 +153,14 @@ const hiddenRows = computed(() =>
     />
     <div
       v-else
-      class="px-3 py-2 font-mono text-[11px] italic text-muted-foreground"
+      class="px-3 py-2 font-mono text-caption italic text-muted-foreground"
     >
       no changes
     </div>
 
     <div
       v-if="isOver && !streaming"
-      class="pointer-events-none flex items-center justify-end border-t border-border bg-card px-2 py-1 font-mono text-[10px] text-muted-foreground"
+      class="pointer-events-none flex items-center justify-end border-t border-border bg-card px-2 py-1 font-mono text-caption text-muted-foreground"
     >
       <span>+{{ hiddenRows }} more line{{ hiddenRows === 1 ? "" : "s" }} · click to open</span>
     </div>
@@ -169,7 +169,7 @@ const hiddenRows = computed(() =>
          User can opt in to render the full diff (warning: slow on huge diffs). -->
     <div
       v-if="truncatedFromLines !== null"
-      class="flex items-center gap-2 border-t border-amber-700/30 bg-amber-950/20 px-2 py-1 font-mono text-[10px] text-amber-200/80"
+      class="flex items-center gap-2 border-t border-amber-700/30 bg-amber-950/20 px-2 py-1 font-mono text-caption text-amber-200/80"
     >
       <span class="leading-none">⚠</span>
       <span>

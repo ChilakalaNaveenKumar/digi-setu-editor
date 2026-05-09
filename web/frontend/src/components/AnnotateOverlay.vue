@@ -548,12 +548,12 @@ function humanSize(bytes: number): string {
       aria-label="Annotate file"
     >
       <!-- Top bar: title · page nav (PDFs) · cancel -->
-      <div class="flex flex-wrap items-center gap-3 border-b border-border bg-popover/95 px-4 py-2 text-sm">
+      <div class="flex flex-wrap items-center gap-3 border-b border-border bg-popover/95 px-4 py-2 text-lead">
         <Icon icon="codicon:edit" class="h-4 w-4 text-muted-foreground" />
         <span class="font-semibold">Annotate</span>
         <span
           v-if="subtitle"
-          class="rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] uppercase text-muted-foreground"
+          class="rounded bg-muted px-1.5 py-0.5 font-mono text-caption uppercase text-muted-foreground"
         >{{ subtitle }}</span>
 
         <div
@@ -569,7 +569,7 @@ function humanSize(bytes: number): string {
           >
             <Icon icon="codicon:chevron-left" class="h-4 w-4" />
           </button>
-          <span class="px-1.5 font-mono text-[11px] tabular-nums">
+          <span class="px-1.5 font-mono text-caption tabular-nums">
             <span class="font-semibold">{{ currentPage }}</span>
             <span class="text-muted-foreground"> / {{ pageCount }}</span>
           </span>
@@ -584,12 +584,12 @@ function humanSize(bytes: number): string {
           </button>
         </div>
 
-        <span class="ml-auto font-mono text-[10px] text-muted-foreground">
+        <span class="ml-auto font-mono text-caption text-muted-foreground">
           drag a box around what you want feedback on
         </span>
         <button
           type="button"
-          class="rounded border border-border bg-background px-2.5 py-1 text-xs font-medium hover:bg-muted"
+          class="rounded border border-border bg-background px-2.5 py-1 text-body font-medium hover:bg-muted"
           title="Cancel (esc)"
           @click="emit('cancel')"
         >Cancel</button>
@@ -602,7 +602,7 @@ function humanSize(bytes: number): string {
       >
         <div
           v-if="pageLoading"
-          class="absolute inset-0 z-20 flex items-center justify-center bg-black/40 text-sm text-muted-foreground"
+          class="absolute inset-0 z-20 flex items-center justify-center bg-black/40 text-lead text-muted-foreground"
         >
           <Icon icon="codicon:loading" class="mr-2 h-4 w-4 animate-spin" />
           Loading page {{ currentPage }}…
@@ -647,7 +647,7 @@ function humanSize(bytes: number): string {
           @drop.stop="onStickyDrop"
         >
           <div class="flex items-center justify-between border-b border-border bg-muted/40 px-2.5 py-1.5">
-            <span class="font-mono text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+            <span class="font-mono text-caption font-semibold uppercase tracking-wide text-muted-foreground">
               Feedback to AI
             </span>
             <button
@@ -665,7 +665,7 @@ function humanSize(bytes: number): string {
             v-model="comment"
             rows="3"
             placeholder="What should I change here?"
-            class="w-full resize-none border-0 bg-transparent px-2.5 py-2 text-sm leading-snug outline-none placeholder:text-muted-foreground"
+            class="w-full resize-none border-0 bg-transparent px-2.5 py-2 text-lead leading-snug outline-none placeholder:text-muted-foreground"
           />
 
           <!-- Extra attachment chips. Hidden when none. -->
@@ -676,7 +676,7 @@ function humanSize(bytes: number): string {
             <div
               v-for="a in extraAttachments"
               :key="a.localId"
-              class="group inline-flex max-w-[12rem] items-center gap-1 rounded border border-border bg-muted/40 px-1.5 py-0.5 text-[10px]"
+              class="group inline-flex max-w-[12rem] items-center gap-1 rounded border border-border bg-muted/40 px-1.5 py-0.5 text-caption"
               :title="a.name"
             >
               <img
@@ -712,7 +712,7 @@ function humanSize(bytes: number): string {
                  dim "or paste / drop" label next to it. -->
             <button
               type="button"
-              class="flex items-center gap-1 rounded border border-border bg-muted px-1.5 py-1 text-[11px] font-medium text-foreground hover:bg-accent hover:text-accent-foreground"
+              class="flex items-center gap-1 rounded border border-border bg-muted px-1.5 py-1 text-caption font-medium text-foreground hover:bg-accent hover:text-accent-foreground"
               title="Click to attach a file. You can also paste images (⌘/Ctrl + V) or drag-drop them onto this note."
               @click="openFilePicker"
             >
@@ -732,13 +732,13 @@ function humanSize(bytes: number): string {
               @change="onFilePicked"
             />
             <span
-              class="hidden font-mono text-[9px] uppercase tracking-wide text-muted-foreground/80 sm:inline"
+              class="hidden font-mono text-caption uppercase tracking-wide text-muted-foreground/80 sm:inline"
               title="You can also paste images with ⌘/Ctrl + V or drag-drop files onto this sticky note."
             >or paste / drop</span>
             <button
               type="button"
               :disabled="sending"
-              class="ml-auto flex items-center gap-1 rounded bg-success px-3 py-1.5 text-xs font-semibold text-success-foreground hover:bg-success/90 disabled:opacity-50"
+              class="ml-auto flex items-center gap-1 rounded bg-success px-3 py-1.5 text-body font-semibold text-success-foreground hover:bg-success/90 disabled:opacity-50"
               :title="chat.isStreaming ? 'Pi is busy — this will queue (⌘/Ctrl + ↵)' : 'Send (⌘/Ctrl + ↵)'"
               @click="send"
             >
@@ -754,7 +754,7 @@ function humanSize(bytes: number): string {
       </div>
 
       <!-- Hint strip. Compact: only the keys that matter for this flow. -->
-      <div class="border-t border-border bg-popover/95 px-4 py-1.5 font-mono text-[10px] text-muted-foreground">
+      <div class="border-t border-border bg-popover/95 px-4 py-1.5 font-mono text-caption text-muted-foreground">
         keys · drag = box · ⌘/Ctrl+↵ send · esc dismiss
         <span v-if="isPdf && pageCount > 1">· ⌘/Ctrl+← / → page</span>
       </div>

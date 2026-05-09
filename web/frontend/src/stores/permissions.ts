@@ -1,15 +1,26 @@
 /**
  * Pending tool-call permission requests.
  *
- * The backend forwards every approve_risky / approve_all gate as a
- * `permission_request` WS event. We queue them here (FIFO) and the
- * <PermissionPrompt /> modal renders the head of the queue.
+ * The backend forwards every gated tool call (see permission mode
+ * matrix below) as a `permission_request` WS event. We queue them
+ * here (FIFO) and the <PermissionPrompt /> modal renders the head of
+ * the queue.
  *
- * Decisions go back over the same WebSocket via chat.sendPermissionResponse.
- * We keep this store dumb on purpose — no fetch, no side effects beyond
- * queue mutation — so the dispatcher in chat.ts is the single chokepoint
- * for incoming events and the modal is the single chokepoint for outgoing
- * decisions.
+ * Decisions go back over the same WebSocket via chat.sendPermission-
+ * Response. We keep this store dumb on purpose — no fetch, no side
+ * effects beyond queue mutation — so the dispatcher in chat.ts is the
+ * single chokepoint for incoming events and the modal is the single
+ * chokepoint for outgoing decisions.
+ *
+ * Permission modes (canonical IDs):
+ *   auto      Run every tool without asking; audit log records all.
+ *   ask       Ask before bash / write / edit / process. Reads silent.
+ *             (Default — matches Cursor / Cline / Claude Code default.)
+ *   cautious  Ask before every tool call, including reads.
+ *
+ * Legacy IDs (`approve_risky` ≡ `ask`, `approve_all` ≡ `cautious`)
+ * are accepted on input and remapped in the backend's user_prefs
+ * service so a stale prefs.json keeps working through the upgrade.
  */
 
 import { defineStore } from "pinia";
@@ -21,7 +32,23 @@ export type PermissionDecision =
   | "deny_once"
   | "deny_session";
 
-export type PermissionMode = "auto" | "approve_risky" | "approve_all";
+export type PermissionMode = "auto" | "ask" | "cautious";
+
+/** Map any legacy mode ID we receive over the wire to the canonical one. */
+export function normalizeMode(raw: string): PermissionMode {
+  switch (raw) {
+    case "auto":
+    case "ask":
+    case "cautious":
+      return raw;
+    case "approve_risky":
+      return "ask";
+    case "approve_all":
+      return "cautious";
+    default:
+      return "ask";
+  }
+}
 
 export interface PermissionPreview {
   kind: "diff";
@@ -43,7 +70,7 @@ export interface PermissionRequest {
 
 export const usePermissionsStore = defineStore("permissions", () => {
   const queue = ref<PermissionRequest[]>([]);
-  const sessionMode = ref<PermissionMode>("approve_risky");
+  const sessionMode = ref<PermissionMode>("ask");
 
   const current = computed<PermissionRequest | null>(
     () => queue.value[0] ?? null,
@@ -51,7 +78,14 @@ export const usePermissionsStore = defineStore("permissions", () => {
   const pendingCount = computed(() => queue.value.length);
 
   function enqueue(req: Omit<PermissionRequest, "receivedAt">): void {
-    queue.value = [...queue.value, { ...req, receivedAt: Date.now() }];
+    // Defensive: an in-flight server may still emit a legacy mode ID
+    // for the first request after upgrade. Normalize before storing
+    // so the UI never sees a raw `approve_risky` token.
+    const safeMode = normalizeMode(req.mode);
+    queue.value = [
+      ...queue.value,
+      { ...req, mode: safeMode, receivedAt: Date.now() },
+    ];
   }
 
   /** Drop the head of the queue. Caller is responsible for sending the
@@ -70,8 +104,8 @@ export const usePermissionsStore = defineStore("permissions", () => {
     queue.value = [];
   }
 
-  function setMode(mode: PermissionMode): void {
-    sessionMode.value = mode;
+  function setMode(mode: PermissionMode | string): void {
+    sessionMode.value = normalizeMode(mode);
   }
 
   return {

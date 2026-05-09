@@ -12,7 +12,12 @@ import { defineStore } from "pinia";
 import { computed, reactive, ref, watch } from "vue";
 
 import { fetchSessionHistory } from "../api/sessions";
+import { i18n } from "../i18n";
 import { applyEvent, createRouterState, pushUserMessage } from "../lib/event-router";
+// `appRouter` here is Vue Router (for navigation); `router` later in
+// this module refers to the chat-message router state from
+// event-router. Aliased to avoid the name clash.
+import { router as appRouter } from "../router";
 import type { AssistantMessage, ChatMessage, RpcEvent, ToolCall } from "../types/rpc";
 import { ChatBridge, type ConnState } from "../ws/chat-bridge";
 
@@ -443,9 +448,12 @@ export const useChatStore = defineStore("chat", () => {
       const model = String(evt.model ?? "");
       const modelName = String(evt.model_name ?? model);
       if (model) useModelsStore().noteSessionInfo(model, modelName);
-      const mode = evt.permission_mode as PermissionMode | undefined;
-      if (mode === "auto" || mode === "approve_risky" || mode === "approve_all") {
-        usePermissionsStore().setMode(mode);
+      // Permission mode arrives over the wire as either a canonical ID
+      // (auto / ask / cautious) or a legacy alias (approve_risky /
+      // approve_all). The store's setMode() normalizes both.
+      const rawMode = evt.permission_mode;
+      if (typeof rawMode === "string" && rawMode.length > 0) {
+        usePermissionsStore().setMode(rawMode);
       }
       return;
     }
@@ -456,7 +464,8 @@ export const useChatStore = defineStore("chat", () => {
     if (evt.type === "permission_request") {
       const id = String(evt.id ?? "");
       const tool = String(evt.tool ?? "tool");
-      const mode = (evt.mode as PermissionMode | undefined) ?? "approve_risky";
+      // The store normalizes legacy aliases (approve_risky → ask, etc).
+      const mode = (typeof evt.mode === "string" ? evt.mode : "ask") as PermissionMode;
       if (!id) return;
       usePermissionsStore().enqueue({
         id,
@@ -484,21 +493,43 @@ export const useChatStore = defineStore("chat", () => {
       return;
     }
 
-    // Inline rate-limit / quota / credit errors from the server. They
-    // arrive as `_bridge_error` with a `code` discriminator. We surface
-    // them as `lastError` for the bottom banner; the credit case ALSO
-    // flips the billing store's `exhausted` flag so the upgrade modal
-    // pops immediately (no need to wait for the next /api/usage poll).
+    // Inline server-side errors arrive as `_bridge_error` with a stable
+    // `code` discriminator. The backend never sends raw exceptions or
+    // file paths — every UI string comes from the i18n table here.
+    //
+    // Special routing:
+    //   - `setup_required` / `session_expired`  → bounce to /login;
+    //     the user has nothing to do on the chat surface until they
+    //     resolve auth.
+    //   - `quota_exceeded` → also flips the billing store flag so the
+    //     upgrade modal pops without waiting for the next /api/usage
+    //     poll.
+    //   - everything else surfaces in the bottom banner only.
     if (evt.type === "_bridge_error") {
-      const code = String(evt.code ?? "");
-      const message = String(evt.message ?? "Unknown error");
-      lastError.value = message;
-      if (code === "credit_exhausted") {
-        const snap = (evt.snapshot ?? null) as
-          | import("../api/types").CreditSnapshot
-          | null;
-        useBillingStore().noteExhausted(snap);
+      const code = String(evt.code ?? "internal");
+      // Always look up via i18n, NEVER fall back to evt.message.
+      // The backend's English message is human-readable but it's
+      // still server-side language ("Cloud relay rejected the
+      // connection (HTTP 403)") that we don't want surfacing to
+      // end users. _localiseError falls back to the generic
+      // "Something went wrong" if the code has no entry yet —
+      // that's a strictly better UX than leaking raw text.
+      const localised = _localiseError(code);
+      lastError.value = localised;
+
+      if (code === "quota_exceeded") {
+        useBillingStore().noteExhausted(null);
       }
+      if (code === "setup_required" || code === "session_expired") {
+        // Bounce to the Welcome screen — the user can't make progress
+        // here until they sign in or add a key. queueMicrotask defers
+        // the navigation past the current event handler so the WS
+        // teardown fires in order.
+        queueMicrotask(() => {
+          void appRouter.push({ name: "login" });
+        });
+      }
+
       isStreaming.value = false;
       return;
     }
@@ -523,20 +554,55 @@ export const useChatStore = defineStore("chat", () => {
     _syncEditorFromWriteCall();
     messages.value = router.messages.slice();
 
-    // Provider-error mirroring. The router stamps `asst.error` on the
-    // current assistant bubble when pi reports `stopReason === "error"`
-    // (Vertex 404, "Model not found for provider", rate-limit, network
-    // dropouts, etc.). We mirror it onto the bottom banner so the
-    // failure is visible no matter where the user is scrolled. Skip if
-    // a more specific `_bridge_error` already populated lastError this
-    // tick — those carry richer codes (credit_exhausted, …).
+    // Localise any error the router just stamped, so both the
+    // assistant bubble AND the bottom banner render friendly text
+    // instead of a raw provider/HTTP string. The router only stamps
+    // `errorCode` (a stable category like "provider_rate_limit",
+    // "provider_usage_policy", …); this helper looks up the
+    // matching `errors.<code>` i18n key and falls back to the
+    // generic `errors.internal` ("Something went wrong. Please try
+    // again.") for any unknown / unmatched code.
+    //
+    // Important contract for future contributors: NEVER set
+    // `asst.error = <raw provider text>`. The chat UI renders
+    // `asst.error` verbatim, so anything that lands there will hit
+    // the user's screen. Always go through `errorCode` + this
+    // helper.
+    const tailMsg = router.messages[router.messages.length - 1];
+    if (
+      tailMsg &&
+      tailMsg.kind === "assistant" &&
+      tailMsg.errorCode &&
+      !tailMsg.error
+    ) {
+      tailMsg.error = _localiseError(tailMsg.errorCode);
+    }
+
+    // Mirror the now-localised error to the bottom banner so the
+    // failure is visible no matter where the user is scrolled.
+    // Skip if a previous tick already populated lastError — the
+    // _bridge_error path sets it in its own branch above.
     if (evt.type === "message_end" && !lastError.value) {
-      const tail = router.messages[router.messages.length - 1];
-      if (tail && tail.kind === "assistant" && tail.error) {
-        lastError.value = tail.error;
+      if (tailMsg && tailMsg.kind === "assistant" && tailMsg.error) {
+        lastError.value = tailMsg.error;
         isStreaming.value = false;
       }
     }
+  }
+
+  /**
+   * Map a stable error code (provider_rate_limit, provider_usage_policy,
+   * relay_unauthenticated, etc.) to a friendly localised string.
+   * Falls back to the generic `errors.internal` when the code has no
+   * dedicated translation, so the user never sees a raw category
+   * name like "provider_error" leak into the chat.
+   */
+  function _localiseError(code: string): string {
+    const key = `errors.${code}`;
+    if (i18n.global.te(key)) {
+      return i18n.global.t(key) as string;
+    }
+    return i18n.global.t("errors.internal") as string;
   }
 
   // ── outbound ───────────────────────────────────────────────────────

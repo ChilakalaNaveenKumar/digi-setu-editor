@@ -421,13 +421,13 @@ function killBg(): void {
 <template>
   <section
     :class="[
-      'relative flex w-full min-h-0 flex-col border-t border-border bg-card text-sm',
+      'relative flex w-full min-h-0 flex-col border-t border-border bg-card text-lead',
       collapsed ? 'h-auto shrink-0' : 'h-full',
     ]"
   >
     <!-- ── HEADER ──────────────────────────────────────────────────── -->
     <header
-      class="flex items-center justify-between gap-2 border-b border-transparent px-3 py-1.5 text-xs text-muted-foreground"
+      class="flex items-center justify-between gap-2 border-b border-transparent px-3 py-1.5 text-body text-muted-foreground"
       :class="!collapsed && 'border-border/60'"
     >
       <button
@@ -439,18 +439,18 @@ function killBg(): void {
         <span class="font-mono font-semibold text-foreground/80">terminal</span>
         <span
           v-if="entries.length > 0"
-          class="rounded-sm bg-muted px-1.5 py-0.5 text-[10px] tabular-nums"
+          class="rounded-sm bg-muted px-1.5 py-0.5 text-caption tabular-nums"
         >{{ entries.length }}</span>
         <span
           v-if="runningCount > 0"
-          class="flex items-center gap-1 rounded-sm bg-warning/15 px-1.5 py-0.5 text-[10px] text-warning"
+          class="flex items-center gap-1 rounded-sm bg-warning/15 px-1.5 py-0.5 text-caption text-warning"
         >
           <span class="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-warning"></span>
           {{ runningCount }} running
         </span>
         <span
           v-if="terminals.activeBackgroundCount > 0"
-          class="flex items-center gap-1 rounded-sm bg-primary/15 px-1.5 py-0.5 text-[10px] text-primary"
+          class="flex items-center gap-1 rounded-sm bg-primary/15 px-1.5 py-0.5 text-caption text-primary"
           title="Active background sessions (pi-interactive-shell). Click to expand the panel."
         >
           <span class="inline-block h-1.5 w-1.5 rounded-full bg-primary"></span>
@@ -462,7 +462,7 @@ function killBg(): void {
       <div v-if="!collapsed" class="flex items-center gap-1.5">
         <button
           type="button"
-          class="rounded-sm px-1.5 py-0.5 text-[10px] hover:bg-accent hover:text-foreground"
+          class="rounded-sm px-1.5 py-0.5 text-caption hover:bg-accent hover:text-foreground"
           :class="terminals.wrap && 'bg-accent text-foreground'"
           :title="terminals.wrap ? 'Disable line wrap' : 'Enable line wrap'"
           @click="toggleWrap"
@@ -470,7 +470,7 @@ function killBg(): void {
         <button
           v-if="selectedBashCall && selectedIsRunning"
           type="button"
-          class="flex items-center gap-1 rounded-sm bg-destructive/15 px-1.5 py-0.5 text-[10px] text-destructive hover:bg-destructive/25"
+          class="flex items-center gap-1 rounded-sm bg-destructive/15 px-1.5 py-0.5 text-caption text-destructive hover:bg-destructive/25"
           title="Stop the current agent turn (kills the running bash process group)"
           @click="stopCurrentBash"
         >
@@ -479,11 +479,11 @@ function killBg(): void {
         </button>
         <button
           type="button"
-          class="text-[11px] hover:text-foreground"
+          class="text-caption hover:text-foreground"
           @click="collapsed = true"
         >hide</button>
       </div>
-      <div v-else class="text-[11px]">expand</div>
+      <div v-else class="text-caption">expand</div>
     </header>
 
     <!-- ── BODY: split view ──────────────────────────────────────── -->
@@ -494,7 +494,7 @@ function killBg(): void {
         <template v-if="selectedBashCall">
           <!-- Status strip with badges -->
           <div
-            class="flex items-center gap-2 border-b border-border/60 bg-card/40 px-3 py-1.5 font-mono text-[11px]"
+            class="flex items-center gap-2 border-b border-border/60 bg-card/40 px-3 py-1.5 font-mono text-caption"
           >
             <span :class="['inline-block h-2 w-2 rounded-full', bashStatusDot(selectedBashCall)]"></span>
             <span class="font-semibold text-foreground/80">bash</span>
@@ -507,7 +507,7 @@ function killBg(): void {
             </span>
             <span
               v-if="selectedIsBackground"
-              class="ml-1 inline-flex items-center gap-1 rounded-sm bg-primary/15 px-1.5 py-0.5 text-[10px] text-primary"
+              class="ml-1 inline-flex items-center gap-1 rounded-sm bg-primary/15 px-1.5 py-0.5 text-caption text-primary"
               title="This command spawns a background process. The daemon keeps running after the foreground exits."
             >
               <span class="inline-block h-1 w-1 rounded-full bg-primary"></span>
@@ -523,7 +523,7 @@ function killBg(): void {
           <!-- Truncation banner -->
           <div
             v-if="selectedTruncation.truncation"
-            class="flex items-center justify-between gap-2 border-b border-warning/30 bg-warning/10 px-3 py-1 font-mono text-[10px] text-warning"
+            class="flex items-center justify-between gap-2 border-b border-warning/30 bg-warning/10 px-3 py-1 font-mono text-caption text-warning"
           >
             <span>
               ⚠ truncated by pi: showing
@@ -555,17 +555,17 @@ function killBg(): void {
               >{{ selectedOutput }}</pre>
               <div
                 v-else-if="selectedIsRunning"
-                class="px-3 py-2 font-mono text-[11px] italic text-muted-foreground"
+                class="px-3 py-2 font-mono text-caption italic text-muted-foreground"
               >waiting for output…</div>
             </div>
             <button
               v-if="!stickToBottom && selectedOutput"
               type="button"
-              class="absolute bottom-3 right-4 z-10 inline-flex items-center gap-1.5 rounded-full border border-primary/40 bg-card/95 px-3 py-1 text-[11px] text-primary shadow-md backdrop-blur-sm transition hover:bg-primary/15"
+              class="absolute bottom-3 right-4 z-10 inline-flex items-center gap-1.5 rounded-full border border-primary/40 bg-card/95 px-3 py-1 text-caption text-primary shadow-md backdrop-blur-sm transition hover:bg-primary/15"
               title="Auto-scroll paused. Click to jump back to the latest output."
               @click="jumpToLatest"
             >
-              <span class="text-base leading-none">↓</span>
+              <span class="text-lead leading-none">↓</span>
               <span>jump to latest</span>
             </button>
           </div>
@@ -575,7 +575,7 @@ function killBg(): void {
         <template v-else-if="selectedBg">
           <!-- Status strip -->
           <div
-            class="flex items-center gap-2 border-b border-border/60 bg-card/40 px-3 py-1.5 font-mono text-[11px]"
+            class="flex items-center gap-2 border-b border-border/60 bg-card/40 px-3 py-1.5 font-mono text-caption"
           >
             <span :class="['inline-block h-2 w-2 rounded-full', bgStatusDot(selectedBg.process.status !== 'running')]"></span>
             <span class="font-semibold text-foreground/80">{{ selectedBg.process.name }}</span>
@@ -596,7 +596,7 @@ function killBg(): void {
               </template>
             </span>
             <span
-              class="ml-1 inline-flex items-center gap-1 rounded-sm bg-primary/15 px-1.5 py-0.5 text-[10px] text-primary"
+              class="ml-1 inline-flex items-center gap-1 rounded-sm bg-primary/15 px-1.5 py-0.5 text-caption text-primary"
               title="Live tail — backend is reading the on-disk log file every 100ms"
             >
               <span class="inline-block h-1 w-1 rounded-full bg-primary"></span>
@@ -604,7 +604,7 @@ function killBg(): void {
             </span>
             <span
               v-if="selectedBg.process.pid > 0"
-              class="text-[10px] text-muted-foreground tabular-nums"
+              class="text-caption text-muted-foreground tabular-nums"
             >pid {{ selectedBg.process.pid }}</span>
           </div>
 
@@ -629,21 +629,21 @@ function killBg(): void {
               >{{ selectedOutput }}</pre>
               <div
                 v-else-if="selectedBg.process.status === 'running'"
-                class="px-3 py-2 font-mono text-[11px] italic text-muted-foreground"
+                class="px-3 py-2 font-mono text-caption italic text-muted-foreground"
               >waiting for output…</div>
               <div
                 v-else
-                class="px-3 py-2 font-mono text-[11px] italic text-muted-foreground"
+                class="px-3 py-2 font-mono text-caption italic text-muted-foreground"
               >no output captured</div>
             </div>
             <button
               v-if="!stickToBottom && selectedOutput"
               type="button"
-              class="absolute bottom-3 right-4 z-10 inline-flex items-center gap-1.5 rounded-full border border-primary/40 bg-card/95 px-3 py-1 text-[11px] text-primary shadow-md backdrop-blur-sm transition hover:bg-primary/15"
+              class="absolute bottom-3 right-4 z-10 inline-flex items-center gap-1.5 rounded-full border border-primary/40 bg-card/95 px-3 py-1 text-caption text-primary shadow-md backdrop-blur-sm transition hover:bg-primary/15"
               title="Auto-scroll paused. Click to jump back to the latest output."
               @click="jumpToLatest"
             >
-              <span class="text-base leading-none">↓</span>
+              <span class="text-lead leading-none">↓</span>
               <span>jump to latest</span>
             </button>
           </div>
@@ -653,13 +653,13 @@ function killBg(): void {
             <button
               v-if="selectedBg.process.status === 'running'"
               type="button"
-              class="rounded-sm bg-destructive/15 px-2 py-1 text-[11px] text-destructive hover:bg-destructive/25"
+              class="rounded-sm bg-destructive/15 px-2 py-1 text-caption text-destructive hover:bg-destructive/25"
               title="SIGTERM this process directly via the backend (5s grace, then SIGKILL)"
               @click="killBg"
             >■ stop</button>
             <span
               v-else
-              class="text-[10px] text-muted-foreground"
+              class="text-caption text-muted-foreground"
             >process ended</span>
           </div>
         </template>
@@ -667,16 +667,16 @@ function killBg(): void {
         <!-- USER PTY (xterm.js interactive terminal) -->
         <template v-else-if="selectedPty">
           <!-- Header with shell + pid + close -->
-          <div class="flex items-center justify-between gap-2 border-b border-border bg-card/60 px-3 py-1 text-[11px]">
+          <div class="flex items-center justify-between gap-2 border-b border-border bg-card/60 px-3 py-1 text-caption">
             <div class="flex min-w-0 items-center gap-2">
               <span :class="['inline-block h-2 w-2 rounded-full', selectedPty.pty.closed ? 'bg-muted-foreground/50' : 'bg-success']"></span>
               <span class="font-semibold text-foreground/80">{{ selectedPty.label }}</span>
               <span class="font-mono text-muted-foreground">pid {{ selectedPty.pty.pid }}</span>
-              <span class="truncate font-mono text-[10px] text-muted-foreground">{{ selectedPty.pty.cwd }}</span>
+              <span class="truncate font-mono text-caption text-muted-foreground">{{ selectedPty.pty.cwd }}</span>
             </div>
             <button
               type="button"
-              class="rounded-sm border border-border bg-background px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-destructive/15 hover:text-destructive"
+              class="rounded-sm border border-border bg-background px-2 py-0.5 text-caption text-muted-foreground hover:bg-destructive/15 hover:text-destructive"
               title="Close terminal"
               @click="killSelectedPty"
             >× close</button>
@@ -702,12 +702,12 @@ function killBg(): void {
         <!-- EMPTY STATE -->
         <div
           v-else
-          class="flex h-full flex-col items-center justify-center px-4 text-center text-xs text-muted-foreground"
+          class="flex h-full flex-col items-center justify-center px-4 text-center text-body text-muted-foreground"
         >
           <p class="mb-2">No terminal selected.</p>
           <button
             type="button"
-            class="rounded-sm border border-border bg-background px-3 py-1 text-[11px] text-foreground hover:bg-accent"
+            class="rounded-sm border border-border bg-background px-3 py-1 text-caption text-foreground hover:bg-accent"
             @click="newTerminal()"
           >+ New terminal</button>
         </div>
@@ -719,7 +719,7 @@ function killBg(): void {
       >
         <!-- Sidebar header: + new terminal button + dropdown picker -->
         <div class="relative flex items-center justify-between border-b border-border bg-card/60 px-2 py-1.5">
-          <span class="text-[10px] uppercase tracking-wider text-muted-foreground">terminals</span>
+          <span class="text-caption uppercase tracking-wider text-muted-foreground">terminals</span>
           <div class="flex items-center gap-1">
             <button
               type="button"
@@ -746,19 +746,19 @@ function killBg(): void {
             class="absolute right-2 top-full z-30 mt-1 min-w-[180px] overflow-hidden rounded-md border border-border bg-card shadow-lg"
             @click.stop
           >
-            <div class="border-b border-border/60 px-3 py-1 text-[10px] uppercase tracking-wider text-muted-foreground">
+            <div class="border-b border-border/60 px-3 py-1 text-caption uppercase tracking-wider text-muted-foreground">
               shell profile
             </div>
             <button
               v-for="p in terminals.shellProfiles"
               :key="p.id"
               type="button"
-              class="block w-full px-3 py-1.5 text-left text-[12px] hover:bg-accent"
+              class="block w-full px-3 py-1.5 text-left text-body hover:bg-accent"
               @click="newTerminal(p.path)"
             >
               <span class="font-mono">{{ p.label }}</span>
-              <span v-if="p.isDefault" class="ml-2 text-[10px] text-muted-foreground">(default)</span>
-              <div class="text-[10px] text-muted-foreground">{{ p.path }}</div>
+              <span v-if="p.isDefault" class="ml-2 text-caption text-muted-foreground">(default)</span>
+              <div class="text-caption text-muted-foreground">{{ p.path }}</div>
             </button>
           </div>
         </div>
@@ -778,7 +778,7 @@ function killBg(): void {
               @click="selectEntry(e.id)"
             >
               <span :class="['inline-block h-1.5 w-1.5 shrink-0 rounded-full', bashStatusDot(e.call)]"></span>
-              <span class="min-w-0 flex-1 truncate font-mono text-[11px]">{{ e.label }}</span>
+              <span class="min-w-0 flex-1 truncate font-mono text-caption">{{ e.label }}</span>
               <button
                 type="button"
                 class="opacity-0 group-hover/row:opacity-100 focus:opacity-100 inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:bg-destructive/20 hover:text-destructive"
@@ -800,7 +800,7 @@ function killBg(): void {
 
           <!-- BG SECTION (only when there are bg sessions) -->
           <template v-if="bgEntries.length > 0">
-            <div class="mt-2 border-t border-border/50 px-3 pb-1 pt-1.5 text-[10px] uppercase tracking-wider text-muted-foreground">
+            <div class="mt-2 border-t border-border/50 px-3 pb-1 pt-1.5 text-caption uppercase tracking-wider text-muted-foreground">
               background
             </div>
             <div
@@ -816,13 +816,13 @@ function killBg(): void {
               @click="selectEntry(e.id)"
             >
               <span :class="['inline-block h-1.5 w-1.5 shrink-0 rounded-full', bgStatusDot(e.process.status !== 'running')]"></span>
-              <span class="min-w-0 flex-1 truncate font-mono text-[11px]">{{ e.label }}</span>
+              <span class="min-w-0 flex-1 truncate font-mono text-caption">{{ e.label }}</span>
             </div>
           </template>
 
           <!-- USER PTY SECTION — interactive terminals the user spawned -->
           <template v-if="ptyEntries.length > 0">
-            <div class="mt-2 border-t border-border/50 px-3 pb-1 pt-1.5 text-[10px] uppercase tracking-wider text-muted-foreground">
+            <div class="mt-2 border-t border-border/50 px-3 pb-1 pt-1.5 text-caption uppercase tracking-wider text-muted-foreground">
               user terminals
             </div>
             <div
@@ -838,7 +838,7 @@ function killBg(): void {
               @click="selectEntry(e.id)"
             >
               <span :class="['inline-block h-1.5 w-1.5 shrink-0 rounded-full', e.pty.closed ? 'bg-muted-foreground/50' : 'bg-success']"></span>
-              <span class="min-w-0 flex-1 truncate font-mono text-[11px]">
+              <span class="min-w-0 flex-1 truncate font-mono text-caption">
                 {{ e.label }} <span class="text-muted-foreground">· {{ e.pty.pid }}</span>
               </span>
               <button
@@ -857,7 +857,7 @@ function killBg(): void {
           <!-- Empty state — nudge the user to create their first terminal -->
           <div
             v-if="entries.length === 0"
-            class="px-3 py-3 text-center text-[10px] text-muted-foreground"
+            class="px-3 py-3 text-center text-caption text-muted-foreground"
           >
             No terminals yet.<br />
             Click <span class="font-mono text-foreground">+</span> to start one.

@@ -19,9 +19,9 @@ from fastapi import APIRouter, Depends, HTTPException
 from models.workspace import SessionCreate, SessionModelUpdate, SessionRename
 from routes._helpers import session_for_user_or_404, workspace_for_user_or_404
 from services.auth import require_user
-from services.billing import CreditLedger
 from services.history import load_history
 from services.models_registry import is_allowed
+from services.plan_cache import get_plan_id as _get_plan_id
 from services.registry import Registry
 from services.user_prefs import user_prefs
 
@@ -57,7 +57,7 @@ async def create_session(
     # check the model PATCH route uses below — duplicate intentional;
     # cheaper than adding a route helper just for this one call.
     if requested_model:
-        plan_id = CreditLedger.instance().get_plan_id(user_id)
+        plan_id = _get_plan_id(user_id)
         if not is_allowed(requested_model, plan_id):
             raise HTTPException(
                 status_code=403,
@@ -86,7 +86,7 @@ async def set_session_model(
     when the chat WS is open.
     """
     sess_rec = session_for_user_or_404(sid, user_id)
-    plan_id = CreditLedger.instance().get_plan_id(user_id)
+    plan_id = _get_plan_id(user_id)
     if not is_allowed(payload.model, plan_id):
         raise HTTPException(
             status_code=403,

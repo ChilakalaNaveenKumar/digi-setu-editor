@@ -1,13 +1,11 @@
-# pi-typst-test
+# Digi Setu
 
-A self-contained smoke-test harness that runs `pi-coding-agent` against the same Typst workflow your existing `typst-agent` covers, using the same Vertex ADC, the same Gemini model, and the same documentation corpus.
-
-The point: stop arguing about ADK vs pi in the abstract. Run both against the same prompts, look at the logs, decide.
+The Digi Setu monorepo: a Vue/FastAPI web app, a Tauri-based desktop app, and a shared `pi-coding-agent` runtime tuned for Typst workflows. The original folder name (`pi-typst-test`) survives only as a path-level historical artifact; everything user-facing now reads as **Digi Setu**.
 
 ## What's in here
 
 ```
-pi-typst-test/
+digi-setu/
 ├── package.json                     # registers extensions/typst-tools.ts
 ├── extensions/typst-tools.ts        # compile_typ, search_docs, list_fonts, list_packages
 ├── guides/                          # → symlink to ../refernecs/typst-agent/guides

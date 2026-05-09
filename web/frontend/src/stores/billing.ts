@@ -19,21 +19,22 @@ import {
   openPortal as apiOpenPortal,
   startCheckout as apiStartCheckout,
 } from "../api/billing";
-import { isDesktop, openExternal } from "../lib/native-bridge";
+import { i18n } from "../i18n";
 import type { CreditSnapshot, PlanInfo } from "../api/types";
 
-/**
- * In desktop mode Stripe Checkout / Customer Portal must open in the
- * system browser (3DS, Apple Pay, autofill all break inside Tauri's
- * webview). The deep-link bridge in main.ts listens for the matching
- * pi-typst-test://billing/return URL the user hits after success or
- * cancel, refreshes credit state, and surfaces a confirmation toast.
- *
- * The web build keeps the existing `window.location.href` redirect:
- * it's same-origin, the URL is whitelisted by Stripe, and the
- * post-payment cookie reattaches automatically.
- */
-const DESKTOP_BILLING_RETURN = "pi-typst-test://billing/return";
+import { useUiStore } from "./ui";
+
+// Threshold (in remaining_pct) where we fire the one-shot low-credit
+// toast. Below this and the user starts seeing the warning colour on
+// the gear icon AND a single nudge toast — Cursor pops a similar toast
+// when you cross 20% of your monthly cap. We DON'T want to fire it on
+// every poll once they're below the line, so the store guards on the
+// crossing event.
+const _LOW_CREDIT_PCT_THRESHOLD = 20;
+// Once the user climbs back above this (e.g. they upgraded, the month
+// rolled over, or their plan was bumped), we re-arm the one-shot so a
+// subsequent dip will toast again.
+const _LOW_CREDIT_REARM_PCT = 50;
 
 export const useBillingStore = defineStore("billing", () => {
   const enabled = ref(false);
@@ -41,6 +42,23 @@ export const useBillingStore = defineStore("billing", () => {
   const credit = ref<CreditSnapshot | null>(null);
   const lastRefresh = ref(0);
   const exhausted = ref(false);
+
+  // ── one-shot UX flags (NOT exposed on the public surface) ──────
+  // Whether we've already shown the "you're under 20%" toast for the
+  // current low-credit cycle. Resets when remaining climbs back over
+  // _LOW_CREDIT_REARM_PCT. Persists across `refreshUsage` calls but
+  // not across page reloads — that's intentional: a refresh is a
+  // legitimate moment to remind the user.
+  const _shownLowCreditToast = ref(false);
+  // Whether we've already auto-popped the upgrade modal for the
+  // current "exhausted" cycle. Cleared when the user dismisses or
+  // when the credit gauge climbs back above 0.
+  const _shownAutoUpgrade = ref(false);
+  // The reactive flag the chat surface watches to render the modal.
+  // Distinct from `exhausted` so the user can dismiss the modal
+  // without having to also hide the bottom error banner — the banner
+  // stays until the user clicks ✕.
+  const wantsAutoUpgrade = ref(false);
 
   async function refreshStatus(): Promise<void> {
     try {
@@ -55,9 +73,8 @@ export const useBillingStore = defineStore("billing", () => {
   async function refreshUsage(): Promise<void> {
     try {
       const r = await getUsage();
-      credit.value = r.credit;
+      _applyCredit(r.credit);
       lastRefresh.value = Date.now();
-      exhausted.value = r.credit.remaining_usd <= 0;
     } catch (exc) {
       // 401 here means we're on the login page — silent skip.
       if (!String(exc).includes("401")) {
@@ -67,37 +84,99 @@ export const useBillingStore = defineStore("billing", () => {
   }
 
   /**
-   * Note a server-pushed credit_exhausted error from chat_ws so the
-   * UI can pop the upgrade modal without waiting for the next poll.
+   * Apply a new CreditSnapshot — used by both poll-based refresh and
+   * server-push paths. Centralised so the one-shot crossing logic
+   * (low-credit toast, auto-open upgrade modal) lives in exactly one
+   * place and can't drift between callers.
+   */
+  function _applyCredit(snap: CreditSnapshot): void {
+    const prev = credit.value;
+    credit.value = snap;
+
+    // Re-arm the one-shot low-credit toast once the user is comfortably
+    // above the threshold again (upgrade, month rollover, refund, …).
+    if (snap.remaining_pct >= _LOW_CREDIT_REARM_PCT) {
+      _shownLowCreditToast.value = false;
+    }
+
+    const wasExhausted = !!prev && prev.remaining_usd <= 0;
+    const nowExhausted = snap.remaining_usd <= 0;
+    exhausted.value = nowExhausted;
+
+    // Re-arm auto-upgrade once the user has any credit again.
+    if (!nowExhausted) {
+      _shownAutoUpgrade.value = false;
+    }
+
+    // Edge transitions ──────────────────────────────────────────────
+    // Crossed *down* into low-credit territory. Show one toast, never
+    // again until they climb back above _LOW_CREDIT_REARM_PCT.
+    if (
+      !nowExhausted &&
+      snap.remaining_pct <= _LOW_CREDIT_PCT_THRESHOLD &&
+      !_shownLowCreditToast.value
+    ) {
+      _shownLowCreditToast.value = true;
+      _emitLowCreditToast(snap);
+    }
+
+    // Crossed *into* exhausted. Pop the upgrade modal once.
+    if (nowExhausted && !wasExhausted) {
+      _maybeAutoOpenUpgrade();
+    }
+  }
+
+  function _emitLowCreditToast(snap: CreditSnapshot): void {
+    try {
+      const ui = useUiStore();
+      const remaining = `$${snap.remaining_usd.toFixed(2)}`;
+      const budget = `$${snap.plan.monthly_credit_usd.toFixed(0)}`;
+      const msg = i18n.global.te("billing.lowCreditToast")
+        ? (i18n.global.t("billing.lowCreditToast", { remaining, budget }) as string)
+        : `Heads up — only ${remaining} of ${budget} left this month.`;
+      ui.toast({ message: msg, kind: "info", ttl: 8000 });
+    } catch (exc) {
+      // Toast firing must never throw past the billing refresh path —
+      // an i18n hiccup or pinia init order quirk should NOT break
+      // the credit poll. Worst case: no toast, gear icon dot still
+      // signals the state.
+      console.warn("[billing] low-credit toast failed", exc);
+    }
+  }
+
+  function _maybeAutoOpenUpgrade(): void {
+    if (_shownAutoUpgrade.value) return;
+    _shownAutoUpgrade.value = true;
+    wantsAutoUpgrade.value = true;
+  }
+
+  /**
+   * Called by the chat error handler when the backend pushes a
+   * `quota_exceeded` _bridge_error. Lets us pop the upgrade modal
+   * the moment the user hits the cap, instead of waiting up to 30s
+   * for the next /api/usage poll.
    */
   function noteExhausted(snapshot: CreditSnapshot | null = null): void {
     exhausted.value = true;
     if (snapshot) credit.value = snapshot;
+    _maybeAutoOpenUpgrade();
+  }
+
+  /** Called by the modal's @close — clears the one-shot so we don't
+   * immediately re-pop. The user can still click the bottom-banner
+   * Upgrade button or the gear icon to reopen on demand. */
+  function dismissAutoUpgrade(): void {
+    wantsAutoUpgrade.value = false;
   }
 
   async function startCheckout(planId: string): Promise<void> {
-    const desktop = isDesktop();
-    const r = await apiStartCheckout(
-      planId,
-      desktop ? DESKTOP_BILLING_RETURN : undefined,
-    );
-    if (desktop) {
-      await openExternal(r.url);
-    } else {
-      window.location.href = r.url;
-    }
+    const r = await apiStartCheckout(planId);
+    window.location.href = r.url;
   }
 
   async function openPortal(): Promise<void> {
-    const desktop = isDesktop();
-    const r = await apiOpenPortal(
-      desktop ? DESKTOP_BILLING_RETURN : undefined,
-    );
-    if (desktop) {
-      await openExternal(r.url);
-    } else {
-      window.location.href = r.url;
-    }
+    const r = await apiOpenPortal();
+    window.location.href = r.url;
   }
 
   const planLabel = computed(() => credit.value?.plan?.label ?? "Free");
@@ -111,12 +190,14 @@ export const useBillingStore = defineStore("billing", () => {
     plans,
     credit,
     exhausted,
+    wantsAutoUpgrade,
     planLabel,
     remainingPct,
     lowCredit,
     refreshStatus,
     refreshUsage,
     noteExhausted,
+    dismissAutoUpgrade,
     startCheckout,
     openPortal,
   };

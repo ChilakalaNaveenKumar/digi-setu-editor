@@ -90,14 +90,14 @@ async function revertTurn(): Promise<void> {
 <template>
   <div ref="root" class="user-bubble group my-5 rounded-md px-4 py-3">
     <div class="mb-1 flex items-center justify-between">
-      <span class="text-[10px] uppercase tracking-wide text-muted-foreground">
+      <span class="text-caption uppercase tracking-wide text-muted-foreground">
         you<span v-if="isLong" class="ml-1.5 normal-case opacity-60">·
           {{ lineCount }} lines, {{ text.length.toLocaleString() }} chars</span>
       </span>
       <button
         type="button"
         :disabled="revertBusy"
-        class="rounded-sm border border-border bg-background px-1.5 py-0.5 text-[10px] text-muted-foreground opacity-0 transition-opacity hover:border-destructive/60 hover:text-destructive group-hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-50"
+        class="rounded-sm border border-border bg-background px-1.5 py-0.5 text-caption text-muted-foreground opacity-0 transition-opacity hover:border-destructive/60 hover:text-destructive group-hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-50"
         title="Revert every file change made in response to this prompt"
         @click="revertTurn"
       >
@@ -121,7 +121,7 @@ async function revertTurn(): Promise<void> {
     <button
       v-if="isLong"
       type="button"
-      class="mt-1 inline-flex items-center gap-1 rounded text-[10px] font-mono text-muted-foreground hover:text-foreground"
+      class="mt-1 inline-flex items-center gap-1 rounded text-caption font-mono text-muted-foreground hover:text-foreground"
       @click="expanded = !expanded"
     >
       <Icon
@@ -132,13 +132,13 @@ async function revertTurn(): Promise<void> {
     </button>
     <div
       v-if="revertedFiles"
-      class="mt-1 text-[10px] text-success"
+      class="mt-1 text-caption text-success"
     >
       reverted {{ revertedFiles.length }} file{{ revertedFiles.length === 1 ? "" : "s" }}
     </div>
     <div
       v-if="revertError"
-      class="mt-1 text-[10px] text-destructive"
+      class="mt-1 text-caption text-destructive"
     >
       {{ revertError }}
     </div>

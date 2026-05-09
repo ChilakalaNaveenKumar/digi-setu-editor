@@ -1,4 +1,4 @@
-# pi-typst-test · web (Step 1: chat parity)
+# Digi Setu · web
 
 Vue 3 chat UI driven by a Python FastAPI bridge that spawns `pi --mode rpc`
 per session. Step 1 ships the chat column only — terminal pane, file tree,

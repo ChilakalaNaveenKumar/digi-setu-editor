@@ -81,7 +81,7 @@ const confirmClass = computed(() => {
         aria-modal="true"
       >
         <div class="px-4 pt-4 pb-2">
-          <h3 class="text-sm font-semibold">{{ confirmDialog.title }}</h3>
+          <h3 class="text-lead font-semibold">{{ confirmDialog.title }}</h3>
           <p
             v-if="confirmDialog.description"
             class="mt-1 whitespace-pre-line text-[12.5px] leading-relaxed text-muted-foreground"
@@ -92,13 +92,13 @@ const confirmClass = computed(() => {
         <div class="flex items-center justify-end gap-2 border-t border-border bg-card/40 px-3 py-2">
           <button
             type="button"
-            class="rounded-sm border border-border bg-background px-3 py-1 text-[12px] text-foreground hover:bg-accent"
+            class="rounded-sm border border-border bg-background px-3 py-1 text-body text-foreground hover:bg-accent"
             @click="onCancel"
           >{{ confirmDialog.cancelLabel ?? "Cancel" }}</button>
           <button
             ref="confirmBtn"
             type="button"
-            :class="['rounded-sm px-3 py-1 text-[12px] font-medium transition-colors', confirmClass]"
+            :class="['rounded-sm px-3 py-1 text-body font-medium transition-colors', confirmClass]"
             @click="onConfirm"
           >{{ confirmDialog.confirmLabel ?? "Confirm" }}</button>
         </div>

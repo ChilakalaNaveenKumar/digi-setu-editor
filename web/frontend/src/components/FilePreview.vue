@@ -294,16 +294,16 @@ function onAnnotateCancel(): void {
          to scroll-zoom an iframe that only zooms with Ctrl/⌘. -->
     <div
       v-if="kind === 'pdf'"
-      class="flex items-center justify-between border-b border-border bg-card/40 px-3 py-1 text-xs text-muted-foreground"
+      class="flex items-center justify-between border-b border-border bg-card/40 px-3 py-1 text-body text-muted-foreground"
     >
       <div class="flex items-center gap-2 font-mono">
         <Icon icon="material-icon-theme:pdf" class="h-[14px] w-[14px]" />
         <span>PDF preview</span>
-        <span class="text-[10px] opacity-60">· toolbar inside viewer · Ctrl/⌘ + scroll to zoom</span>
+        <span class="text-caption opacity-60">· toolbar inside viewer · Ctrl/⌘ + scroll to zoom</span>
       </div>
       <button
         type="button"
-        class="flex items-center gap-1 rounded border border-border bg-background px-2 py-0.5 text-[11px] font-medium hover:border-warning/40 hover:bg-warning/10 hover:text-warning"
+        class="flex items-center gap-1 rounded border border-border bg-background px-2 py-0.5 text-caption font-medium hover:border-warning/40 hover:bg-warning/10 hover:text-warning"
         title="Mark up any page of this PDF and attach to your next message"
         @click="startAnnotate"
       >
@@ -315,7 +315,7 @@ function onAnnotateCancel(): void {
     <!-- Toolbar (zoom + svg toggle for images / svg) -->
     <div
       v-if="kind === 'image' || kind === 'svg'"
-      class="flex items-center justify-between border-b border-border bg-card/40 px-3 py-1 text-xs text-muted-foreground"
+      class="flex items-center justify-between border-b border-border bg-card/40 px-3 py-1 text-body text-muted-foreground"
     >
       <div class="flex items-center gap-2 font-mono">
         <Icon
@@ -323,13 +323,13 @@ function onAnnotateCancel(): void {
           class="h-[14px] w-[14px]"
         />
         <span>{{ kind === "svg" ? "SVG preview" : "image preview" }}</span>
-        <span class="text-[10px] opacity-60">· scroll = zoom · drag = pan · 0/F = reset</span>
+        <span class="text-caption opacity-60">· scroll = zoom · drag = pan · 0/F = reset</span>
       </div>
       <div class="flex items-center gap-0.5">
         <button
           v-if="canAnnotate"
           type="button"
-          class="mr-2 flex items-center gap-1 rounded-sm border border-border bg-background px-1.5 py-0.5 text-[11px] font-medium hover:border-warning/40 hover:bg-warning/10 hover:text-warning"
+          class="mr-2 flex items-center gap-1 rounded-sm border border-border bg-background px-1.5 py-0.5 text-caption font-medium hover:border-warning/40 hover:bg-warning/10 hover:text-warning"
           title="Mark up this file and attach to your next message"
           @click="startAnnotate"
         >
@@ -340,7 +340,7 @@ function onAnnotateCancel(): void {
           v-if="kind === 'svg'"
           type="button"
           :class="[
-            'mr-2 rounded-sm border px-1.5 py-0.5 font-mono text-[10px] transition-colors',
+            'mr-2 rounded-sm border px-1.5 py-0.5 font-mono text-caption transition-colors',
             showAsCode
               ? 'border-primary/50 bg-primary/10 text-primary'
               : 'border-border bg-background text-muted-foreground hover:bg-accent',
@@ -358,7 +358,7 @@ function onAnnotateCancel(): void {
         </button>
         <button
           type="button"
-          class="flex min-w-[3.5rem] items-center justify-center rounded-sm px-1 font-mono text-[11px] tabular-nums hover:bg-accent hover:text-foreground"
+          class="flex min-w-[3.5rem] items-center justify-center rounded-sm px-1 font-mono text-caption tabular-nums hover:bg-accent hover:text-foreground"
           title="Click to reset to 100% (0)"
           @click="zoomToActual"
         >{{ zoomPct }}%</button>

@@ -42,6 +42,12 @@ run "install -d -m 0700 -o 1100 -g 1100 /srv/pi/data/workspaces"
 run "install -d -m 0700 -o 1100 -g 1100 /srv/pi/data/chats"
 run "install -d -m 0700 -o 1100 -g 1100 /srv/pi/data/shadows"
 run "install -d -m 0755 -o 0    -g 0    /srv/pi/www"
+# Public download artefacts (signed/unsigned .dmg, .pkg, .zip). Caddy
+# serves these directly out of /srv/pi/downloads — see the
+# /downloads/* handler in deploy/caddy/Caddyfile. Owned by root and
+# world-readable: the operator scp's new releases here and Caddy
+# (running as root) reads them.
+run "install -d -m 0755 -o 0    -g 0    /srv/pi/downloads"
 run "install -d -m 0700 -o 0    -g 0    /srv/caddy/data"
 run "install -d -m 0700 -o 0    -g 0    /srv/caddy/config"
 run "install -d -m 0700 -o 0    -g 0    /opt/pi"

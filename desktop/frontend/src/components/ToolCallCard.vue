@@ -49,7 +49,7 @@ const argsSummary = computed(() => {
 
 <template>
   <div
-    class="my-2 rounded-md border border-border bg-card px-3 py-2 font-mono text-xs shadow-sm"
+    class="my-2 rounded-md border border-border bg-card px-3 py-2 font-mono text-body shadow-sm"
   >
     <div class="flex items-baseline gap-2">
       <button
@@ -59,26 +59,26 @@ const argsSummary = computed(() => {
       >
         {{ expanded ? "▾" : "▸" }} {{ call.name }}
       </button>
-      <span :class="['text-[10px]', statusBadge.color]">{{ statusBadge.label }}</span>
+      <span :class="['text-caption', statusBadge.color]">{{ statusBadge.label }}</span>
       <span class="flex-1 truncate text-muted-foreground">{{ argsSummary }}</span>
     </div>
 
     <div v-if="expanded" class="mt-2 space-y-2">
       <div v-if="argsJson">
-        <div class="mb-1 text-[10px] uppercase tracking-wide text-muted-foreground">
+        <div class="mb-1 text-caption uppercase tracking-wide text-muted-foreground">
           args
         </div>
         <pre
-          class="whitespace-pre-wrap break-words rounded bg-background px-2 py-1 text-[11px] leading-snug text-foreground"
+          class="whitespace-pre-wrap break-words rounded bg-background px-2 py-1 text-caption leading-snug text-foreground"
         >{{ argsJson }}</pre>
       </div>
       <div v-if="call.result">
-        <div class="mb-1 text-[10px] uppercase tracking-wide text-muted-foreground">
+        <div class="mb-1 text-caption uppercase tracking-wide text-muted-foreground">
           {{ call.result.isError ? "error output" : "output" }}
         </div>
         <pre
           :class="[
-            'whitespace-pre-wrap break-words rounded bg-background px-2 py-1 text-[11px] leading-snug',
+            'whitespace-pre-wrap break-words rounded bg-background px-2 py-1 text-caption leading-snug',
             call.result.isError ? 'text-destructive' : 'text-foreground',
           ]"
         >{{ call.result.text || "(empty)" }}</pre>

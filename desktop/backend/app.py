@@ -76,7 +76,7 @@ from routes import (
     usage,
     workspaces,
 )
-from services import container_pool, egress_proxy
+from services import container_pool, dotenv_watcher, egress_proxy
 
 
 @asynccontextmanager
@@ -106,6 +106,12 @@ async def _lifespan(app: FastAPI):
     # MITM proxy. Skipping the container pool sweep + egress proxy
     # avoids spurious "/srv/pi/state read-only" warnings on first
     # launch and keeps the boot fast.
+    #
+    # In desktop mode we DO start the dotenv watcher: it polls
+    # ~/.digi-setu/.env and refreshes BYOK state without requiring
+    # the user to restart the app every time they drop a key.
+    if DEPLOY_MODE == "desktop":
+        dotenv_watcher.start()
     if DEPLOY_MODE != "desktop":
         try:
             await container_pool.cleanup_orphaned_containers()
@@ -121,13 +127,15 @@ async def _lifespan(app: FastAPI):
     try:
         yield
     finally:
+        if DEPLOY_MODE == "desktop":
+            dotenv_watcher.stop()
         if DEPLOY_MODE != "desktop":
             egress_proxy.stop_egress_proxy()
 
 
 def create_app() -> FastAPI:
     app = FastAPI(
-        title="pi-typst-test web bridge",
+        title="Digi Setu desktop sidecar",
         version="0.4.0",
         lifespan=_lifespan,
     )

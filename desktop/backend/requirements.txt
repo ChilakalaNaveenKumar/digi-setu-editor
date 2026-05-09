@@ -10,10 +10,13 @@ python-multipart==0.0.20
 clerk-backend-api==5.0.6
 svix==1.92.2
 
-# Billing (Stripe Checkout + Customer Portal + webhooks).
-# USD-only for v1; India will arrive on Razorpay or a Merchant of Record
-# (Paddle / Lemon Squeezy) once the first paid customer asks for it.
-stripe==15.1.0
+# Billing: NO Stripe SDK on the desktop. The cloud backend at
+# api.digi-setu.com owns all payment flows (Checkout, Customer
+# Portal, webhooks) — the desktop SPA opens the cloud's hosted
+# pages in the system browser via openExternal(). See
+# services/billing.py for the architectural rationale and
+# routes/billing.py for the 410-Gone redirect stubs that catch
+# any old client still hitting /api/billing/* on the sidecar.
 
 # Egress proxy (services/egress_proxy.py). The proxy MITMs HTTPS for
 # *.aiplatform.googleapis.com to inject the Vertex auth header from

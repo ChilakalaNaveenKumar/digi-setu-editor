@@ -86,6 +86,28 @@ export default {
         sans: ["var(--font-sans)"],
         mono: ["var(--font-mono)"],
       },
+      /**
+       * Compact-dense type scale (Cursor / VS Code feel).
+       *
+       * The ENTIRE app should use only these six sizes — anything outside
+       * this list is a bug. Linter target: zero `text-[Npx]` and zero
+       * `text-xs|sm|base|lg|2xl|3xl|4xl` outside of this file.
+       *
+       *   text-caption   11px / 1.4    — chips, captions, smallest microcopy
+       *   text-body      12px / 1.5    — default body text inside the IDE
+       *   text-body-lg   13px / 1.55   — slightly emphasised body / IDs
+       *   text-lead      14px / 1.55   — paragraph lead, prose pages
+       *   text-h2        18px / 1.3    — section headings
+       *   text-h1        24px / 1.2    — page hero
+       */
+      fontSize: {
+        caption:  ["11px", { lineHeight: "1.4" }],
+        body:     ["12px", { lineHeight: "1.5" }],
+        "body-lg": ["13px", { lineHeight: "1.55" }],
+        lead:     ["14px", { lineHeight: "1.55" }],
+        h2:       ["18px", { lineHeight: "1.3", letterSpacing: "-0.005em" }],
+        h1:       ["24px", { lineHeight: "1.2", letterSpacing: "-0.015em" }],
+      },
     },
   },
   plugins: [],

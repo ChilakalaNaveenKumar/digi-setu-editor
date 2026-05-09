@@ -78,7 +78,7 @@ async function routeMenuEvent(name: MenuEventName, router: Router): Promise<void
       // first means the user always sees the picker UI light up — even
       // if they were deep inside a chat — instead of a hidden file
       // dialog popping over their workspace.
-      await router.push({ name: "picker" });
+      await router.push({ name: "sessions" });
       // Use a microtask to let the route render before triggering the
       // picker's openDesktopFolder handler. The Picker view exposes
       // it as a window-level event so we don't have to plumb refs.
@@ -90,7 +90,7 @@ async function routeMenuEvent(name: MenuEventName, router: Router): Promise<void
     case "menu:close_folder": {
       const ws = useWorkspaceStore();
       ws.setActive(null);
-      await router.push({ name: "picker" });
+      await router.push({ name: "sessions" });
       return;
     }
     case "menu:new_chat": {

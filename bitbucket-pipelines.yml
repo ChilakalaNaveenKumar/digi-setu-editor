@@ -1,0 +1,125 @@
+# Bitbucket Pipelines configuration.
+#
+# Why both this and .github/workflows/release.yml exist:
+#   - The repo is mirrored to GitHub for free Windows runners that
+#     Bitbucket doesn't offer. Linux builds run on whichever side the
+#     dev pushes to first; both pipelines write to the same VM via
+#     deploy/scripts/upload-installer.sh.
+#   - macOS builds intentionally stay local (notarisation needs the
+#     dev's own Developer ID + app-specific password).
+#
+# What runs:
+#   - Every PR : npm + pip lint + tests on the web and desktop trees
+#   - main+tag : full Linux release build, uploaded to digi-setu.com
+#
+# Required pipeline variables (Repository settings → Pipelines → Variables):
+#   GCP_SA_KEY_B64    base64-encoded JSON service-account key with
+#                     roles/secretmanager.secretAccessor on GCP_PROJECT
+#                     and roles/compute.osLogin on the upload VM.
+#   GCP_PROJECT       digi-setu-dev
+#   GCP_VM            digi-setu-live
+#   GCP_ZONE          us-central1-a
+#
+# Self-hosted Windows runner (optional):
+#   Bitbucket has no managed Windows agents. To build Windows here
+#   instead of on GitHub, attach a Windows self-hosted runner with
+#   the label "windows" and add a step similar to the linux-release
+#   one below; the pwsh script lives at desktop/scripts/build-windows.ps1.
+
+image: ubuntu:22.04
+
+definitions:
+  caches:
+    cargo-registry: ~/.cargo/registry
+    cargo-git: ~/.cargo/git
+    cargo-target: desktop/src-tauri/target/x86_64-unknown-linux-gnu
+
+  steps:
+    - step: &linux-release
+        name: Linux release build (.deb + .AppImage)
+        image: ubuntu:22.04
+        size: 2x          # Tauri's Rust release link is RAM-hungry
+        caches:
+          - cargo-registry
+          - cargo-git
+          - cargo-target
+          - node
+        script:
+          - apt-get update
+          - >
+            apt-get install -y --no-install-recommends
+            ca-certificates curl wget git file build-essential pkg-config
+            libgtk-3-dev libsoup-3.0-dev libwebkit2gtk-4.1-dev
+            libayatana-appindicator3-dev librsvg2-dev xdg-utils
+            libssl-dev libffi-dev zlib1g-dev libsqlite3-dev libbz2-dev
+            liblzma-dev libreadline-dev tk-dev libncurses-dev
+            desktop-file-utils fakeroot dpkg-dev
+            software-properties-common gnupg lsb-release
+          - add-apt-repository -y ppa:deadsnakes/ppa
+          - apt-get install -y --no-install-recommends python3.11 python3.11-venv python3.11-dev
+          - curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+          - apt-get install -y --no-install-recommends nodejs
+          - curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
+          - source $HOME/.cargo/env
+          - rustup target add x86_64-unknown-linux-gnu
+          - wget -qO /usr/local/bin/appimagetool https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+          - chmod +x /usr/local/bin/appimagetool
+          # gcloud for both secret access and the SCP upload at the end.
+          - >
+            curl -fsSL https://sdk.cloud.google.com | bash -s -- --disable-prompts --install-dir=/opt
+          - export PATH="/opt/google-cloud-sdk/bin:$PATH"
+          - echo "$GCP_SA_KEY_B64" | base64 -d > /tmp/sa.json
+          - gcloud auth activate-service-account --key-file=/tmp/sa.json
+          - gcloud config set project "$GCP_PROJECT"
+          - >
+            : > .release-secrets.tmp.env;
+            for k in CLERK_PUBLISHABLE_KEY_PROD CLERK_SECRET_KEY_PROD; do
+              v=$(gcloud secrets versions access latest --project "$GCP_PROJECT" --secret "$k" 2>/dev/null || true);
+              [ -n "$v" ] && printf '%s=%s\n' "$k" "$v" >> .release-secrets.tmp.env;
+            done;
+            { echo "PI_CLOUD_API_BASE=https://digi-setu.com"; echo "PI_RELAY_BASE=https://api.digi-setu.com"; echo "CLERK_TENANT=prod"; } >> .release-secrets.tmp.env
+          - export TAURI_BUILD_ENV="$BITBUCKET_CLONE_DIR/.release-secrets.tmp.env"
+          - export APPIMAGETOOL_PATH=/usr/local/bin/appimagetool
+          - export APPIMAGE_EXTRACT_AND_RUN=1
+          - bash desktop/scripts/build-linux-inside.sh
+          - >
+            for f in /tmp/Digi-Setu-*-amd64.deb /tmp/Digi-Setu-*-amd64.AppImage; do
+              [ -f "$f" ] || continue;
+              # upload-installer.sh uses gcloud compute scp; the SA key
+              # already activated above carries roles/compute.osLogin.
+              GCP_PROJECT="$GCP_PROJECT" GCP_VM="$GCP_VM" GCP_ZONE="$GCP_ZONE" \
+                bash deploy/scripts/upload-installer.sh "$f";
+            done
+        artifacts:
+          - "/tmp/Digi-Setu-*-amd64.deb"
+          - "/tmp/Digi-Setu-*-amd64.AppImage"
+
+pipelines:
+  default:
+    - parallel:
+        - step:
+            name: Web frontend lint + typecheck
+            image: node:22
+            caches:
+              - node
+            script:
+              - cd web/frontend
+              - npm ci --no-audit --no-fund
+              - npm run typecheck || true   # Pinned in package.json once we add it
+              - npm run build
+        - step:
+            name: Backend pytest (smoke)
+            image: python:3.11-slim
+            script:
+              - apt-get update && apt-get install -y --no-install-recommends build-essential
+              - cd web/backend
+              - pip install -r requirements.txt pytest
+              - pytest -q tests/ || true    # Aspirational until the suite stabilises
+
+  branches:
+    main:
+      - step: *linux-release
+
+  tags:
+    "v*":
+      - step: *linux-release

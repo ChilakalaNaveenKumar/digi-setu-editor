@@ -99,3 +99,11 @@ scripts/_scratch/
 # `git rm -r --cached patches/backups/` (run once, intentionally) is
 # what actually drops them out of the index.
 patches/backups/
+.release-secrets.tmp.env
+
+# Build orchestration outputs (added 2026-05-09)
+.env-build
+.release-secrets.tmp.env
+desktop/build-out/
+.dev-logs/
+.gcloudignore

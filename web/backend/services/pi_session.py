@@ -286,7 +286,7 @@ def _scrub_env_for_subprocess(full_env: dict[str, str]) -> dict[str, str]:
 
 def _load_env_sh() -> dict[str, str]:
     """
-    Source pi-typst-test/scripts/env.sh in a child shell and capture the
+    Source digi-setu's scripts/env.sh in a child shell and capture the
     resulting environment. Used by the subprocess runtime to inherit the
     operator's interactive defaults. The docker runtime ignores this
     (the container has its own baked-in defaults).
@@ -410,7 +410,7 @@ class PiSession:
         provider: Optional[str] = None,
         model: Optional[str] = None,
         session_dir: Optional[Path] = None,
-        permission_mode: str = "approve_risky",
+        permission_mode: str = "ask",
         permission_mode_file: Optional[Path] = None,
         user_id: Optional[str] = None,
     ):
@@ -437,16 +437,24 @@ class PiSession:
         self._provider = provider or full_env.get("PI_PROVIDER", "anthropic-vertex")
         self._model = model or full_env.get("PI_MODEL", "claude-sonnet-4-6")
 
-        mode = (permission_mode or "approve_risky").strip().lower()
-        if mode not in {"auto", "approve_risky", "approve_all"}:
-            mode = "approve_risky"
-        self._permission_mode = mode
+        # Accept canonical IDs (auto / ask / cautious) AND legacy
+        # aliases (approve_risky / approve_all) so a stale spawn from
+        # an older client doesn't blow up; user_prefs.normalize_-
+        # permission_mode is the single source of truth for the mapping.
+        try:
+            from services.user_prefs import normalize_permission_mode  # local import to avoid cycle
+        except Exception:  # noqa: BLE001
+            normalize_permission_mode = None  # type: ignore[assignment]
+        cleaned: Optional[str] = None
+        if normalize_permission_mode is not None:
+            cleaned = normalize_permission_mode(permission_mode or "")
+        self._permission_mode = cleaned or "ask"
 
         # Materialise the permission_mode_file with mode 0644 so the
         # container's sandbox uid (1000) can read it via the bind mount.
-        # The mode token itself ("auto" / "approve_risky" / "approve_all")
-        # is not a secret — it's a UI preference — so widening read perms
-        # does not leak anything sensitive.
+        # The mode token itself ("auto" / "ask" / "cautious") is not a
+        # secret — it's a UI preference — so widening read perms does
+        # not leak anything sensitive.
         self._permission_mode_file_host: Optional[Path] = None
         if permission_mode_file is not None:
             try:

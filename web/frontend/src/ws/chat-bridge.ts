@@ -38,12 +38,17 @@ export class ChatBridge {
       const ws = new WebSocket(url);
       this.ws = ws;
       ws.onopen = () => this.opts.onState("open");
-      ws.onerror = () => this.opts.onState("error", "websocket error");
+      // The `error` payload here is a STABLE CODE (matches an
+      // `errors.<code>` i18n key), never a raw English string. The
+      // chat store is responsible for translating it. This keeps the
+      // bridge transport-agnostic and prevents English from sneaking
+      // into non-English locales.
+      ws.onerror = () => this.opts.onState("error", "network");
       ws.onclose = (e) => {
         // 4401 = "auth required"; surface it as an error so the route
         // guard can bounce the user to /login.
         if (e.code === 4401) {
-          this.opts.onState("error", "not signed in");
+          this.opts.onState("error", "session_expired");
           return;
         }
         // 4408 = prompt timeout (server killed a runaway turn). The
@@ -54,11 +59,22 @@ export class ChatBridge {
           this.opts.onState("closed");
           return;
         }
-        // 4409 = "kicked by a newer tab". Same session id was opened
-        // somewhere else; we lose. Surface as an error with a clear
-        // message so the chat pane can render the dedicated banner.
+        // 4409 = "conflict / capacity". Two distinct sub-cases the
+        // server differentiates via the close `reason` field:
+        //   reason starts with "too_many_chats" -> the per-user
+        //     concurrent-chat cap is hit; user has to close one of
+        //     their other open chats before this one can connect.
+        //   anything else -> "kicked by a newer tab". Same session
+        //     id was opened somewhere else; we lose.
+        // Both go through the same banner pipeline but with different
+        // copy + actions, so we propagate them as distinct error codes.
         if (e.code === 4409) {
-          this.opts.onState("error", "kicked by newer tab");
+          const reason = e.reason ?? "";
+          if (reason.startsWith("too_many_chats")) {
+            this.opts.onState("error", "too_many_chats");
+          } else {
+            this.opts.onState("error", "session_kicked");
+          }
           return;
         }
         // 4410 = client-requested abort. Backend killed the pi
@@ -72,10 +88,13 @@ export class ChatBridge {
         }
         // 4429 = WS-level rate limit (connect/spawn bucket exhausted).
         if (e.code === 4429) {
-          this.opts.onState("error", "you're connecting too fast");
+          this.opts.onState("error", "rate_limit");
           return;
         }
-        this.opts.onState(this.explicitlyClosed ? "closed" : "error");
+        this.opts.onState(
+          this.explicitlyClosed ? "closed" : "error",
+          this.explicitlyClosed ? null : "network",
+        );
       };
       ws.onmessage = (e) => {
         let parsed: unknown;
@@ -106,7 +125,7 @@ export class ChatBridge {
     try {
       this.ws.send(JSON.stringify(payload));
     } catch {
-      this.opts.onState("error", "failed to send");
+      this.opts.onState("error", "network");
     }
   }
 

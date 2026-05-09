@@ -7,7 +7,7 @@ This is the actual hands-on comparison: same model (`gemini-3.1-pro-preview`), s
 ## 0. One-time setup (~2 min)
 
 ```bash
-cd "$(dirname pi-typst-test)/pi-typst-test"   # this directory
+cd <repo root>   # the directory containing this RUN.md
 
 # 0a. ADC for Vertex (skip if already done elsewhere)
 gcloud auth application-default login

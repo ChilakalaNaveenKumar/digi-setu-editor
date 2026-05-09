@@ -76,7 +76,8 @@ onUpdated(() => {
 
     <div
       v-if="message.error"
-      class="mt-2 rounded border border-destructive/40 bg-destructive/10 px-2 py-1 font-mono text-xs text-destructive"
+      class="mt-2 rounded border border-destructive/40 bg-destructive/10 px-2 py-1 text-body text-destructive"
+      role="alert"
     >
       {{ message.error }}
     </div>

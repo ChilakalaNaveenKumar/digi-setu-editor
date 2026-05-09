@@ -1,23 +1,50 @@
 /**
- * Stripe-backed billing client.
+ * Billing client (DESKTOP) — thin redirector.
  *
- * Three flows the SPA exercises:
- *   - `getStatus()`           on app boot, to know whether to render
- *                              Upgrade buttons or a "billing not
- *                              configured in this build" notice.
- *   - `startCheckout(plan)`   redirect into Stripe Checkout when the
- *                              user clicks Upgrade.
- *   - `openPortal()`          redirect into the Stripe Customer Portal
- *                              for plan changes / cancellations / card
- *                              updates. We never reimplement that UI.
- *   - `getUsage()`            polled by the credit chip; returns the
- *                              user's monthly $ spend + plan tier.
+ * The desktop sidecar has no Stripe code (see desktop/backend/services/
+ * billing.py for the full architecture write-up). All real billing
+ * operations — Checkout, Customer Portal, webhooks — live on the cloud
+ * backend at api.digi-setu.com and are reached through hosted pages on
+ * digi-setu.com that the system browser opens for the user.
+ *
+ * What this module does:
+ *
+ *   - `getBillingStatus()`     return a synthetic { enabled: true, plans }
+ *                              built from the public catalogue. Always
+ *                              `enabled` because the redirect path always
+ *                              works regardless of local configuration.
+ *   - `getPlans()`             fetch the public plan catalogue from the
+ *                              local sidecar (which mirrors the cloud's).
+ *   - `cloudCheckoutUrl(plan)` URL on digi-setu.com to send the user to
+ *                              for an Upgrade click. The cloud reads the
+ *                              ?plan= query, creates a Stripe Checkout
+ *                              session in the user's authenticated
+ *                              browser context, and 302's into Stripe.
+ *   - `cloudPortalUrl()`       URL on digi-setu.com that creates a
+ *                              Stripe Customer Portal session and
+ *                              redirects into it.
+ *   - `getUsage()`             polled by the credit chip; the local
+ *                              sidecar proxies api.digi-setu.com/api/usage.
+ *   - `getUsageEvents()`       Activity table; same proxy.
+ *   - `getByokUsage()`         local SQLite token tally for BYOK chats.
+ *                              Stays local — no money flows.
+ *
+ * What this module deliberately does NOT do any more:
+ *
+ *   - Call POST /api/billing/checkout (returns 410 on the sidecar).
+ *   - Call POST /api/billing/portal   (returns 410 on the sidecar).
+ *   - Carry any Stripe session ids — those are minted only on the cloud
+ *     inside the user's browser session.
  */
 
-import { apiJson, apiPost } from "./client";
+import { apiJson } from "./client";
 import type { CreditSnapshot, PlanInfo } from "./types";
 
 export interface BillingStatus {
+  /** Always true on the desktop now — the redirect to digi-setu.com
+   *  works regardless of whether Stripe is configured on this machine
+   *  (it isn't and never will be). Kept in the response shape for
+   *  parity with the web build's BillingStatus. */
   enabled: boolean;
   currency: "usd";
   plans: PlanInfo[];
@@ -32,10 +59,50 @@ export interface UsageResponse {
     limits: Record<string, { capacity: number; refill_per_sec: number }>;
   };
   credit: CreditSnapshot;
+  /** Where the snapshot came from. "cloud" = authoritative, fetched
+   *  via the sidecar's proxy from api.digi-setu.com. The "offline_*"
+   *  variants surface when the cloud is unreachable; the SPA can show
+   *  a small "couldn't reach the cloud" hint without panicking. */
+  source?: "cloud" | "offline_byok" | "offline_signed_out";
+  /** Non-null when ``source`` is offline AND the cloud actually
+   *  returned an error (vs. the user being signed-out). For ops, not
+   *  surfaced verbatim in the UI. */
+  cloud_error?: string | null;
 }
 
-export function getBillingStatus(): Promise<BillingStatus> {
-  return apiJson("/api/billing/status");
+interface PlansResponse {
+  plans: PlanInfo[];
+}
+
+/**
+ * Resolve the cloud web base for billing redirects. Same pattern as
+ * lib/desktop-auth.ts:_resolveWebAuthBase — VITE override for dev,
+ * hard-coded https://digi-setu.com for production builds.
+ */
+function _cloudWebBase(): string {
+  const env = (import.meta as { env?: Record<string, string> }).env;
+  const fromEnv = env?.VITE_DIGI_SETU_WEB_BASE || env?.VITE_DESKTOP_AUTH_URL;
+  if (fromEnv) return fromEnv.replace(/\/+$/, "");
+  return "https://digi-setu.com";
+}
+
+/** Public plan catalogue. Sidecar serves the same shape as the cloud. */
+export function getPlans(): Promise<PlansResponse> {
+  return apiJson("/api/plans");
+}
+
+/**
+ * Synthesize the {@link BillingStatus} shape from the public plan
+ * catalogue. There's no longer a server-side `enabled` flag — billing
+ * IS available because we always have somewhere to send the user.
+ */
+export async function getBillingStatus(): Promise<BillingStatus> {
+  const r = await getPlans();
+  return {
+    enabled: true,
+    currency: "usd",
+    plans: r.plans,
+  };
 }
 
 export function getUsage(): Promise<UsageResponse> {
@@ -84,12 +151,16 @@ export interface UsageEvent {
 export interface UsageEventsResponse {
   events: UsageEvent[];
   limit: number;
+  /** "cloud" when the proxy succeeded; "offline*" if the sidecar
+   *  couldn't reach api.digi-setu.com. SPA renders a small banner. */
+  source?: "cloud" | "offline" | "offline_signed_out";
+  cloud_error?: string | null;
 }
 
 /**
  * Returns the most recent activity events for the signed-in user,
- * newest first. The server keeps a 500-event ring per user; older
- * entries fall off silently. Use `since` (ISO-8601 UTC) to poll
+ * newest first. Sidecar forwards this from digi-setu.com — see
+ * services/cloud_api.py. Use `since` (ISO-8601 UTC) to poll
  * incrementally.
  */
 export function getUsageEvents(opts: {
@@ -149,6 +220,11 @@ export interface ByokUsageResponse {
  * response is empty (and `byok_active=false`) in web mode and in
  * desktop installs without any BYOK keys, so callers don't need to
  * branch on deployment shape.
+ *
+ * Note: this stays local because BYOK is uncharged by us — there's
+ * no money to track on the cloud. Deleting the local file blanks
+ * the user's *own* activity log; it cannot grant them free
+ * subscription usage.
  */
 export function getByokUsage(opts: {
   limit?: number;
@@ -161,15 +237,32 @@ export function getByokUsage(opts: {
   return apiJson(`/api/usage/byok${qs ? "?" + qs : ""}`);
 }
 
-export interface CheckoutResponse {
-  url: string;
-  session_id: string;
+/**
+ * URL on digi-setu.com that triggers a Stripe Checkout for the
+ * given plan. Caller (the billing store) opens this in the system
+ * browser via openExternal(). The cloud route reads the `?plan=`
+ * query, creates the Stripe session in the user's signed-in browser
+ * context, and 302s into checkout.stripe.com.
+ *
+ * `?source=desktop` is a soft hint the cloud may use to (a) tag the
+ * Stripe session metadata for analytics, and (b) pick a different
+ * post-payment landing copy ("you can close this tab and return to
+ * the desktop app" instead of "back to your dashboard").
+ */
+export function cloudCheckoutUrl(planId: string): string {
+  const base = _cloudWebBase();
+  const params = new URLSearchParams({ plan: planId, source: "desktop" });
+  return `${base}/pricing?${params.toString()}`;
 }
 
-export function startCheckout(planId: string, returnUrl?: string): Promise<CheckoutResponse> {
-  return apiPost("/api/billing/checkout", { plan_id: planId, return_url: returnUrl });
-}
-
-export function openPortal(returnUrl?: string): Promise<{ url: string }> {
-  return apiPost("/api/billing/portal", { return_url: returnUrl });
+/**
+ * URL on digi-setu.com that creates a Stripe Customer Portal session
+ * for the signed-in user. The portal is where users change plans,
+ * update cards, and cancel subscriptions — Stripe runs the entire
+ * UI; we never reimplement it.
+ */
+export function cloudPortalUrl(): string {
+  const base = _cloudWebBase();
+  const params = new URLSearchParams({ source: "desktop" });
+  return `${base}/account/billing?${params.toString()}`;
 }

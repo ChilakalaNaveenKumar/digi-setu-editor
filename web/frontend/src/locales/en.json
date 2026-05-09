@@ -1,0 +1,148 @@
+{
+  "$schema_note": "Strings the entire Digi Setu UI uses. Keys are organised by feature so adding a second language is a matter of duplicating this file (e.g. hi.json, es.json) and translating. The convention: short fragments (buttons, labels, mode names) live here; long-form prose (Privacy / Terms paragraphs) stays inline in the .vue template — translators clone the file in those rare cases.",
+
+  "brand": {
+    "name": "Digi Setu",
+    "homeAria": "Digi Setu — home"
+  },
+
+  "common": {
+    "allow": "Allow",
+    "deny": "Deny",
+    "alwaysAllow": "Always allow",
+    "alwaysDeny": "Always deny",
+    "cancel": "Cancel",
+    "save": "Save",
+    "loading": "Loading…",
+    "tryAgain": "Try again",
+    "saved": "saved",
+    "more": "more",
+    "moreQueued": "{count} more queued"
+  },
+
+  "billing": {
+    "lowCreditToast": "Heads up — only {remaining} of {budget} left this month. Upgrade any time from the gear menu."
+  },
+
+  "errors": {
+    "setup_required": "Please sign in to start chatting.",
+    "session_expired": "Your sign-in expired. Please sign in again.",
+    "session_unknown": "This chat is no longer available.",
+    "session_kicked": "This chat was opened in another tab. Reload to continue here.",
+    "too_many_chats": "You already have 5 chats open. Close one of your other tabs before starting another.",
+    "workspace_missing": "This folder is no longer available.",
+    "network": "Connection lost. Please check your internet and try again.",
+    "not_connected": "Reconnecting to the chat service. Please wait a moment and try again.",
+    "timeout": "This is taking longer than expected. Please try again.",
+    "rate_limit": "You're sending messages a bit too quickly. Please wait a few seconds and try again.",
+    "capacity": "Our servers are busy right now. Please try again in a moment.",
+    "quota_exceeded": "You've used up your plan's allowance for now. Please upgrade or wait for your plan to reset.",
+    "upgrade_required": "This model is part of a paid plan. Please upgrade your account to continue.",
+    "storage_full": "This folder is full. Please free up some space and try again.",
+    "aborted": "Stopped.",
+    "internal": "Something went wrong. Please try again.",
+    "provider_usage_policy": "This message was blocked by the AI provider's usage policy. Please rephrase your request and try again.",
+    "provider_safety_block": "The AI's response was blocked by safety filters. Please rephrase your request and try again.",
+    "provider_context_too_large": "This conversation has grown too long for the model. Please start a new chat or remove some attachments.",
+    "provider_billing": "There's a billing problem with the AI provider for this account. Please check your subscription and try again.",
+    "provider_quota_exhausted": "You've reached the usage cap for this AI model. Please switch to a different model or try again later.",
+    "provider_rate_limit": "You're sending messages a bit too quickly. Please wait a few seconds and try again.",
+    "provider_overloaded": "The AI service is overloaded right now. Please try again in 30 to 60 seconds.",
+    "provider_model_unavailable": "This model isn't available right now. Please pick a different model from the menu.",
+    "provider_auth": "Your sign-in needs a refresh. Please sign in again and resend your message.",
+    "provider_invalid_request": "The AI couldn't process that message. Please try simplifying or shortening your prompt.",
+    "provider_timeout": "The AI took too long to respond. Please try again.",
+    "provider_network": "Couldn't reach the AI service. Please check your internet and try again.",
+    "provider_error": "Something went wrong. Please try again."
+  },
+
+  "nav": {
+    "activity": "Activity",
+    "pricing": "Pricing",
+    "privacy": "Privacy",
+    "terms": "Terms",
+    "feedback": "Feedback",
+    "sessions": "Sessions",
+    "newChat": "New chat",
+    "openFolder": "Open folder",
+    "closeFolder": "Close folder",
+    "signIn": "Sign in"
+  },
+
+  "permission": {
+    "modeLabel": "Permission mode: {mode}",
+    "appliesToChat": "Applies to {bold} from the next tool call onward.",
+    "thisChat": "this chat",
+
+    "mode": {
+      "auto": {
+        "label": "Auto",
+        "blurb": "Run every tool without asking. Every action is still recorded in the audit log."
+      },
+      "ask": {
+        "label": "Ask",
+        "blurb": "Ask before shell commands, file edits, and background processes. Reads pass silently."
+      },
+      "cautious": {
+        "label": "Cautious",
+        "blurb": "Ask before every tool call, including reads and searches. Most cautious."
+      }
+    },
+
+    "prompt": {
+      "wantsTo": "Digi Setu wants to",
+      "showDetails": "Show details (a)",
+      "hideDetails": "Hide details (a)",
+      "intent": "Intent",
+      "command": "Command",
+      "create": "Create",
+      "modify": "Modify",
+      "arguments": "Arguments",
+      "tools": {
+        "bash": "run a shell command",
+        "write": "create a file",
+        "edit": "modify a file",
+        "process": "start a background process",
+        "process_start": "start a background process"
+      },
+      "buttons": {
+        "allow": "Allow",
+        "alwaysAllow": "Always allow",
+        "alwaysDeny": "Always deny",
+        "deny": "Deny",
+        "allowTitle": "Allow this single call. Digi Setu will ask again next time. (↵)",
+        "alwaysAllowTitle": "Allow this AND every future call with the same arguments for the rest of this chat. (⇧↵)",
+        "alwaysDenyTitle": "Deny this AND every future call with the same arguments for the rest of this chat.",
+        "denyTitle": "Deny this single call. Digi Setu will ask again next time. (esc)"
+      }
+    }
+  },
+
+  "fileTree": {
+    "header": {
+      "back": "Sessions",
+      "newFile": "New File",
+      "newFolder": "New Folder",
+      "refresh": "Refresh",
+      "collapseAll": "Collapse All"
+    },
+    "workspace": "workspace · {count}",
+    "empty": "Empty. Files appear here as the agent creates them — or use the buttons above to create one yourself."
+  },
+
+  "workspace": {
+    "untitledChat": "Untitled chat",
+    "connectionClosed": "Lost connection. Reconnecting…",
+    "connectionError": "Something's not working. Please try again."
+  },
+
+  "privacy": {
+    "badge": "v2 · last updated 2026-05",
+    "title": "Privacy & data handling"
+  },
+
+  "terms": {
+    "badge": "v2 · last updated 2026-05",
+    "title": "Terms & output ownership"
+  }
+}

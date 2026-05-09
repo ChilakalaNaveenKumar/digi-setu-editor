@@ -86,6 +86,19 @@ export default {
         sans: ["var(--font-sans)"],
         mono: ["var(--font-mono)"],
       },
+      /**
+       * Compact-dense type scale (Cursor / VS Code feel). See the desktop
+       * tailwind.config.ts for the full rationale; both apps share the
+       * exact same scale so cross-fork visual parity is automatic.
+       */
+      fontSize: {
+        caption:  ["11px", { lineHeight: "1.4" }],
+        body:     ["12px", { lineHeight: "1.5" }],
+        "body-lg": ["13px", { lineHeight: "1.55" }],
+        lead:     ["14px", { lineHeight: "1.55" }],
+        h2:       ["18px", { lineHeight: "1.3", letterSpacing: "-0.005em" }],
+        h1:       ["24px", { lineHeight: "1.2", letterSpacing: "-0.015em" }],
+      },
     },
   },
   plugins: [],

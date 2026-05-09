@@ -54,7 +54,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from config import CORS_ORIGINS, DEPLOY_MODE
+from config import CORS_ORIGINS
 from routes import (
     attachments,
     auth_webhook,
@@ -62,6 +62,7 @@ from routes import (
     billing,
     chat_ws,
     config as config_route,
+    desktop_handoff,
     desktop_relay,
     feedback,
     files,
@@ -101,33 +102,26 @@ async def _lifespan(app: FastAPI):
     fall back to the subprocess runtime where this proxy isn't on
     the path anyway.
     """
-    # Desktop mode runs the agent as a plain subprocess on the user's
-    # own machine — no Docker, no per-session containers, no egress
-    # MITM proxy. Skipping the container pool sweep + egress proxy
-    # avoids spurious "/srv/pi/state read-only" warnings on first
-    # launch and keeps the boot fast.
-    if DEPLOY_MODE != "desktop":
-        try:
-            await container_pool.cleanup_orphaned_containers()
-        except Exception as exc:
-            # Cleanup failures are non-fatal — orphans burn a little
-            # memory until the next manual `docker rm` but don't break
-            # new chats.
-            import sys as _sys
-            print(f"[lifespan] container_pool cleanup failed: {exc}", file=_sys.stderr)
+    try:
+        await container_pool.cleanup_orphaned_containers()
+    except Exception as exc:
+        # Cleanup failures are non-fatal — orphans burn a little
+        # memory until the next manual `docker rm` but don't break
+        # new chats.
+        import sys as _sys
+        print(f"[lifespan] container_pool cleanup failed: {exc}", file=_sys.stderr)
 
-        egress_proxy.start_egress_proxy()
+    egress_proxy.start_egress_proxy()
 
     try:
         yield
     finally:
-        if DEPLOY_MODE != "desktop":
-            egress_proxy.stop_egress_proxy()
+        egress_proxy.stop_egress_proxy()
 
 
 def create_app() -> FastAPI:
     app = FastAPI(
-        title="pi-typst-test web bridge",
+        title="Digi Setu web bridge",
         version="0.4.0",
         lifespan=_lifespan,
     )
@@ -156,17 +150,18 @@ def create_app() -> FastAPI:
 
     app.include_router(chat_ws.router)
     app.include_router(terminal_ws.router)
+    # Desktop chat-relay WS — sits next to chat_ws because it shares
+    # the same protocol surface (delegates to chat_ws.run_session_loop).
+    # Requires services/auth's subprotocol-bearer support to be wired,
+    # which it is (see _WsRequestish + _bearer_from_subprotocol).
+    app.include_router(desktop_relay.router)
 
     # Public (unauth) auth-side endpoints: webhook + feedback.
     # auth_webhook is Clerk-signature-verified; feedback requires a
     # signed-in user.
     app.include_router(auth_webhook.router)
+    app.include_router(desktop_handoff.router)
 
-    # Desktop relay: hosted backend endpoint that desktop clients (no
-    # BYOK key, signed in via Clerk) connect to over WebSocket. The
-    # router itself decides per-request whether to accept based on
-    # plan + headers; see web/backend/routes/desktop_relay.py.
-    app.include_router(desktop_relay.router)
     app.include_router(feedback.router)
     app.include_router(usage.router)
     app.include_router(models_route.router)

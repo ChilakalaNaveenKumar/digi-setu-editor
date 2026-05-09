@@ -29,8 +29,10 @@ async def get_models(user_id: str = Depends(require_user)) -> dict[str, Any]:
     # Annotate each entry with the routing path it would actually
     # take ("byok" | "cloud") so the model picker can show a badge
     # AND so chat_ws can later reject cloud-only picks for users
-    # without an active subscription. Web mode is always cloud (BYOK
-    # detection is gated on DEPLOY_MODE=desktop).
+    # without an active subscription. The hosted SaaS deployment runs
+    # without BYOK credentials so every entry resolves to "cloud";
+    # self-hosted operators with BYOK keys in the backend env get
+    # "byok" entries for the providers they have keys for.
     for entry in entries:
         spec = get_model(entry["id"])
         entry["route"] = route_for_model(spec) if spec else "cloud"

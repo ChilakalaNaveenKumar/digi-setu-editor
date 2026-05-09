@@ -64,8 +64,8 @@ from services.paths import ws_root
 
 # Identity used for shadow-repo commits. Hardcoded so user .gitconfig
 # isn't required and commits show as agent-authored.
-SHADOW_AUTHOR_NAME = "pi-typst-test agent"
-SHADOW_AUTHOR_EMAIL = "agent@pi-typst-test.local"
+SHADOW_AUTHOR_NAME = "Digi Setu agent"
+SHADOW_AUTHOR_EMAIL = "agent@digi-setu.local"
 
 SHADOWS_ROOT_NAME = "shadows"
 GIT_DIR_NAME = ".git"

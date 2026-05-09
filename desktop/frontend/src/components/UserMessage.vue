@@ -1,6 +1,12 @@
 <!--
-  UserMessage — chat bubble for the user. Compact card with subtle accent
-  rail on the left.
+  UserMessage — chat bubble for the user.
+
+  Visual: slim 2 px accent rail on the left, NO full border / loud
+  background fill. The earlier card-style version made every "Hi"
+  look like a banner announcement next to a plain-text assistant
+  reply, which broke the "this is a dialogue" reading. The accent
+  rail keeps speakers visually distinguishable without colouring in
+  the whole turn.
 
   Long messages (>~12 lines or 1500 chars of source) auto-collapse to a
   preview with a "Show more / less" toggle, so a single 100k-char paste
@@ -88,16 +94,16 @@ async function revertTurn(): Promise<void> {
 </script>
 
 <template>
-  <div ref="root" class="user-bubble group my-5 rounded-md px-4 py-3">
+  <div ref="root" class="user-bubble group my-5 pl-3">
     <div class="mb-1 flex items-center justify-between">
-      <span class="text-[10px] uppercase tracking-wide text-muted-foreground">
-        you<span v-if="isLong" class="ml-1.5 normal-case opacity-60">·
+      <span class="text-caption font-medium uppercase tracking-wide text-muted-foreground/80">
+        You<span v-if="isLong" class="ml-1.5 normal-case opacity-60">·
           {{ lineCount }} lines, {{ text.length.toLocaleString() }} chars</span>
       </span>
       <button
         type="button"
         :disabled="revertBusy"
-        class="rounded-sm border border-border bg-background px-1.5 py-0.5 text-[10px] text-muted-foreground opacity-0 transition-opacity hover:border-destructive/60 hover:text-destructive group-hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-50"
+        class="rounded-sm border border-border bg-background px-1.5 py-0.5 text-caption text-muted-foreground opacity-0 transition-opacity hover:border-destructive/60 hover:text-destructive group-hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-50"
         title="Revert every file change made in response to this prompt"
         @click="revertTurn"
       >
@@ -111,17 +117,17 @@ async function revertTurn(): Promise<void> {
       cleanly.
     -->
     <div class="relative">
-      <div class="pi-markdown text-foreground" v-html="html" />
+      <div class="pi-markdown leading-relaxed text-foreground" v-html="html" />
       <div
         v-if="isLong && !expanded"
-        class="pointer-events-none absolute inset-x-0 bottom-0 h-10 bg-gradient-to-t from-[var(--user-bubble-bg,theme(colors.muted.DEFAULT))] to-transparent"
+        class="pointer-events-none absolute inset-x-0 bottom-0 h-10 bg-gradient-to-t from-background to-transparent"
         aria-hidden="true"
       />
     </div>
     <button
       v-if="isLong"
       type="button"
-      class="mt-1 inline-flex items-center gap-1 rounded text-[10px] font-mono text-muted-foreground hover:text-foreground"
+      class="mt-1 inline-flex items-center gap-1 rounded text-caption font-mono text-muted-foreground hover:text-foreground"
       @click="expanded = !expanded"
     >
       <Icon
@@ -132,25 +138,15 @@ async function revertTurn(): Promise<void> {
     </button>
     <div
       v-if="revertedFiles"
-      class="mt-1 text-[10px] text-success"
+      class="mt-1 text-caption text-success"
     >
       reverted {{ revertedFiles.length }} file{{ revertedFiles.length === 1 ? "" : "s" }}
     </div>
     <div
       v-if="revertError"
-      class="mt-1 text-[10px] text-destructive"
+      class="mt-1 text-caption text-destructive"
     >
       {{ revertError }}
     </div>
   </div>
 </template>
-
-<style scoped>
-/* Pull the bubble's exact background colour into the fade gradient via
-   a CSS variable, so the fade reads as "fading into the bubble" rather
-   than fading into a generic surface. Falls back to muted when the
-   bubble doesn't expose its own bg variable. */
-.user-bubble {
-  --user-bubble-bg: hsl(var(--card));
-}
-</style>

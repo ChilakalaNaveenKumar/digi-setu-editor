@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# remote-deploy.sh — laptop-side orchestrator for the pi-typst-test
+# remote-deploy.sh — laptop-side orchestrator for the digi-setu
 # hosted deployment to digi-setu-live (the existing VM in
 # digi-setu-dev/us-central1-a that previously hosted typst-agent).
 #
@@ -75,17 +75,35 @@ run() {
 ssh_remote() {
   # OS Login + project SSH keys do not populate ~/.ssh for raw `ssh
   # ubuntu@<external-ip>` — always hop through `gcloud compute ssh`.
+  #
+  # We base64-encode the bash payload before stuffing it into
+  # gcloud's `--command` because gcloud is single-shot and gets
+  # confused by multi-line scripts with embedded quotes / heredocs.
+  # The encoding is purely a transport hack — there's no security
+  # value to it. To keep the deploy log readable we print only the
+  # first non-empty line of the ORIGINAL script (with a "+ ssh:"
+  # prefix) instead of dumping a 2KB base64 blob.
   if [[ "$#" -ne 1 ]]; then
     fail "ssh_remote expects exactly one shell-string argument"
   fi
   local cmd="$1"
-  local enc
+  local enc preview
   enc="$(printf '%s' "${cmd}" | base64 | tr -d '\n')"
-  run gcloud compute ssh "${VM}" \
-    --project "${PROJECT}" \
-    --zone "${ZONE}" \
-    --strict-host-key-checking=yes \
-    --command="echo '${enc}' | base64 -d | bash -s"
+  preview="$(printf '%s\n' "${cmd}" \
+              | grep -vE '^\s*(#|$)' \
+              | head -n 1 \
+              | sed 's/[[:space:]]\{2,\}/ /g' \
+              | cut -c1-120)"
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    printf '+ ssh: %s ...\n' "${preview}"
+  else
+    printf '+ ssh: %s ...\n' "${preview}"
+    gcloud compute ssh "${VM}" \
+      --project "${PROJECT}" \
+      --zone "${ZONE}" \
+      --strict-host-key-checking=yes \
+      --command="echo '${enc}' | base64 -d | bash -s"
+  fi
 }
 
 scp_remote() {
@@ -268,9 +286,75 @@ push_frontend() {
     --command='sudo install -d -m 0755 -o root -g root /srv/pi/www && sudo find /srv/pi/www -mindepth 1 -delete && sudo tar xf - -C /srv/pi/www'
 }
 
+# ── Step 5b: materialize stack.env on the VM from Secret Manager ──
+#
+# Secrets used to live in plaintext at /opt/pi/stack.env, scp'd from
+# the operator's laptop. That meant the canonical copy lived on
+# whichever laptop pushed last and rotation required SSH-and-vi.
+# Now: the VM's attached SA has roles/secretmanager.secretAccessor
+# on every key managed by deploy/scripts/secrets-sync.sh. At deploy
+# time we ask the VM to pull each secret into a fresh stack.env,
+# then preserve the non-secret config (image refs, price IDs, public
+# Clerk key, etc.) by merging from the previous file. We never write
+# the secret values to the deploy log or the operator's terminal.
+materialize_stack_env() {
+  log "materializing /opt/pi/stack.env from Secret Manager (project ${PROJECT})"
+  # Keep this list in sync with MANAGED_KEYS in secrets-sync.sh.
+  local managed=(
+    CLOUDFLARE_API_TOKEN
+    GEMINI_API_KEY
+    CLERK_SECRET_KEY
+    CLERK_WEBHOOK_SECRET
+    STRIPE_SECRET_KEY
+    STRIPE_WEBHOOK_SECRET
+  )
+  local managed_str="${managed[*]}"
+  ssh_remote "set -euo pipefail
+sudo install -d -m 0700 -o root -g root /opt/pi
+TMP=\$(sudo mktemp /opt/pi/stack.env.new.XXXXXX)
+sudo chmod 0600 \"\${TMP}\"
+
+# Preserve every non-managed key from the existing stack.env so we
+# don't blow away image tags, price IDs, etc. Operator workflow:
+# edit non-secrets in deploy/stack.env on the laptop and ship via
+# the existing scp path; secrets are now untouchable from the
+# laptop side.
+if sudo test -f ${REMOTE_ROOT}/stack.env; then
+  managed='${managed_str}'
+  filter_re=\"^(\$(printf '%s' \"\${managed}\" | tr ' ' '|'))=\"
+  sudo grep -vE \"\${filter_re}\" ${REMOTE_ROOT}/stack.env | sudo tee \"\${TMP}\" >/dev/null
+fi
+
+# Append the freshly-fetched secrets. We use the VM's attached SA
+# token (no human-key auth) so this only succeeds if seed-iam was
+# run for the secret.
+TOK=\$(curl -fsS -H 'Metadata-Flavor: Google' \\
+  'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token' \\
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)[\"access_token\"])')
+for k in ${managed_str}; do
+  v=\$(curl -fsS -H \"Authorization: Bearer \${TOK}\" \\
+        \"https://secretmanager.googleapis.com/v1/projects/${PROJECT}/secrets/\${k}/versions/latest:access\" \\
+        | python3 -c 'import sys,json,base64; print(base64.b64decode(json.load(sys.stdin)[\"payload\"][\"data\"]).decode(), end=\"\")' \\
+        2>/dev/null || true)
+  if [ -z \"\${v}\" ]; then
+    echo \"  ! GSM missing: \${k} (skipped)\" >&2
+    continue
+  fi
+  printf '%s=%s\n' \"\${k}\" \"\${v}\" | sudo tee -a \"\${TMP}\" >/dev/null
+  echo \"  + materialized \${k}\" >&2
+done
+
+sudo chown root:root \"\${TMP}\"
+sudo chmod 0600 \"\${TMP}\"
+sudo mv \"\${TMP}\" ${REMOTE_ROOT}/stack.env
+echo '  ok — stack.env regenerated from GSM'
+"
+}
+
 # ── Step 6: pull the new image + reload the stack ─────────────────
 roll_stack() {
   log "rolling docker compose on ${VM} (image tag ${TAG})"
+  materialize_stack_env
   ssh_remote "set -e
 cd ${REMOTE_ROOT}
 test -f ./stack.env || { echo 'ERROR: ${REMOTE_ROOT}/stack.env missing — populate it before rolling' >&2; exit 1; }

@@ -38,12 +38,26 @@ export class ChatBridge {
       const ws = new WebSocket(url);
       this.ws = ws;
       ws.onopen = () => this.opts.onState("open");
-      ws.onerror = () => this.opts.onState("error", "websocket error");
+      // Emit STABLE error codes (not English strings). The chat pane
+      // / banner translates each code to a friendly localised
+      // message via the `ws.error.<code>` i18n namespace. Raw English
+      // like "websocket error" used to leak straight to the UI which
+      // looked like a debug message escaping into the product.
+      ws.onerror = () => this.opts.onState("error", "ws_error");
       ws.onclose = (e) => {
         // 4401 = "auth required"; surface it as an error so the route
         // guard can bounce the user to /login.
         if (e.code === 4401) {
-          this.opts.onState("error", "not signed in");
+          this.opts.onState("error", "ws_unauthorized");
+          return;
+        }
+        // 4403 = forbidden (relay rejected the JWT — usually clock
+        // skew or the cloud relay restarted with a new signing key
+        // mid-session). Distinct from 4401 so the UI can hint at
+        // "your session expired, sign in again" instead of a generic
+        // "not signed in".
+        if (e.code === 4403) {
+          this.opts.onState("error", "ws_forbidden");
           return;
         }
         // 4408 = prompt timeout (server killed a runaway turn). The
@@ -54,11 +68,19 @@ export class ChatBridge {
           this.opts.onState("closed");
           return;
         }
-        // 4409 = "kicked by a newer tab". Same session id was opened
-        // somewhere else; we lose. Surface as an error with a clear
-        // message so the chat pane can render the dedicated banner.
+        // 4409 = "conflict / capacity". Two sub-cases distinguished
+        // by the close `reason`:
+        //   "too_many_chats:<n>/<cap>" — desktop window count hit the
+        //     server's per-user concurrent-chat cap (default 5). User
+        //     must close one of their other windows / tabs.
+        //   anything else — a newer tab / window kicked this session.
         if (e.code === 4409) {
-          this.opts.onState("error", "kicked by newer tab");
+          const reason = e.reason ?? "";
+          if (reason.startsWith("too_many_chats")) {
+            this.opts.onState("error", "ws_too_many_chats");
+          } else {
+            this.opts.onState("error", "ws_kicked");
+          }
           return;
         }
         // 4410 = client-requested abort. Backend killed the pi
@@ -72,10 +94,17 @@ export class ChatBridge {
         }
         // 4429 = WS-level rate limit (connect/spawn bucket exhausted).
         if (e.code === 4429) {
-          this.opts.onState("error", "you're connecting too fast");
+          this.opts.onState("error", "ws_rate_limited");
           return;
         }
-        this.opts.onState(this.explicitlyClosed ? "closed" : "error");
+        // 4503 / 1011 / 1006 = upstream relay or local sidecar
+        // restart. Surface as a retryable network blip so the banner
+        // shows "Reconnect" instead of a scarier "session ended".
+        if (e.code === 1006 || e.code === 1011 || e.code === 4503) {
+          this.opts.onState("error", "ws_unreachable");
+          return;
+        }
+        this.opts.onState(this.explicitlyClosed ? "closed" : "error", this.explicitlyClosed ? null : "ws_error");
       };
       ws.onmessage = (e) => {
         let parsed: unknown;
@@ -106,7 +135,7 @@ export class ChatBridge {
     try {
       this.ws.send(JSON.stringify(payload));
     } catch {
-      this.opts.onState("error", "failed to send");
+      this.opts.onState("error", "ws_send_failed");
     }
   }
 

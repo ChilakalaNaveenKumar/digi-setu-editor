@@ -58,7 +58,7 @@ async function send(): Promise<void> {
   >
     <div class="w-full max-w-md rounded-lg border border-border bg-card p-5 text-foreground shadow-2xl">
       <div class="mb-3 flex items-center justify-between">
-        <h2 class="text-sm font-semibold">Send feedback</h2>
+        <h2 class="text-lead font-semibold">Send feedback</h2>
         <button
           type="button"
           class="rounded p-1 text-muted-foreground hover:text-foreground"
@@ -69,13 +69,13 @@ async function send(): Promise<void> {
       </div>
 
       <div v-if="submitted" class="space-y-3">
-        <p class="text-sm">
+        <p class="text-lead">
           Thanks — your message was delivered to
-          <span class="font-mono text-xs">{{ destination }}</span>.
+          <span class="font-mono text-body">{{ destination }}</span>.
         </p>
         <button
           type="button"
-          class="w-full rounded-md bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground hover:opacity-90"
+          class="w-full rounded-md bg-primary px-4 py-2 text-lead font-semibold text-primary-foreground hover:opacity-90"
           @click="emit('close')"
         >
           Close
@@ -83,13 +83,13 @@ async function send(): Promise<void> {
       </div>
 
       <form v-else class="space-y-3" @submit.prevent="send">
-        <p class="text-xs text-muted-foreground">
-          Goes directly to <span class="font-mono">nchilaka@digi-setu.com</span> — a real human
+        <p class="text-body text-muted-foreground">
+          Goes directly to <span class="font-mono">support@digi-setu.com</span> — a real human
           will read it. Not a chatbot, not a ticketing system.
         </p>
 
         <div>
-          <label class="mb-1 block text-[11px] uppercase tracking-wide text-muted-foreground">
+          <label class="mb-1 block text-caption uppercase tracking-wide text-muted-foreground">
             Type
           </label>
           <div class="flex gap-2">
@@ -101,7 +101,7 @@ async function send(): Promise<void> {
               ]"
               :key="opt.id"
               type="button"
-              class="rounded-md border px-2.5 py-1 text-xs"
+              class="rounded-md border px-2.5 py-1 text-body"
               :class="category === opt.id
                 ? 'border-primary bg-primary/10 text-foreground'
                 : 'border-border text-muted-foreground hover:text-foreground'"
@@ -113,7 +113,7 @@ async function send(): Promise<void> {
         </div>
 
         <div>
-          <label class="mb-1 block text-[11px] uppercase tracking-wide text-muted-foreground">
+          <label class="mb-1 block text-caption uppercase tracking-wide text-muted-foreground">
             Message
           </label>
           <textarea
@@ -121,13 +121,13 @@ async function send(): Promise<void> {
             rows="5"
             maxlength="4000"
             placeholder="What's broken or what would you like?"
-            class="block w-full resize-y rounded-md border border-border bg-background px-2.5 py-2 text-sm focus:border-ring focus:outline-none"
+            class="block w-full resize-y rounded-md border border-border bg-background px-2.5 py-2 text-lead focus:border-ring focus:outline-none"
             required
           />
         </div>
 
         <div>
-          <label class="mb-1 block text-[11px] uppercase tracking-wide text-muted-foreground">
+          <label class="mb-1 block text-caption uppercase tracking-wide text-muted-foreground">
             Reply-to email <span class="text-muted-foreground">(optional)</span>
           </label>
           <input
@@ -135,21 +135,21 @@ async function send(): Promise<void> {
             type="email"
             maxlength="320"
             placeholder="you@example.com"
-            class="block w-full rounded-md border border-border bg-background px-2.5 py-1.5 text-sm focus:border-ring focus:outline-none"
+            class="block w-full rounded-md border border-border bg-background px-2.5 py-1.5 text-lead focus:border-ring focus:outline-none"
           />
         </div>
 
         <div class="flex justify-end gap-2 pt-1">
           <button
             type="button"
-            class="rounded-md px-3 py-1.5 text-sm text-muted-foreground hover:text-foreground"
+            class="rounded-md px-3 py-1.5 text-lead text-muted-foreground hover:text-foreground"
             @click="emit('close')"
           >
             Cancel
           </button>
           <button
             type="submit"
-            class="rounded-md bg-primary px-3 py-1.5 text-sm font-semibold text-primary-foreground hover:opacity-90 disabled:opacity-60"
+            class="rounded-md bg-primary px-3 py-1.5 text-lead font-semibold text-primary-foreground hover:opacity-90 disabled:opacity-60"
             :disabled="submitting || !message.trim()"
           >
             {{ submitting ? "Sending…" : "Send feedback" }}

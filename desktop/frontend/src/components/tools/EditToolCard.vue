@@ -145,7 +145,7 @@ async function restore(): Promise<void> {
       !isReviewing && isFocused && 'ring-1 ring-primary/60',
     ]"
   >
-    <div class="flex items-center gap-2 px-2.5 py-1.5 font-mono text-xs">
+    <div class="flex items-center gap-2 px-2.5 py-1.5 font-mono text-body">
       <button
         type="button"
         class="flex min-w-0 flex-1 items-center gap-2 text-left"
@@ -153,7 +153,7 @@ async function restore(): Promise<void> {
         @click="focus"
       >
         <span
-          class="inline-flex h-4 w-4 items-center justify-center rounded-sm bg-muted text-[10px] text-muted-foreground"
+          class="inline-flex h-4 w-4 items-center justify-center rounded-sm bg-muted text-caption text-muted-foreground"
         >{{ glyph }}</span>
         <span class="font-semibold text-foreground/90">edit</span>
         <span class="min-w-0 flex-1 truncate text-foreground" :title="path">
@@ -162,13 +162,13 @@ async function restore(): Promise<void> {
         </span>
         <span
           v-if="stats.added > 0"
-          class="text-[10px] tabular-nums text-success"
+          class="text-caption tabular-nums text-success"
         >+{{ stats.added }}</span>
         <span
           v-if="stats.removed > 0"
-          class="text-[10px] tabular-nums text-destructive"
+          class="text-caption tabular-nums text-destructive"
         >-{{ stats.removed }}</span>
-        <span :class="['rounded-sm px-1.5 py-0.5 text-[10px]', statusBadge.color]">
+        <span :class="['rounded-sm px-1.5 py-0.5 text-caption', statusBadge.color]">
           {{ statusBadge.label }}
         </span>
       </button>
@@ -176,7 +176,7 @@ async function restore(): Promise<void> {
         v-if="call.status === 'success' && unifiedDiff"
         type="button"
         :class="[
-          'rounded-sm border px-1.5 py-0.5 text-[10px] transition-colors',
+          'rounded-sm border px-1.5 py-0.5 text-caption transition-colors',
           isReviewing
             ? 'border-primary bg-primary/15 text-primary'
             : 'border-border bg-background text-muted-foreground hover:border-primary/60 hover:text-foreground',
@@ -190,7 +190,7 @@ async function restore(): Promise<void> {
         v-if="call.status === 'success'"
         type="button"
         :disabled="restoreBusy"
-        class="rounded-sm border border-border bg-background px-1.5 py-0.5 text-[10px] text-muted-foreground transition-colors hover:border-destructive/60 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
+        class="rounded-sm border border-border bg-background px-1.5 py-0.5 text-caption text-muted-foreground transition-colors hover:border-destructive/60 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
         title="Rewind workspace to before this tool call"
         @click.stop="restore"
       >
@@ -199,14 +199,14 @@ async function restore(): Promise<void> {
     </div>
     <div
       v-if="restoreError"
-      class="border-t border-destructive/30 bg-destructive/10 px-2.5 py-1 text-[10px] text-destructive"
+      class="border-t border-destructive/30 bg-destructive/10 px-2.5 py-1 text-caption text-destructive"
     >
       {{ restoreError }}
     </div>
 
     <div
       v-if="isStreaming"
-      class="border-t border-border bg-editor px-3 py-2 font-mono text-[11px] italic text-muted-foreground"
+      class="border-t border-border bg-editor px-3 py-2 font-mono text-caption italic text-muted-foreground"
     >
       <template v-if="editsCount > 0">
         applying {{ editsCount }} edit{{ editsCount === 1 ? "" : "s" }}…
@@ -225,14 +225,14 @@ async function restore(): Promise<void> {
 
     <div
       v-else-if="call.status === 'success'"
-      class="border-t border-border bg-editor px-3 py-2 font-mono text-[11px] italic text-muted-foreground"
+      class="border-t border-border bg-editor px-3 py-2 font-mono text-caption italic text-muted-foreground"
     >
       no visible changes
     </div>
 
     <div
       v-else-if="call.status === 'error'"
-      class="border-t border-border bg-destructive/5 px-3 py-2 font-mono text-[11px] text-destructive"
+      class="border-t border-border bg-destructive/5 px-3 py-2 font-mono text-caption text-destructive"
     >
       {{ call.result?.text || "edit failed" }}
     </div>

@@ -1,4 +1,4 @@
-# pi-typst-test — hosted deployment
+# Digi Setu — hosted deployment
 
 Deploys the FastAPI + Vue + pi stack to **digi-setu.com**, replacing
 the legacy `typst-agent` stack on the same VM (`digi-setu-live` in

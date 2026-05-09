@@ -28,7 +28,9 @@ import UpgradeModal from "./UpgradeModal.vue";
 const billing = useBillingStore();
 const cfg = useConfigStore();
 const { credit, remainingPct, lowCredit, enabled } = storeToRefs(billing);
-const { mode: deployMode } = storeToRefs(cfg);
+// `cfg` is referenced here for future feature flags (e.g. plan-aware
+// chrome). Reading it pulls the store into the dep graph for HMR.
+void cfg;
 
 const open = ref(false);
 const showUpgrade = ref(false);
@@ -85,9 +87,11 @@ async function setRoutingDefault(value: RoutingDefault): Promise<void> {
   }
 }
 
-const showRoutingToggle = computed(
-  () => deployMode.value === "desktop" && byokModeAvailable.value,
-);
+// BYOK + the BYOK/Cloud routing toggle are desktop-only features.
+// The web edition always runs cloud-routed, so this toggle is
+// permanently hidden here. (The desktop hard-fork has its own version
+// of this component that flips this on when byok_mode is true.)
+const showRoutingToggle = computed(() => false);
 
 onMounted(() => {
   void billing.refreshStatus();
@@ -170,12 +174,12 @@ function openUpgrade(): void {
       <!-- Permission mode -->
       <div class="border-b border-border px-3 py-2.5">
         <div class="mb-1.5 flex items-baseline justify-between">
-          <span class="font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
+          <span class="font-mono text-caption uppercase tracking-wide text-muted-foreground">
             permissions
           </span>
         </div>
         <PermissionModePicker />
-        <p class="mt-1.5 text-[10px] leading-tight text-muted-foreground">
+        <p class="mt-1.5 text-caption leading-tight text-muted-foreground">
           Controls when pi asks before running tools. Audit trail is
           always recorded.
         </p>
@@ -188,14 +192,14 @@ function openUpgrade(): void {
            default when starting a fresh chat. -->
       <div v-if="showRoutingToggle" class="border-b border-border px-3 py-2.5">
         <div class="mb-1.5 flex items-baseline justify-between">
-          <span class="font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
+          <span class="font-mono text-caption uppercase tracking-wide text-muted-foreground">
             default ai source
           </span>
         </div>
         <div class="flex gap-1 rounded-md border border-border bg-background p-0.5">
           <button
             type="button"
-            class="flex-1 rounded px-2 py-1 text-[11px] font-mono transition-colors disabled:opacity-50"
+            class="flex-1 rounded px-2 py-1 text-caption font-mono transition-colors disabled:opacity-50"
             :class="
               routingDefault === 'byok'
                 ? 'bg-primary text-primary-foreground'
@@ -209,7 +213,7 @@ function openUpgrade(): void {
           </button>
           <button
             type="button"
-            class="flex-1 rounded px-2 py-1 text-[11px] font-mono transition-colors disabled:opacity-50"
+            class="flex-1 rounded px-2 py-1 text-caption font-mono transition-colors disabled:opacity-50"
             :class="
               routingDefault === 'cloud'
                 ? 'bg-primary text-primary-foreground'
@@ -222,7 +226,7 @@ function openUpgrade(): void {
             Cloud subscription
           </button>
         </div>
-        <p class="mt-1.5 text-[10px] leading-tight text-muted-foreground">
+        <p class="mt-1.5 text-caption leading-tight text-muted-foreground">
           New chats start with a model from this source. The model picker
           can override per chat.
         </p>
@@ -231,11 +235,11 @@ function openUpgrade(): void {
       <!-- Credit / plan -->
       <div class="border-b border-border px-3 py-2.5">
         <div class="mb-1.5 flex items-baseline justify-between">
-          <span class="font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
+          <span class="font-mono text-caption uppercase tracking-wide text-muted-foreground">
             credit · {{ planLabel.toLowerCase() }}
           </span>
           <span
-            class="font-mono text-[10px]"
+            class="font-mono text-caption"
             :class="
               credit && credit.remaining_usd <= 0
                 ? 'text-destructive'
@@ -259,14 +263,14 @@ function openUpgrade(): void {
         <div class="mt-2 flex items-center gap-2">
           <button
             type="button"
-            class="flex-1 rounded border border-border bg-background px-2 py-1 font-mono text-[11px] hover:bg-muted"
+            class="flex-1 rounded border border-border bg-background px-2 py-1 font-mono text-caption hover:bg-muted"
             @click="openUpgrade"
           >
             Upgrade
           </button>
           <RouterLink
             to="/pricing"
-            class="flex-1 rounded border border-border bg-background px-2 py-1 text-center font-mono text-[11px] text-foreground hover:bg-muted"
+            class="flex-1 rounded border border-border bg-background px-2 py-1 text-center font-mono text-caption text-foreground hover:bg-muted"
             @click="close"
           >
             See plans
@@ -275,7 +279,7 @@ function openUpgrade(): void {
       </div>
 
       <!-- Footer hint -->
-      <div class="px-3 py-2 text-[10px] leading-tight text-muted-foreground">
+      <div class="px-3 py-2 text-caption leading-tight text-muted-foreground">
         Settings live next to the model picker so you don't lose visual
         space in the chat. Open this menu any time to change permission
         or check usage.

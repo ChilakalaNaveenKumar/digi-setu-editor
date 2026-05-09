@@ -121,6 +121,22 @@ const OPEN_URL_TIMEOUT_MS = 20_000;
 
 // ── Corpus loader (lazy, in-memory cache) ───────────────────────────────────
 
+// Vendored upstream source folders live alongside the curated docs, named
+// `<pkg>-<semver>/` (e.g. `typst-0.14.2/`, `cetz-0.5.0/`, `quill-0.7.2/`).
+// Those trees are kept on disk so the AI can `read`/`grep` them as a
+// source-of-truth oracle (see RULE 0.5 in .pi/APPEND_SYSTEM.md), but they
+// must NOT be swept into the `search_docs` corpus — they contain hundreds
+// of test files, upstream docs, and examples that would (a) bloat the
+// `typst` bucket past Gemini Flash's 1M-token context window and
+// (b) cross-contaminate it with off-package content (cetz tests landing
+// in the typst corpus, etc.).
+//
+// Match any top-level guides subdirectory whose name ends in a semver
+// triple — that's the convention the vendoring script uses, distinct from
+// the curated docs folders (`cetz/`, `codly/`, `quill/`, `reference/`, …)
+// which never carry a version suffix.
+const VENDORED_SOURCE_DIR_RE = /-\d+\.\d+\.\d+$/;
+
 let corpusCache: Map<string, string> | null = null;
 
 async function loadCorpus(guidesRoot: string): Promise<Map<string, string>> {
@@ -134,6 +150,7 @@ async function loadCorpus(guidesRoot: string): Promise<Map<string, string>> {
 		for (const e of entries) {
 			const full = path.join(dir, e.name);
 			if (e.isDirectory()) {
+				if (VENDORED_SOURCE_DIR_RE.test(e.name)) continue;
 				out.push(...(await walk(full)));
 			} else if (e.isFile() && (e.name.endsWith(".md") || e.name.endsWith(".typ"))) {
 				out.push(full);
@@ -327,8 +344,9 @@ export default function (pi: ExtensionAPI) {
 		name: "search_docs",
 		label: "Search Typst Docs",
 		description: [
-			"Look up something in the indexed Typst documentation corpus.",
-			"Pick the smallest relevant `package` so the responder LLM only sees the corpus that matters:",
+			"Ask a senior Typst engineer (running in a side LLM that already has the full doc corpus for the chosen package loaded into its context) for an in-depth, code-bearing answer.",
+			"",
+			"Pick the smallest relevant `package` so the responder only sees the corpus that matters:",
 			"  typst        — core Typst language and stdlib (no third-party packages)",
 			"  cetz         — vector drawing primitives (canvas, draw, line, etc.)",
 			"  fletcher     — diagrams built on CeTZ (diagram, node, edge)",
@@ -336,13 +354,28 @@ export default function (pi: ExtensionAPI) {
 			"  codly        — code-block styling",
 			"  circuiteria  — block-level circuit diagrams",
 			"  touying      — slide / presentation framework with themes",
-			"Pack the `query` with real symbol names, parameter names, and any compiler error you've seen.",
+			"",
+			"HOW TO WRITE `query`: the responder is NOT a search engine — it already has every doc in context. It needs detail, intent, and expectations from you. The richer your brief, the more targeted and code-specific the answer comes back. A keyword (`codly highlights`) gets a generic overview; a detailed brief gets exact paste-ready code.",
+			"",
+			"Pack every `query` with whichever of these apply:",
+			"  - Goal — the artifact / behaviour you're producing, not just a feature name (e.g. '30-line Rust listing with lines 4-7 highlighted in muted yellow with a left bar marker').",
+			"  - Concrete symbols + parameter names + the exact import line you're using.",
+			"  - What you already tried AND the verbatim compiler error or wrong visual you got back.",
+			"  - Constraints — page size, fonts, palette, must-not-break-pagination, must-fit-one-page, accessibility.",
+			"  - Edge cases you need covered — multiple ranges, nested usage, interaction with another package, etc.",
+			"  - What you want IN the answer — full pasteable snippet, parameter-by-parameter explanation, both `set` and `show` forms, etc.",
+			"",
+			"⚠ IMPORTANT: search_docs returns a HYPOTHESIS, not ground truth. The responder LLM synthesises from a doc corpus that may be incomplete; it can confidently invent plausible workarounds that don't match the actual language. After getting an answer, VALIDATE against the vendored source under `guides/<pkg>-<version>/src/` (or `guides/typst-0.14.2/crates/typst-library/src/` for core typst) — confirm the function exists, its parameters match, and its default behaviour matches what was claimed. Especially when the proposed answer is a workaround using `move(...)`, `box(baseline: ...)`, or a custom show rule, search the source for a first-class API in the same area BEFORE accepting it. See RULE 0.5 in the system prompt for the full validation protocol.",
+			"",
 			"Returns the responder's freeform markdown answer plus the doc paths it cited.",
 		].join("\n"),
 		promptSnippet:
-			"search_docs(query, package) — responder LLM loaded with the full corpus for one package; returns an in-depth answer.",
+			"search_docs(query, package) — responder LLM with the full corpus loaded; pass a DETAILED brief (goal + symbols + what you tried + verbatim error + constraints + what to include), NOT keywords; returns an in-depth HYPOTHESIS — validate against the vendored source under guides/<pkg>-<version>/src/ before shipping (see RULE 0.5).",
 		parameters: Type.Object({
-			query: Type.String({ description: "Concrete brief. Include symbol names, error text, what you're trying to build." }),
+			query: Type.String({
+				description:
+					"Detailed natural-language brief — NOT keywords. The responder already has the full corpus in context; it doesn't search, it synthesises, so the more you tell it, the more precise the answer. Include: (a) the GOAL (the artifact / behaviour you're producing), (b) concrete SYMBOLS + parameter names + the exact import line, (c) what you TRIED and the verbatim compiler error or wrong visual, (d) CONSTRAINTS (page size / fonts / palette / pagination), (e) EDGE CASES you need covered, (f) what you want IN the answer (full snippet, parameter-by-parameter explanation, both `set` and `show` forms, etc.). Example: \"With codly 1.3.0, I'm rendering a 30-line Rust listing and need lines 4-7 highlighted in muted yellow with a left bar marker. What is the exact shape of the `highlights:` argument? Can one codly(...) call accept multiple non-contiguous ranges (4-7 AND 12-14)? I tried `highlights: ((4, 7))` and got `error: expected array of dictionaries`. Give me the full snippet plus an explanation of why each parameter is shaped that way.\"",
+			}),
 			package: Type.Union(
 				[
 					Type.Literal("typst"),

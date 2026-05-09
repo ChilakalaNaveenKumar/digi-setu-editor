@@ -1,5 +1,5 @@
 {
-  "name": "pi-typst-test-web",
+  "name": "digi-setu-desktop-frontend",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -58,6 +58,7 @@
     "shiki": "^1.29.2",
     "splitpanes": "^4.0.4",
     "vue": "^3.5.13",
+    "vue-i18n": "^11.4.2",
     "vue-router": "^4.6.4",
     "vue-virtual-scroller": "^2.0.0-beta.8"
   },

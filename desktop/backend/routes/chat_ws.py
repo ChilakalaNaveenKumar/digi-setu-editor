@@ -37,7 +37,6 @@ from config import (
 from services.auth import user_for_websocket
 from services.bg_processes import BackgroundProcessHub
 from services.billing import (
-    CreditLedger,
     estimate_prompt_cost,
     extract_sub_llm_usage,
     usage_token_total,
@@ -52,7 +51,9 @@ from services.models_registry import (
     pick_default_for_plan,
 )
 from services.audit import record as audit_record
+from services.error_codes import bridge_error, log_error
 from services.pi_session import PiSession
+from services.plan_cache import get_plan_id as _get_plan_id
 from services.policy import check_bash, scrub_secrets
 from services.sandbox_layout import stamp_sandbox_dir
 from services.rate_limit import RateLimiter
@@ -196,22 +197,35 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
     reg = Registry.instance()
     sess_rec = reg.get_session(session_id)
     if not sess_rec:
-        await ws.send_json({"type": "_bridge_error", "message": f"unknown session id: {session_id}"})
+        log_error("session_unknown", session_id=session_id, user_id=user_id, where="ws_open")
+        await ws.send_json(bridge_error("session_unknown"))
         await ws.close()
         return
 
     ws_rec = reg.get_workspace(sess_rec["workspace_id"])
     if not ws_rec:
-        await ws.send_json(
-            {"type": "_bridge_error", "message": f"workspace gone: {sess_rec['workspace_id']}"}
+        log_error(
+            "workspace_missing",
+            session_id=session_id,
+            user_id=user_id,
+            workspace_id=sess_rec["workspace_id"],
+            where="ws_open",
         )
+        await ws.send_json(bridge_error("workspace_missing"))
         await ws.close()
         return
 
     # Owner check: collapsing into the same "unknown session" message
     # so a hostile client can't enumerate session ids.
     if ws_rec.get("owner_user_id") != user_id:
-        await ws.send_json({"type": "_bridge_error", "message": f"unknown session id: {session_id}"})
+        log_error(
+            "session_unknown",
+            session_id=session_id,
+            user_id=user_id,
+            where="owner_check",
+            actual_owner=ws_rec.get("owner_user_id"),
+        )
+        await ws.send_json(bridge_error("session_unknown"))
         await ws.close()
         return
 
@@ -252,11 +266,15 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
                 file=sys.stderr,
             )
         except OSError as exc:
-            await ws.send_json({
-                "type": "_bridge_error",
-                "message": f"workspace directory could not be created: {exc}",
-                "code": "workspace_missing",
-            })
+            log_error(
+                "workspace_missing",
+                session_id=session_id,
+                user_id=user_id,
+                exc=exc,
+                where="recreate_workspace_dir",
+                workspace_path=str(workspace_path),
+            )
+            await ws.send_json(bridge_error("workspace_missing"))
             await ws.close()
             return
 
@@ -265,14 +283,14 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
     # cheap WS upgrade so a hostile client can't burn a thousand
     # subprocesses by reconnecting in a tight loop.
     if not rl.try_take(user_id, "pi.spawn"):
-        await ws.send_json(
-            {
-                "type": "_bridge_error",
-                "message": "You're starting chats too quickly. Wait a moment and try again.",
-                "code": "rate_limit",
-                "bucket": "pi.spawn",
-            }
+        log_error(
+            "rate_limit",
+            session_id=session_id,
+            user_id=user_id,
+            where="pi_spawn_throttle",
+            bucket="pi.spawn",
         )
+        await ws.send_json(bridge_error("rate_limit"))
         await ws.close(code=4429)
         return
 
@@ -285,7 +303,7 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
     #      whatever you used last time there).
     #   3. Otherwise use the cheapest model their plan can afford,
     #      defaulting to Sonnet for paying tiers.
-    plan_id = CreditLedger.instance().get_plan_id(user_id)
+    plan_id = _get_plan_id(user_id)
     pinned_model = (sess_rec.get("model") or "").strip()
     # The session's parent workspace id — defined here so the
     # workspace-default lookup can reuse it. We re-bind the same value
@@ -365,29 +383,22 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
                 # Two slightly different toasts so the SPA shows the
                 # right CTA: "you have a key, but THIS model needs
                 # cloud" vs. "you don't have a key, sign in".
-                if BYOK_MODE:
-                    await ws.send_json({
-                        "type": "_bridge_error",
-                        "code": "upgrade_required",
-                        "model": active_model_id,
-                        "message": (
-                            f"Model '{active_model_spec.name}' isn't "
-                            "covered by your local key. Sign in for "
-                            "cloud access, or pick a model badged BYOK."
-                        ),
-                    })
-                    await ws.close(code=4402)
-                else:
-                    await ws.send_json({
-                        "type": "_bridge_error",
-                        "code": "sign_in_required",
-                        "message": (
-                            "Sign in at digi-setu.com to chat with cloud "
-                            "models, or add an AI key to ~/.digi-setu/.env "
-                            "to use BYOK mode."
-                        ),
-                    })
-                    await ws.close(code=4401)
+                # The frontend distinguishes the two flavours via `code`
+                # alone; `setup_required` covers both ("sign in" and
+                # "add a key" are presented by the SPA's Welcome
+                # screen, not by separate error messages here). Model
+                # detail goes to the log for our debugging only.
+                log_error(
+                    "setup_required",
+                    session_id=session_id,
+                    user_id=user_id,
+                    where="dispatch_no_route",
+                    byok_mode=BYOK_MODE,
+                    model=active_model_id,
+                    model_name=getattr(active_model_spec, "name", None),
+                )
+                await ws.send_json(bridge_error("setup_required"))
+                await ws.close(code=4402 if BYOK_MODE else 4401)
                 return
 
             bearer_token, _cached_user = cached
@@ -402,17 +413,17 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
             except Exception as exc:
                 # Last-resort guard: if the bridge itself blew up
                 # (uncommon — proxy_to_relay catches its own errors),
-                # surface a clean error rather than a 1011 close.
-                print(
-                    f"[chat_ws] relay bridge failed for {user_id!r}: {exc}",
-                    file=sys.stderr,
+                # surface a clean error rather than a 1011 close. The
+                # raw exception is logged; the UI sees only "network".
+                log_error(
+                    "network",
+                    session_id=session_id,
+                    user_id=user_id,
+                    exc=exc,
+                    where="cloud_relay",
                 )
                 try:
-                    await ws.send_json({
-                        "type": "_bridge_error",
-                        "code": "relay_error",
-                        "message": f"Relay error: {exc}",
-                    })
+                    await ws.send_json(bridge_error("network"))
                     await ws.close(code=1011)
                 except Exception:
                     pass
@@ -452,27 +463,39 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
         from services import container_pool as _pool
         await _pool.enforce_quotas(user_id)
     except _pool.GlobalCapacityExceeded as exc:
-        await ws.send_json({
-            "type": "_bridge_error",
-            "code": "vm_capacity",
-            "message": (
-                "The VM is currently at maximum capacity. "
-                "Please try again in a minute."
-            ),
-            "detail": str(exc),
-        })
+        log_error(
+            "capacity",
+            session_id=session_id,
+            user_id=user_id,
+            exc=exc,
+            where="container_pool_quota",
+        )
+        await ws.send_json(bridge_error("capacity"))
         await ws.close(code=1013)  # Try Again Later
         return
     except Exception as exc:
-        print(f"[ws {session_id}] WARN container_pool quota check failed: {exc}", file=sys.stderr)
+        log_error(
+            "internal",
+            session_id=session_id,
+            user_id=user_id,
+            exc=exc,
+            where="container_pool_quota_check",
+            severity="warn",
+        )
         # Don't refuse the chat on a transient docker error; let
         # PiSession.start() decide.
 
     try:
         await pi.start()
     except Exception as exc:
-        print(f"[ws {session_id}] failed to start pi: {exc}", file=sys.stderr)
-        await ws.send_json({"type": "_bridge_error", "message": f"Failed to start pi: {exc}"})
+        log_error(
+            "internal",
+            session_id=session_id,
+            user_id=user_id,
+            exc=exc,
+            where="pi_session_start",
+        )
+        await ws.send_json(bridge_error("internal"))
         await ws.close()
         return
 
@@ -616,19 +639,25 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
         except Exception as exc:
             print(f"[ws {session_id}] shadow-git snapshot failed for {tid}: {exc}", file=sys.stderr)
 
-    ledger = CreditLedger.instance()
+    # NOTE: no local credit ledger on the desktop. Cloud-routed chats
+    # are gated and recorded by the cloud's CreditLedger at chat-WS
+    # time (see web/backend/routes/chat_ws.py:run_session_loop). Local
+    # chats here are always BYOK — we record token tallies in
+    # services/byok_usage.py for the Activity page, but no $ flows
+    # through us so there's nothing to gate or "charge". A user who
+    # deletes ~/.digi-setu/usage.sqlite blanks their own activity log;
+    # they cannot grant themselves free cloud usage that way.
 
     def _maybe_charge_usage(evt: dict[str, Any]) -> None:
-        """On `message_end` from an assistant turn, charge:
-          - the daily token bucket (rate-limit fairness signal)
-          - the per-user dollar ledger (subscription credit)
+        """On `message_end` from an assistant turn:
+          - charge the daily token bucket (rate-limit fairness signal,
+            per-machine — distinct from the cloud's monthly $ cap),
+          - record a token-only row in the BYOK ledger for Activity.
 
         We sum input + output + cache reads + cache writes so the
         budget reflects "what we actually paid the model provider
         for", not just the user-visible bytes. Charge happens
-        unconditionally — we never amputate a half-finished answer
-        the user already paid for. The cap is enforced on the *next*
-        prompt instead (see ws_to_pi).
+        unconditionally — we never amputate a half-finished answer.
 
         Also clears the prompt watchdog: a `message_end` means the
         assistant turn is done, so the wall-clock timer for that
@@ -640,10 +669,8 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
             return
         # Clear the per-prompt watchdog — the assistant returned a
         # complete message, so any tool loop wrapped up cleanly.
-        wall_seconds = 0.0
         started = turn_started_at.get("ts")
         if started is not None:
-            wall_seconds = max(0.0, asyncio.get_event_loop().time() - started)
             turn_started_at["ts"] = None
         usage = message.get("usage") or {}
         if not isinstance(usage, dict):
@@ -656,36 +683,13 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
         )
         if total > 0:
             rl.charge_tokens(user_id, total)
-        cost = estimate_prompt_cost(
-            usage,
-            model_id=active_model_id,
-            wall_seconds=wall_seconds,
-        )
-        # Always log the event — even on $0 turns — so the activity
-        # table shows the user something happened. The aggregate
-        # spent_usd / prompts counter is gated inside note_cost.
-        ledger.note_cost(
-            user_id,
-            cost.total_usd,
-            source="chat",
-            model=cost.model_id,
-            session_id=session_id,
-            workspace_id=workspace_id_for_audit,
-            usage=usage,
-            breakdown={
-                "llm_usd": cost.llm_usd,
-                "vm_usd": cost.vm_usd,
-                "margin_usd": cost.margin_usd,
-                "total_usd": cost.total_usd,
-            },
-        )
 
         # ── BYOK ledger (desktop only) ──────────────────────────────
         # When BYOK is active and the picked model has a path through
-        # the user's own keys, also record a token-only row in the
-        # local SQLite. The Activity page reads this so the user can
-        # see usage that never hit our cloud relay (no $ figure
-        # because we don't know their provider's price).
+        # the user's own keys, record a token-only row in the local
+        # SQLite. The Activity page reads this so the user can see
+        # usage that never hit our cloud relay (no $ figure because
+        # we don't know their provider's price).
         if BYOK_MODE and active_model_spec is not None:
             from services.byok import byok_provider_for as _byok_pf  # noqa: E402
             from services.byok_usage import record as _byok_record  # noqa: E402
@@ -703,16 +707,21 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
                 )
 
     def _maybe_charge_tool_sub_llm(evt: dict[str, Any]) -> None:
-        """Bill side-LLM calls that happen *inside* tool execute() bodies.
+        """Charge the rate-limit token bucket for sub-LLM tool calls.
 
-        The parent assistant turn's `message_end` only carries the parent
-        model's tokens; tools that spawn their own provider call (Haiku for
-        search_docs, Gemini grounded search for web_search) need a separate
-        ledger entry, otherwise we under-bill.
+        The parent assistant turn's `message_end` only carries the
+        parent model's tokens; tools that spawn their own provider
+        call (Haiku for search_docs, Gemini grounded search for
+        web_search) would otherwise be free against the local
+        rate-limit. We don't write a separate "$ row" here — the
+        desktop has no ledger to write to and BYOK token rows are
+        already keyed by the parent turn's session for the Activity
+        view.
 
-        Pure logic lives in services/billing.py:extract_sub_llm_usage so it
-        can be unit-tested without spinning up a websocket. This thin
-        wrapper just applies the side effects (rate-limit + ledger)."""
+        Pure event extraction lives in
+        services/billing.py:extract_sub_llm_usage so it can be
+        unit-tested without spinning up a websocket. This thin
+        wrapper just applies the per-machine rate-limit side effect."""
         usage = extract_sub_llm_usage(evt)
         if usage is None:
             return
@@ -720,29 +729,12 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
         if total <= 0:
             return
         rl.charge_tokens(user_id, total)
+        # Compute the cost so future code (e.g., emitting an event
+        # the SPA can render in the assistant bubble) has it on hand;
+        # currently used only for parity with the cloud-side
+        # implementation that records it in the canonical ledger.
         sub_model = str(usage.get("model") or "")
-        cost = estimate_prompt_cost(usage, model_id=sub_model or active_model_id)
-        # Tool name is on the tool_execution_end / tool_result envelope,
-        # not inside `usage`. Surface it on the event so the table can
-        # render "search_docs (haiku-4-5)" rows distinctly from chat
-        # turns.
-        tool_name = str(evt.get("toolName") or "tool")
-        ledger.note_cost(
-            user_id,
-            cost.total_usd,
-            source="tool",
-            tool=tool_name,
-            model=cost.model_id,
-            session_id=session_id,
-            workspace_id=workspace_id_for_audit,
-            usage=usage,
-            breakdown={
-                "llm_usd": cost.llm_usd,
-                "vm_usd": cost.vm_usd,
-                "margin_usd": cost.margin_usd,
-                "total_usd": cost.total_usd,
-            },
-        )
+        _ = estimate_prompt_cost(usage, model_id=sub_model or active_model_id)
 
     def _maybe_block_bash(evt: dict[str, Any]) -> Optional[dict[str, Any]]:
         """When pi requests a bash exec, evaluate it against the
@@ -791,7 +783,7 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
             "isError": True,
             "result": {
                 "text": (
-                    f"Command refused by web-mode policy.\n"
+                    f"Command refused by safety policy.\n"
                     f"  reason: {verdict.reason}\n"
                     f"  command: {cmd[:240]}\n\n"
                     "If this is legitimate work, ask the user to confirm and "
@@ -1013,26 +1005,16 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
             elapsed = loop.time() - started
             if elapsed >= PROMPT_TIMEOUT_SECONDS:
                 timed_out["flag"] = True
-                print(
-                    f"[ws {session_id}] prompt timeout: turn ran {elapsed:.0f}s "
-                    f"(limit {PROMPT_TIMEOUT_SECONDS}s) — tearing down",
-                    file=sys.stderr,
+                log_error(
+                    "timeout",
+                    session_id=session_id,
+                    user_id=user_id,
+                    where="prompt_watchdog",
+                    elapsed_seconds=int(elapsed),
+                    limit_seconds=PROMPT_TIMEOUT_SECONDS,
                 )
                 try:
-                    await ws.send_json(
-                        {
-                            "type": "_bridge_error",
-                            "message": (
-                                f"Your prompt ran for over "
-                                f"{PROMPT_TIMEOUT_SECONDS // 60} minutes "
-                                "and was stopped to protect your budget. "
-                                "Try a smaller request or break the work "
-                                "into steps."
-                            ),
-                            "code": "prompt_timeout",
-                            "elapsed_seconds": int(elapsed),
-                        }
-                    )
+                    await ws.send_json(bridge_error("timeout"))
                 except Exception:
                     pass
                 return
@@ -1046,9 +1028,14 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
             try:
                 command = json.loads(raw)
             except json.JSONDecodeError:
-                await ws.send_json(
-                    {"type": "_bridge_error", "message": f"Invalid JSON from client: {raw[:120]!r}"}
+                log_error(
+                    "internal",
+                    session_id=session_id,
+                    user_id=user_id,
+                    where="ws_to_pi_json_decode",
+                    raw_head=raw[:120],
                 )
+                await ws.send_json(bridge_error("internal"))
                 continue
             # Client-driven abort. The SPA sends `{type: "abort"}` when
             # the user clicks the stop button (see web/frontend/src/stores/
@@ -1070,26 +1057,28 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
             # an extra click.
             if command.get("type") == "abort":
                 aborted["flag"] = True
-                print(
-                    f"[ws {session_id}] abort requested by client; force-killing pi",
-                    file=sys.stderr,
+                # User-initiated stop is not really an error — log it
+                # at info level (the helper accepts any code; the
+                # frontend treats `aborted` as a benign cancellation).
+                log_error(
+                    "aborted",
+                    session_id=session_id,
+                    user_id=user_id,
+                    where="user_abort",
                 )
                 try:
-                    await ws.send_json(
-                        {
-                            "type": "_bridge_error",
-                            "code": "aborted",
-                            "message": "Aborted.",
-                        }
-                    )
+                    await ws.send_json(bridge_error("aborted"))
                 except Exception:
                     pass
                 try:
                     await pi.terminate()
                 except Exception as exc:
-                    print(
-                        f"[ws {session_id}] abort: pi.terminate raised {exc!r}",
-                        file=sys.stderr,
+                    log_error(
+                        "internal",
+                        session_id=session_id,
+                        user_id=user_id,
+                        exc=exc,
+                        where="abort_terminate",
                     )
                 return
             # Permission gate response. We translate the SPA's high-level
@@ -1102,14 +1091,25 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
                 req_id = command.get("id")
                 decision = command.get("decision")
                 if not isinstance(req_id, str) or not isinstance(decision, str):
-                    await ws.send_json(
-                        {"type": "_bridge_error", "message": "permission_response missing id/decision"}
+                    log_error(
+                        "internal",
+                        session_id=session_id,
+                        user_id=user_id,
+                        where="permission_response_validate",
+                        reason="missing_id_or_decision",
                     )
+                    await ws.send_json(bridge_error("internal"))
                     continue
                 if decision not in ("allow_once", "allow_session", "deny_once", "deny_session"):
-                    await ws.send_json(
-                        {"type": "_bridge_error", "message": f"unknown decision: {decision!r}"}
+                    log_error(
+                        "internal",
+                        session_id=session_id,
+                        user_id=user_id,
+                        where="permission_response_validate",
+                        reason="unknown_decision",
+                        decision=decision,
                     )
+                    await ws.send_json(bridge_error("internal"))
                     continue
                 pending = pending_permissions.pop(req_id, None)
                 tool_name = (
@@ -1129,9 +1129,14 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
                         {"type": "extension_ui_response", "id": req_id, "value": decision}
                     )
                 except Exception as exc:
-                    await ws.send_json(
-                        {"type": "_bridge_error", "message": f"Failed to forward decision to pi: {exc}"}
+                    log_error(
+                        "internal",
+                        session_id=session_id,
+                        user_id=user_id,
+                        exc=exc,
+                        where="forward_permission_decision",
                     )
+                    await ws.send_json(bridge_error("internal"))
                 continue
             if command.get("type") == "prompt":
                 # Pre-flight rate limit + daily-token check. We block
@@ -1141,27 +1146,25 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
                 # chat pane can render an inline notice instead of
                 # closing the WS (the user can retry after the cooldown).
                 if not rl.try_take(user_id, "chat.message"):
-                    await ws.send_json(
-                        {
-                            "type": "_bridge_error",
-                            "message": "You're sending prompts too quickly. Slow down for a moment.",
-                            "code": "rate_limit",
-                            "bucket": "chat.message",
-                        }
+                    log_error(
+                        "rate_limit",
+                        session_id=session_id,
+                        user_id=user_id,
+                        where="prompt_rate_limit",
+                        bucket="chat.message",
                     )
+                    await ws.send_json(bridge_error("rate_limit"))
                     continue
                 if not rl.can_send_message(user_id):
                     remaining = rl.remaining_tokens(user_id)
-                    await ws.send_json(
-                        {
-                            "type": "_bridge_error",
-                            "message": (
-                                "Daily token budget reached. Resets at UTC midnight. "
-                                f"({remaining} tokens left)"
-                            ),
-                            "code": "token_quota",
-                        }
+                    log_error(
+                        "quota_exceeded",
+                        session_id=session_id,
+                        user_id=user_id,
+                        where="daily_token_budget",
+                        remaining_tokens=remaining,
                     )
+                    await ws.send_json(bridge_error("quota_exceeded"))
                     continue
                 # Workspace storage cap. We enforce *between* prompts
                 # rather than during a tool call — by the time we see
@@ -1178,61 +1181,41 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
                 if DEPLOY_MODE == "web" and WORKSPACE_DISK_QUOTA_MB > 0:
                     used_mb = workspace_over_quota(workspace_path, WORKSPACE_DISK_QUOTA_MB)
                     if used_mb is not None:
-                        # When a hosted-tier user hits the workspace
-                        # cap they're almost always trying to install
-                        # heavyweight tooling (rust/go toolchains,
-                        # multi-GB datasets, media projects). Rather
-                        # than asking them to delete files and stay on
-                        # the web — where they'll just hit the same
-                        # ceiling on the next install — we steer them
-                        # to the desktop app, which uses their local
-                        # disk and has no quota. This is also the
-                        # signal we use to drive desktop-app adoption
-                        # for the ~5% of power users who'd otherwise
-                        # churn on a "your sandbox is full" wall.
-                        def _fmt(mb: float) -> str:
-                            return f"{mb / 1024:.1f} GB" if mb >= 1024 else f"{mb:.0f} MB"
-
-                        await ws.send_json(
-                            {
-                                "type": "_bridge_error",
-                                "message": (
-                                    f"You hit the workspace storage limit "
-                                    f"({_fmt(used_mb)} of {_fmt(WORKSPACE_DISK_QUOTA_MB)}). "
-                                    "Use the local version instead "
-                                    "for better storage options that "
-                                    "run on your own machine — "
-                                    "https://digi-setu.com/download"
-                                ),
-                                "code": "storage_quota",
-                                "used_mb": round(used_mb, 1),
-                                "quota_mb": WORKSPACE_DISK_QUOTA_MB,
-                                "download_url": "https://digi-setu.com/download",
-                            }
+                        # Hosted-tier user hit the workspace cap. The
+                        # raw numbers and the "use the desktop"
+                        # marketing CTA belong on a Settings / Usage
+                        # page, not in an error toast — the SPA
+                        # detects `code: "storage_full"` and routes
+                        # the user there.
+                        log_error(
+                            "storage_full",
+                            session_id=session_id,
+                            user_id=user_id,
+                            where="workspace_disk_quota",
+                            used_mb=round(used_mb, 1),
+                            quota_mb=WORKSPACE_DISK_QUOTA_MB,
                         )
+                        await ws.send_json(bridge_error("storage_full"))
                         continue
 
-                # Subscription credit gate. The token bucket above is
-                # the daily-fairness signal; this is the *monthly
-                # dollar* signal (free tier $2, pro tier $20, …). When
-                # spent_usd ≥ plan.monthly_credit_usd the user has to
-                # upgrade or wait for the next billing month.
-                if not ledger.can_spend(user_id):
-                    snap = ledger.snapshot(user_id)
-                    await ws.send_json(
-                        {
-                            "type": "_bridge_error",
-                            "message": (
-                                f"You've used your {snap['plan']['label']} "
-                                f"plan's ${snap['plan']['monthly_credit_usd']:.2f} "
-                                f"of credit for {snap['month']}. "
-                                "Upgrade your plan or wait for the next month."
-                            ),
-                            "code": "credit_exhausted",
-                            "snapshot": snap,
-                        }
-                    )
-                    continue
+                # Subscription credit gate intentionally NOT enforced
+                # here. Two reasons:
+                #
+                #   1. This handler only runs for BYOK chats (cloud
+                #      chats go through services/relay_bridge.py to
+                #      api.digi-setu.com, where the cloud's own
+                #      run_session_loop calls ledger.can_spend on
+                #      every message — a user cannot bypass that by
+                #      tampering with anything on their machine).
+                #   2. BYOK chats are uncharged by us; the user pays
+                #      their AI provider directly. Gating them with a
+                #      "Digi Setu credit" check would be both
+                #      incorrect and pointlessly punitive.
+                #
+                # If we ever introduce per-machine rate fairness for
+                # BYOK (e.g., cap parallel sub-LLM calls), it goes in
+                # the rate_limit token bucket above — not in any
+                # billing ledger.
                 rl.note_message(user_id)
 
                 cid = command.get("id")
@@ -1278,9 +1261,14 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
             try:
                 await pi.send(command)
             except Exception as exc:
-                await ws.send_json(
-                    {"type": "_bridge_error", "message": f"Failed to forward command to pi: {exc}"}
+                log_error(
+                    "internal",
+                    session_id=session_id,
+                    user_id=user_id,
+                    exc=exc,
+                    where="forward_command",
                 )
+                await ws.send_json(bridge_error("internal"))
                 return
 
     pump_out = asyncio.create_task(pi_to_ws(), name=f"pi_to_ws[{session_id}]")

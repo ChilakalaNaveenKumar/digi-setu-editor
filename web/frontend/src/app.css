@@ -9,6 +9,28 @@
 @tailwind utilities;
 
 /* ────────────────────────────────────────────────────────────────────────
+ * Bundled webfonts — self-hosted to avoid third-party (Google Fonts)
+ * cookies on the public web edition. SIL OFL 1.1 for both; license texts
+ * ship under public/fonts/.
+ * ──────────────────────────────────────────────────────────────────────── */
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url("/fonts/InterVariable.woff2") format("woff2-variations"),
+       url("/fonts/InterVariable.woff2") format("woff2");
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 100 800;
+  font-display: swap;
+  src: url("/fonts/JetBrainsMono.woff2") format("woff2-variations"),
+       url("/fonts/JetBrainsMono.woff2") format("woff2");
+}
+
+/* ────────────────────────────────────────────────────────────────────────
  * Design tokens.
  *
  * Every UI color is a CSS custom property. Components NEVER hardcode hex.
@@ -26,10 +48,13 @@
 /* Light fallback (kept thin — we force `.dark` in main.ts). */
 :root {
   --radius: 0.5rem;
-  --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
-    "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif;
-  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
-    "Liberation Mono", "Courier New", monospace;
+  /* UI prose — Inter first, system fallback while the woff2 streams in. */
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system,
+    BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial,
+    "Noto Sans", sans-serif;
+  /* Code / paths / commands — JetBrains Mono first, system fallback. */
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco,
+    Consolas, "Liberation Mono", "Courier New", monospace;
 }
 
 /* ────────────────────────────────────────────────────────────────────────
@@ -80,14 +105,18 @@
  * Add new themes here. Apply by toggling the class on <html>.
  * ──────────────────────────────────────────────────────────────────────── */
 
-/* Notion teal — soft teal accent, productive doc-craft vibe (default). */
+/* Notion teal — soft teal accent, productive doc-craft vibe (default).
+ * --primary tuned to a punchier mid-teal so white foreground text on
+ * primary CTA buttons (Sign in, Pay, etc.) has 4.5:1+ contrast. The
+ * earlier teal-400 + near-black foreground combo read as muddy in
+ * the dark theme; mid-teal + white is the canonical CTA look. */
 .theme-notion {
-  --primary:           oklch(0.78 0.13 175);   /* teal-400 */
-  --primary-foreground: oklch(0.18 0 0);
-  --accent:            oklch(0.78 0.13 175 / 0.15);
-  --accent-foreground: oklch(0.85 0.13 175);
-  --user-bubble-bg:    oklch(0.78 0.13 175 / 0.08);
-  --user-bubble-border: oklch(0.78 0.13 175 / 0.30);
+  --primary:           oklch(0.66 0.14 178);   /* teal-500 */
+  --primary-foreground: oklch(0.99 0 0);       /* near-white */
+  --accent:            oklch(0.66 0.14 178 / 0.15);
+  --accent-foreground: oklch(0.85 0.13 178);
+  --user-bubble-bg:    oklch(0.66 0.14 178 / 0.08);
+  --user-bubble-border: oklch(0.66 0.14 178 / 0.30);
   --rail-running:      var(--warning);
   --rail-success:      var(--success);
   --rail-error:        var(--destructive);
@@ -165,6 +194,11 @@ body {
   font-family: var(--font-sans);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  /* Inter screen-UI tuning — see desktop/frontend/src/app.css for the
+   * full rationale. cv11 = single-storey lowercase l (so 1lI don't
+   * collide), tnum = tabular numerals for usage tables. */
+  font-feature-settings: "cv11", "tnum";
+  letter-spacing: -0.006em;
 }
 
 /* Smooth thin scrollbars on every dark surface. */

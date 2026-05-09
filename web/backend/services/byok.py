@@ -1,16 +1,17 @@
 """
-BYOK (bring-your-own-key) routing helpers — desktop only.
+BYOK (bring-your-own-key) routing helpers.
 
-In desktop mode the user can drop AI provider credentials into
-``~/.digi-setu/.env``. When at least one of these credentials is
-present (see ``config.DETECTED_BYOK_KEYS``) the backend skips Clerk
-authentication and lets every chat call go directly from the user's
-machine to the AI provider's endpoint, billed against the user's own
+Self-hosted operators can drop AI provider credentials into the
+backend's environment (``web/backend/.env`` or shell exports). When at
+least one of these credentials is present (see
+:data:`config.DETECTED_BYOK_KEYS`) the backend skips Clerk
+authentication and lets every chat call go directly from this server
+to the AI provider's endpoint, billed against the operator's own
 account.
 
 This module decides, for any given (model, available keys) tuple:
 
-  * route        — "byok" (user pays provider) or "cloud" (we pay,
+  * route        — "byok" (operator pays provider) or "cloud" (we pay,
                    user is on a subscription)
   * pi_provider  — value to pass as ``pi --provider``. With BYOK keys
                    we route directly (anthropic / google / openai)
@@ -21,13 +22,14 @@ This module decides, for any given (model, available keys) tuple:
                    user's OpenAI key, etc.
 
 The rules are deliberately conservative — we never silently drop the
-user's key in favour of cloud relay or vice versa. The model picker
-in the frontend exposes the route per model so the user always knows
-which path their next prompt takes (and we can charge / not charge
-accordingly).
+operator's key in favour of cloud relay or vice versa. The model
+picker in the frontend exposes the route per model so the user always
+knows which path their next prompt takes (and we can charge / not
+charge accordingly).
 
-Web mode is unaffected — :data:`config.BYOK_MODE` is always False
-there, so :func:`route_for_model` always returns ``"cloud"``.
+When :data:`config.BYOK_MODE` is ``False`` (no BYOK credentials in
+env, the default for the hosted SaaS deployment) :func:`route_for_model`
+always returns ``"cloud"``.
 """
 
 from __future__ import annotations
@@ -167,8 +169,8 @@ def route_for_model(model: ModelSpec) -> str:
     to badge the model picker; chat_ws uses it to gate cloud-only
     models behind Clerk login.
 
-    Web mode always returns ``"cloud"`` because BYOK_MODE is False
-    by construction (see ``config.py``).
+    Returns ``"cloud"`` whenever ``BYOK_MODE`` is ``False`` (no BYOK
+    credentials wired into the backend env), regardless of the model.
     """
     if not BYOK_MODE:
         return "cloud"

@@ -82,47 +82,32 @@ onBeforeUnmount(() => {
   chat.disconnect();
 });
 
-function backToPicker(): void {
-  chat.disconnect();
-  router.push({ name: "picker" });
-}
 </script>
 
 <template>
   <div class="flex h-full w-full flex-col bg-background text-foreground">
-    <!-- Compact brand header: small logo + back-to-sessions button on
-         the leading slot, current workspace name centred (md+ only),
-         pricing/privacy/terms + account avatar trailing. -->
+    <!-- Compact brand header for the IDE shell. The back-to-sessions
+         affordance lives in the file-tree sidebar (FileTreePane) where
+         it sits directly above the session ID — that's the more
+         contextual location. We deliberately do NOT add a second back
+         button to this top bar. -->
     <BrandHeader
       variant="compact"
       :links="[
-        { to: '/activity', label: 'Activity' },
-        { to: '/pricing', label: 'Pricing' },
-        { to: '/privacy', label: 'Privacy' },
-        { to: '/terms', label: 'Terms' },
+        { to: '/activity', label: $t('nav.activity') },
+        { to: '/pricing',  label: $t('nav.pricing') },
+        { to: '/privacy',  label: $t('nav.privacy') },
+        { to: '/terms',    label: $t('nav.terms') },
       ]"
       :home-link="false"
     >
-      <template #leading>
-        <button
-          type="button"
-          class="flex items-center gap-1 rounded-md border border-border bg-card px-2 py-1 text-xs text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground"
-          title="Back to sessions"
-          @click="backToPicker"
-        >
-          <Icon icon="codicon:arrow-left" class="h-3.5 w-3.5" />
-          <span class="hidden sm:inline">Sessions</span>
-        </button>
-      </template>
-      <!-- Centre: current chat title. We deliberately show the *session*
-           title here (the LLM-generated or heuristic title) rather than
-           the workspace id, so the user always knows which thread they
-           are in. The title updates live when the background titler
-           lands a polished version (see chat.ts → applyTitleUpdate). -->
-      <div class="flex min-w-0 items-center justify-center gap-2 text-sm text-foreground">
+      <!-- Centre: current chat title. The title updates live when the
+           background titler lands a polished version (see chat.ts →
+           applyTitleUpdate). -->
+      <div class="flex min-w-0 items-center justify-center gap-2 text-lead text-foreground">
         <Icon icon="codicon:comment-discussion" class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
         <span class="truncate font-medium">
-          {{ activeSession?.title || "Untitled chat" }}
+          {{ activeSession?.title || $t("workspace.untitledChat") }}
         </span>
       </div>
     </BrandHeader>
@@ -131,9 +116,9 @@ function backToPicker(): void {
 
     <div
       v-if="connState === 'closed' || connState === 'error'"
-      class="border-t border-destructive/40 bg-destructive/10 px-3 py-1 text-center text-[11px] text-destructive"
+      class="border-t border-destructive/40 bg-destructive/10 px-3 py-1 text-center text-caption text-destructive"
     >
-      Connection {{ connState }} — bridge is down or pi crashed.
+      {{ connState === "closed" ? $t("workspace.connectionClosed") : $t("workspace.connectionError") }}
     </div>
 
     <!-- Per-tool-call approval gate. Renders nothing when there are no

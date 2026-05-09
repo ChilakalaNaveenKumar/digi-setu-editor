@@ -122,7 +122,7 @@ const cwdShort = computed(() => {
 
 function back(): void {
   chat.disconnect();
-  router.push({ name: "picker" });
+  router.push({ name: "sessions" });
 }
 
 // ── Toolbar actions ────────────────────────────────────────────────────
@@ -330,17 +330,21 @@ const canPaste = computed(() => fsClipboard.value !== null);
     <header class="border-b border-sidebar-border px-3 py-2">
       <button
         type="button"
-        class="text-xs text-muted-foreground transition-colors hover:text-foreground"
+        class="inline-flex items-center gap-1 text-caption text-muted-foreground transition-colors hover:text-foreground"
         @click="back"
       >
-        ← sessions
+        <Icon icon="codicon:arrow-left" class="h-3 w-3" />
+        {{ $t("nav.sessions") }}
       </button>
-      <div class="mt-1 truncate font-mono text-[13px] text-foreground">
+      <!-- Session ID stays in mono — it's a literal token the user may
+           need to copy/paste (e.g. for support tickets). -->
+      <div class="mt-1 truncate font-mono text-body-lg text-foreground">
         {{ session?.id ?? "—" }}
       </div>
+      <!-- File path also stays in mono — it's a path. -->
       <div
         v-if="cwdShort"
-        class="mt-0.5 truncate font-mono text-[11px] text-muted-foreground"
+        class="mt-0.5 truncate font-mono text-caption text-muted-foreground"
         :title="session?.cwd"
       >
         {{ cwdShort }}
@@ -349,7 +353,7 @@ const canPaste = computed(() => fsClipboard.value !== null);
 
     <!-- ── Toolbar row: workspace label + 4 action icons ──────────────── -->
     <div
-      class="flex items-center justify-between border-b border-sidebar-border px-3 py-1.5 text-[10px] uppercase tracking-wide text-muted-foreground"
+      class="flex items-center justify-between border-b border-sidebar-border px-3 py-1.5 text-caption uppercase tracking-wide text-muted-foreground"
     >
       <span>workspace · {{ fileCount }}</span>
       <div class="flex items-center gap-0.5">
@@ -391,7 +395,7 @@ const canPaste = computed(() => fsClipboard.value !== null);
     <!-- ── Body: recursive tree ──────────────────────────────────────── -->
     <div
       data-role="tree-body"
-      class="relative flex-1 overflow-y-auto py-1 text-sm"
+      class="relative flex-1 overflow-y-auto py-1 text-lead"
       :class="rootDragOver && 'ring-2 ring-primary ring-inset'"
       @click="onRootClick"
       @dragenter="onRootDragEnter"
@@ -406,7 +410,7 @@ const canPaste = computed(() => fsClipboard.value !== null);
         class="pointer-events-none absolute inset-0 z-10 flex items-center justify-center bg-primary/10 backdrop-blur-[1px]"
       >
         <div
-          class="flex items-center gap-2 rounded-md border border-primary bg-card px-3 py-2 text-sm font-medium text-foreground shadow"
+          class="flex items-center gap-2 rounded-md border border-primary bg-card px-3 py-2 text-lead font-medium text-foreground shadow"
         >
           <Icon
             :icon="rootUploading ? 'codicon:loading' : 'codicon:cloud-upload'"
@@ -443,7 +447,7 @@ const canPaste = computed(() => fsClipboard.value !== null);
           v-model="rootNewName"
           type="text"
           :placeholder="rootCreating === 'folder' ? 'new folder name' : 'new file name'"
-          class="min-w-0 flex-1 rounded-sm border border-primary/50 bg-background px-1 py-[1px] font-mono text-[12px] text-foreground outline-none focus:ring-1 focus:ring-primary"
+          class="min-w-0 flex-1 rounded-sm border border-primary/50 bg-background px-1 py-[1px] font-mono text-body text-foreground outline-none focus:ring-1 focus:ring-primary"
           @keydown.enter.prevent="commitRootCreate"
           @keydown.esc.prevent="cancelRootCreate"
           @blur="commitRootCreate"
@@ -452,7 +456,7 @@ const canPaste = computed(() => fsClipboard.value !== null);
 
       <div
         v-if="!tree.length && !rootCreating"
-        class="px-3 py-3 text-xs text-muted-foreground"
+        class="px-3 py-3 text-body text-muted-foreground"
       >
         Empty. Files appear here as the agent creates them — or use the
         <Icon icon="codicon:new-file" class="inline-block h-3 w-3" /> /
@@ -480,7 +484,7 @@ const canPaste = computed(() => fsClipboard.value !== null);
       <button
         v-if="!menu.node.isDir"
         type="button"
-        class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] hover:bg-accent"
+        class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-body hover:bg-accent"
         @click="ctxOpen"
       >
         <Icon icon="codicon:go-to-file" class="h-[14px] w-[14px] text-muted-foreground" />
@@ -488,7 +492,7 @@ const canPaste = computed(() => fsClipboard.value !== null);
       </button>
       <button
         type="button"
-        class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] hover:bg-accent"
+        class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-body hover:bg-accent"
         @click="ctxNewFile"
       >
         <Icon icon="codicon:new-file" class="h-[14px] w-[14px] text-muted-foreground" />
@@ -496,7 +500,7 @@ const canPaste = computed(() => fsClipboard.value !== null);
       </button>
       <button
         type="button"
-        class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] hover:bg-accent"
+        class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-body hover:bg-accent"
         @click="ctxNewFolder"
       >
         <Icon icon="codicon:new-folder" class="h-[14px] w-[14px] text-muted-foreground" />
@@ -508,7 +512,7 @@ const canPaste = computed(() => fsClipboard.value !== null);
            the right-clicked node is a folder. -->
       <button
         type="button"
-        class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] hover:bg-accent"
+        class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-body hover:bg-accent"
         @click="ctxCut"
       >
         <Icon icon="codicon:list-selection" class="h-[14px] w-[14px] text-muted-foreground" />
@@ -516,7 +520,7 @@ const canPaste = computed(() => fsClipboard.value !== null);
       </button>
       <button
         type="button"
-        class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] hover:bg-accent"
+        class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-body hover:bg-accent"
         @click="ctxCopy"
       >
         <Icon icon="codicon:files" class="h-[14px] w-[14px] text-muted-foreground" />
@@ -526,18 +530,18 @@ const canPaste = computed(() => fsClipboard.value !== null);
         type="button"
         :disabled="!canPaste"
         :class="[
-          'flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px]',
+          'flex w-full items-center gap-2 px-3 py-1.5 text-left text-body',
           canPaste ? 'hover:bg-accent' : 'cursor-not-allowed text-muted-foreground/60',
         ]"
         :title="canPaste ? `Paste ${fsClipboard?.path}` : 'Clipboard is empty'"
         @click="ctxPaste"
       >
         <Icon icon="codicon:clippy" class="h-[14px] w-[14px] text-muted-foreground" />
-        Paste<span v-if="canPaste" class="ml-auto text-[10px] text-muted-foreground">{{ fsClipboard?.op }}</span>
+        Paste<span v-if="canPaste" class="ml-auto text-caption text-muted-foreground">{{ fsClipboard?.op }}</span>
       </button>
       <button
         type="button"
-        class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] hover:bg-accent"
+        class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-body hover:bg-accent"
         @click="ctxDuplicate"
       >
         <Icon icon="codicon:diff-added" class="h-[14px] w-[14px] text-muted-foreground" />
@@ -546,7 +550,7 @@ const canPaste = computed(() => fsClipboard.value !== null);
       <div class="border-t border-border"></div>
       <button
         type="button"
-        class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] hover:bg-accent"
+        class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-body hover:bg-accent"
         @click="ctxRename"
       >
         <Icon icon="codicon:edit" class="h-[14px] w-[14px] text-muted-foreground" />
@@ -554,7 +558,7 @@ const canPaste = computed(() => fsClipboard.value !== null);
       </button>
       <button
         type="button"
-        class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] hover:bg-accent"
+        class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-body hover:bg-accent"
         @click="ctxCopyPath"
       >
         <Icon icon="codicon:copy" class="h-[14px] w-[14px] text-muted-foreground" />
@@ -563,7 +567,7 @@ const canPaste = computed(() => fsClipboard.value !== null);
       <div class="border-t border-border"></div>
       <button
         type="button"
-        class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] text-destructive hover:bg-destructive/15"
+        class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-body text-destructive hover:bg-destructive/15"
         @click="ctxDelete"
       >
         <Icon icon="codicon:trash" class="h-[14px] w-[14px]" />

@@ -5,11 +5,8 @@
  * side, change the other — there's no codegen yet.
  */
 
-export type DeployMode = "web" | "desktop";
-
 export interface WorkspaceRecord {
   id: string;
-  mode: DeployMode;
   path: string;
   name: string;
   created_at: string;

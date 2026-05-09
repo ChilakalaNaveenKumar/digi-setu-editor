@@ -43,6 +43,9 @@ pub mod ids {
     pub const HELP_DOCS: &str = "help_docs";
     pub const HELP_REPORT: &str = "help_report";
     pub const HELP_HOMEPAGE: &str = "help_homepage";
+    pub const HELP_LICENSES: &str = "help_licenses";
+    pub const HELP_PRIVACY: &str = "help_privacy";
+    pub const HELP_TERMS: &str = "help_terms";
 }
 
 /// Build and attach the native menu to the running app. Called once
@@ -170,12 +173,22 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let report_item = MenuItemBuilder::with_id(ids::HELP_REPORT, "Report Issue").build(app)?;
     let homepage_item =
         MenuItemBuilder::with_id(ids::HELP_HOMEPAGE, "Visit digi-setu.com").build(app)?;
+    let privacy_item =
+        MenuItemBuilder::with_id(ids::HELP_PRIVACY, "Privacy Policy").build(app)?;
+    let terms_item =
+        MenuItemBuilder::with_id(ids::HELP_TERMS, "Terms of Service").build(app)?;
+    let licenses_item =
+        MenuItemBuilder::with_id(ids::HELP_LICENSES, "Open Source Licenses").build(app)?;
 
     let help_submenu = SubmenuBuilder::new(app, "Help")
         .item(&docs_item)
         .item(&report_item)
         .separator()
         .item(&homepage_item)
+        .separator()
+        .item(&privacy_item)
+        .item(&terms_item)
+        .item(&licenses_item)
         .build()?;
 
     // ── Final assembly ───────────────────────────────────────────────

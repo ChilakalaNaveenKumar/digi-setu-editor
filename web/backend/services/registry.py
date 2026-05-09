@@ -81,21 +81,6 @@ def _safe_id(prefix: str = "") -> str:
     return f"{prefix}{secrets.token_urlsafe(8)}"
 
 
-def _canonical_workspace_path(path: str) -> str:
-    """
-    Canonical key used to dedup desktop workspaces by folder.
-
-    macOS APFS and Windows NTFS are both case-insensitive by default, so
-    `/Users/me/Foo` and `/Users/me/foo` must collapse to one workspace.
-    Linux is case-sensitive, so we keep the path as-is there. We always
-    `expanduser().resolve()` first to flatten `~`, `..`, and symlinks.
-    """
-    abs_path = str(Path(path).expanduser().resolve())
-    if sys.platform in ("darwin", "win32"):
-        return abs_path.casefold()
-    return abs_path
-
-
 class Registry:
     """JSON-backed workspace/session catalogue. Singleton via Registry.instance()."""
 
@@ -116,13 +101,6 @@ class Registry:
         self._async_lock = asyncio.Lock()
         self._sync_lock = threading.Lock()
         self._data: dict[str, Any] = self._load()
-        # One-shot dedup of any pre-existing desktop duplicates. Earlier
-        # builds of register_desktop_workspace minted a fresh ws id on
-        # every "Open folder" click, so users hitting upgrade may have
-        # several workspace records pointing at the same folder. We
-        # collapse them here so the rest of the codebase sees a clean
-        # 1:1 (folder → workspace) mapping. No-op on fresh installs.
-        self._migrate_dedup_desktop_workspaces()
 
     # ── persistence ────────────────────────────────────────────────────────
     def _load(self) -> dict[str, Any]:
@@ -154,63 +132,6 @@ class Registry:
         with tmp.open("w", encoding="utf-8") as f:
             json.dump(self._data, f, indent=2, ensure_ascii=False)
         os.replace(tmp, REGISTRY_PATH)
-
-    def _migrate_dedup_desktop_workspaces(self) -> None:
-        """
-        Collapse desktop workspaces that share (owner_user_id, canonical_path).
-
-        We keep the OLDEST record (smallest `created_at`) so the user's
-        original chats stay attached to the original wsid — anything that
-        cached the id externally (deep links, pinned tabs) keeps working.
-        Sessions belonging to the duplicates are reparented to the keeper.
-        We also fold each duplicate's `last_used` into the keeper so the
-        re-opened workspace sorts to the top.
-
-        Idempotent: a clean registry runs through here as a no-op (groups
-        of size 1 are skipped) and we only `_flush` when something changed.
-        """
-        groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
-        for rec in self._data["workspaces"].values():
-            if rec.get("mode") != "desktop":
-                continue
-            owner = rec.get("owner_user_id") or ""
-            path = rec.get("path") or ""
-            if not path:
-                continue
-            key = (owner, _canonical_workspace_path(path))
-            groups.setdefault(key, []).append(rec)
-
-        changed = False
-        for recs in groups.values():
-            if len(recs) <= 1:
-                continue
-            recs.sort(key=lambda r: r.get("created_at", ""))
-            keeper = recs[0]
-            keeper_id = keeper["id"]
-            duplicate_ids = {r["id"] for r in recs[1:]}
-            # Reparent sessions before the workspace records vanish, otherwise
-            # list_sessions(wsid=keeper_id) won't see the orphaned chats.
-            for sess in self._data["sessions"].values():
-                if sess.get("workspace_id") in duplicate_ids:
-                    sess["workspace_id"] = keeper_id
-            # Fold last_used so the merged workspace sorts to the top.
-            for r in recs[1:]:
-                lu = r.get("last_used") or ""
-                if lu > (keeper.get("last_used") or ""):
-                    keeper["last_used"] = lu
-            # Drop the duplicate workspace records.
-            for dup_id in duplicate_ids:
-                self._data["workspaces"].pop(dup_id, None)
-            changed = True
-            print(
-                f"[registry] merged {len(duplicate_ids)} duplicate desktop "
-                f"workspace(s) into {keeper_id} (path={keeper.get('path')!r})",
-                file=sys.stderr,
-            )
-
-        if changed:
-            with self._sync_lock:
-                self._flush()
 
     # ── workspace CRUD ─────────────────────────────────────────────────────
     # All workspace records carry an `owner_user_id`. In dev mode every row
@@ -261,58 +182,6 @@ class Registry:
             self._data["workspaces"][wsid] = record
             self._flush()
         return dict(record)
-
-    def register_desktop_workspace(
-        self, path: str, name: str = "", *, owner_user_id: str
-    ) -> dict[str, Any]:
-        """
-        Register a folder the user picked via the OS dialog. We do NOT create
-        the directory — desktop mode trusts the user's pick. The folder must
-        already exist and be writable.
-
-        Idempotent on (owner_user_id, canonical_path): if the same user has
-        already registered this exact folder, we return the EXISTING record
-        (with `last_used` bumped) instead of minting a new id. This is what
-        makes "Open folder" behave like Cursor — picking a workspace you
-        already have brings you back to your existing chats, it doesn't
-        spawn a parallel copy of the workspace.
-        """
-        abs_path = Path(path).expanduser().resolve()
-        if not abs_path.exists() or not abs_path.is_dir():
-            raise FileNotFoundError(f"Workspace folder not found: {abs_path}")
-
-        canon = _canonical_workspace_path(str(abs_path))
-        with self._sync_lock:
-            # Look for an existing desktop workspace owned by this user
-            # whose canonical path matches the picked folder.
-            for rec in self._data["workspaces"].values():
-                if rec.get("mode") != "desktop":
-                    continue
-                if rec.get("owner_user_id") != owner_user_id:
-                    continue
-                if _canonical_workspace_path(rec.get("path", "")) != canon:
-                    continue
-                # Re-pick of an existing folder. Bump last_used so it
-                # bubbles to the top of the recent-workspaces list, but
-                # leave name/created_at alone — users may have renamed
-                # the workspace and we don't want to clobber that.
-                rec["last_used"] = _now_iso()
-                self._flush()
-                return dict(rec)
-
-            wsid = _safe_id("ds_")
-            record = {
-                "id": wsid,
-                "mode": "desktop",
-                "path": str(abs_path),
-                "name": name or abs_path.name,
-                "owner_user_id": owner_user_id,
-                "created_at": _now_iso(),
-                "last_used": _now_iso(),
-            }
-            self._data["workspaces"][wsid] = record
-            self._flush()
-            return dict(record)
 
     def get_workspace(self, wsid: str) -> Optional[dict[str, Any]]:
         rec = self._data["workspaces"].get(wsid)
@@ -689,18 +558,13 @@ class Registry:
         """Return (and create if missing) workspace/uploads/.
 
         Self-heals for older workspaces created before the uploads/ dir
-        was part of the bootstrap. Also self-heals for both web and desktop
-        modes — desktop users still get an uploads/ folder under whatever
-        directory they picked.
+        was part of the bootstrap.
         """
         rec = self._data["workspaces"].get(wsid)
         if not rec:
             raise KeyError(wsid)
         base = Path(rec["path"])
-        if rec.get("mode") == "desktop":
-            uploads = base / "uploads"
-        else:
-            uploads = base / "workspace" / "uploads"
+        uploads = base / "workspace" / "uploads"
         uploads.mkdir(parents=True, exist_ok=True)
         # Re-stamp on every call so legacy uploads/ dirs created before
         # the dual-uid migration get pulled into compliance the first

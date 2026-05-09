@@ -3,9 +3,10 @@
  *
  * Routes (history mode so the URL shows real paths, not `#`-hashes):
  *
- *   /                  Home — picker (web flat list, or desktop workspace list)
- *   /sessions          Alias for / — Clerk's hosted sign-in redirects here
- *                      after auth (configured in the Clerk dashboard).
+ *   /                  Home — public marketing landing
+ *   /sessions          Picker — recent chats (web) or workspaces (desktop).
+ *                      This is the first authenticated surface; Clerk's
+ *                      hosted sign-in also redirects here post-auth.
  *   /workspaces/:wsid  Desktop landing — resolves to the most-recent
  *                      chat in the workspace (or auto-creates one), then
  *                      redirects to /chat/:sid. Kept for bookmark stability;
@@ -24,72 +25,94 @@
  * and it'll resolve the workspace from the session id at boot via the
  * session's wsid.
  *
+ * Route meta:
+ *   - `header: 'full' | 'compact' | 'none'` — controls the global
+ *     BrandHeader mounted in App.vue. The IDE shell (/chat/:sid) uses
+ *     the compact variant so the chat title fits in the centre slot;
+ *     the marketing routes use full; nothing currently sets 'none'
+ *     but it's there for future fullscreen flows.
+ *   - `footer: boolean` — render the shared <AppFooter /> below the
+ *     route. The chat IDE has its own bottom bar so it sets false.
+ *
  * Auth guard:
- *   - In dev mode (`auth_required=false`) every route is open and the
- *     guard short-circuits.
- *   - In prod mode the guard waits for Clerk to load, then bounces
- *     unauthenticated users to /login (carrying a `next` param so we
- *     can return them to the original URL after sign-in).
+ *   - The guard does NOT block navigation based on auth state. Users
+ *     can browse the home page, picker, open folders, view workspaces,
+ *     and read legal pages without signing in. The actual gate lives
+ *     in the chat surface: when a user tries to send a message without
+ *     a usable backend (no Clerk session AND no BYOK key), the chat
+ *     panel renders an inline "sign in or add a key" prompt instead
+ *     of trying to spawn the runtime and crashing the bridge.
+ *   - On true first launch (`requires_setup=true`) we land the user on
+ *     the public Home page (/), which carries its own primary CTA into
+ *     /login. We do NOT bounce / → /login any more — the user always
+ *     sees the marketing surface first so they know what they're
+ *     signing in to.
+ *   - /login is auto-redirected to /sessions once auth is satisfied so
+ *     the dead "auth disabled" / "you're already signed in" stub never
+ *     shows.
  */
 
 import { createRouter, createWebHistory, type RouteRecordRaw } from "vue-router";
 
 import { useConfigStore } from "./stores/config";
-
-// Routes that bypass the Clerk auth guard. `sessions` stays public
-// because Clerk lands here right after sign-in and the auth cookie
-// hasn't necessarily been written by the time the guard runs (race
-// window during the OAuth round trip). The picker itself works
-// gracefully whether the user is signed in or not.
-const PUBLIC_ROUTES = new Set([
-  "login",
-  "sessions",
-  "privacy",
-  "terms",
-  "pricing",
-  "feedback",
-]);
+import { useAuthStore } from "./stores/auth";
 
 const routes: RouteRecordRaw[] = [
   {
     path: "/",
-    name: "picker",
-    component: () => import("./views/Picker.vue"),
+    name: "home",
+    component: () => import("./views/Home.vue"),
+    meta: { header: "full", footer: true },
   },
   {
-    // Clerk's Account Portal sends users to /sessions after sign-in /
-    // sign-up (see dashboard → User redirects). Alias to the picker
-    // so we don't have to maintain a separate component.
+    // Picker is the first authenticated surface. Clerk's Account
+    // Portal sends users to /sessions after sign-in / sign-up (see
+    // dashboard → User redirects), so the route name is fixed.
     path: "/sessions",
     name: "sessions",
     component: () => import("./views/Picker.vue"),
+    meta: { header: "full", footer: true },
   },
   {
     path: "/workspaces/:wsid",
     name: "workspace",
     component: () => import("./views/PickerDesktopDrill.vue"),
     props: true,
+    meta: { header: "full", footer: true },
   },
   {
     path: "/chat/:sid",
     name: "chat",
     component: () => import("./views/Workspace.vue"),
     props: true,
+    meta: { header: "compact", footer: false },
   },
   {
     path: "/login",
     name: "login",
     component: () => import("./views/Login.vue"),
+    meta: { header: "full", footer: true },
   },
   {
+    // /pricing — kept as a route so old in-app links and the chat
+    // surface's "Upgrade" CTA don't 404, but the page itself now
+    // renders an "Opening browser…" stub and immediately calls
+    // openExternal({CLOUD}/pricing). Billing UX lives on the cloud
+    // SPA where Stripe Checkout / Customer Portal already runs in
+    // the user's signed-in browser session — we don't want a parallel
+    // billing surface inside the desktop binary that could go stale,
+    // mis-classify states, or leak Stripe keys.
     path: "/pricing",
     name: "pricing",
-    component: () => import("./views/Pricing.vue"),
+    component: () => import("./views/CloudRedirect.vue"),
+    props: { target: "PRICING", title: "Pricing" },
+    meta: { header: "full", footer: true },
   },
   {
     path: "/privacy",
     name: "privacy",
     component: () => import("./views/Privacy.vue"),
+    meta: { header: "full", footer: true },
   },
   {
     // Clerk's "Privacy Policy URL" field points to /privacy-policy
@@ -101,16 +124,28 @@ const routes: RouteRecordRaw[] = [
     path: "/terms",
     name: "terms",
     component: () => import("./views/Terms.vue"),
+    meta: { header: "full", footer: true },
   },
   {
     path: "/feedback",
     name: "feedback",
     component: () => import("./views/Feedback.vue"),
+    meta: { header: "full", footer: true },
   },
   {
+    // /activity — same posture as /pricing. The cloud's CreditLedger
+    // is the authoritative source of truth (every chat turn that ran
+    // on the cloud relay writes a row there); a separate desktop page
+    // would drift, leak the user's chat history into a local SQLite
+    // (which they could delete), and force the desktop to make
+    // authenticated reads against the cloud DB. Sending users to
+    // {CLOUD}/activity keeps the data path: browser → Caddy → cloud
+    // FastAPI → SQLite-on-VM. The desktop never reaches that DB.
     path: "/activity",
     name: "activity",
-    component: () => import("./views/Activity.vue"),
+    component: () => import("./views/CloudRedirect.vue"),
+    props: { target: "ACTIVITY", title: "Activity" },
+    meta: { header: "full", footer: true },
   },
   {
     path: "/:pathMatch(.*)*",
@@ -125,31 +160,23 @@ export const router = createRouter({
 
 router.beforeEach(async (to) => {
   const cfg = useConfigStore();
+  const auth = useAuthStore();
   // Defensive: if main.ts somehow navigates before refresh, do it now.
   if (!cfg.ready) await cfg.refresh();
+  if (!auth.ready) await auth.refresh();
 
-  if (!cfg.authRequired) {
-    // /login is meaningless in dev mode (no Clerk to render). Bounce
-    // to home so nobody trips the dead "auth disabled" notice.
-    if (to.name === "login") return { path: "/" };
-    return true;
-  }
-  if (PUBLIC_ROUTES.has(String(to.name))) return true;
-
-  // Why not `useAuth()` here: composables rely on Vue's `inject()`
-  // and only resolve inside a component setup function. Router
-  // guards run outside that context, so we use the plugin-free
-  // `getToken()` helper from @clerk/shared. It internally waits for
-  // Clerk to finish loading and returns null iff there's no session
-  // — exactly the boolean we need.
-  const { getToken } = await import("@clerk/vue");
-  let token: string | null = null;
-  try {
-    token = await getToken();
-  } catch (exc) {
-    console.warn("[router] getToken failed in guard", exc);
+  // /login is the Welcome screen. If the user is already signed in
+  // (or running in BYOK / dev mode), there's nothing useful for
+  // /login to show — send them straight to the picker. This also
+  // avoids the "you're already signed in" dead-end stub.
+  if (to.name === "login" && (auth.signedIn || !cfg.authRequired)) {
+    return { name: "sessions" };
   }
 
-  if (token) return true;
-  return { name: "login", query: { next: to.fullPath } };
+  // Otherwise: every route is open. Cold-launch first-time users
+  // land on / (the public Home page) and choose to sign in from
+  // the hero CTA — we no longer punt them to /login behind their
+  // back. Chat itself prompts for sign-in or BYOK at message-send
+  // time when no backend is configured.
+  return true;
 });

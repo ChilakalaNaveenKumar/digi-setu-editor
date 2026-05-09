@@ -1,5 +1,5 @@
 {
-  "name": "pi-typst-test-desktop",
+  "name": "digi-setu-desktop",
   "version": "0.1.0",
   "private": true,
   "description": "Tauri desktop shell for Digi Setu. Owns its own forked backend (desktop/backend) frozen via PyInstaller and frontend (desktop/frontend) built with Vite, plus a bundled Node + pi-coding-agent runtime.",

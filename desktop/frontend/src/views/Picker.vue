@@ -3,11 +3,13 @@
   workspace-then-session drilldown).
 
   Layout:
-    BrandHeader      (logo + nav)
     hero             (tagline + primary CTA)
     recent strip     (search + 5 most recent + "view all" toggle)
-    "built on pi"    (small footer credit, deliberately understated)
-    site footer      (copyright)
+    AppFooter        (shared, fixed copyright)
+
+  The global brand header is mounted in App.vue, NOT here. This view
+  starts with the hero directly so the page reads as a workspace
+  selector rather than a marketing-shaped surface.
 
   Branches on `useConfigStore().mode` so the same SPA bundle ships to
   both Tauri (desktop) and Cloud Run (web).
@@ -18,7 +20,7 @@ import { storeToRefs } from "pinia";
 import { useRouter } from "vue-router";
 import { Icon } from "@iconify/vue";
 
-import BrandHeader from "../components/BrandHeader.vue";
+import AppFooter from "../components/AppFooter.vue";
 import { pickFolder } from "../lib/native-bridge";
 import { useChatSessionStore } from "../stores/chat-session";
 import { useConfigStore } from "../stores/config";
@@ -272,20 +274,18 @@ const isReady = computed(() => cfg.ready);
 </script>
 
 <template>
-  <div class="flex min-h-screen w-full flex-col bg-background text-foreground">
-    <BrandHeader :home-link="false" />
-
-    <main class="mx-auto flex w-full max-w-5xl flex-1 flex-col px-6 py-10 md:py-16">
+  <div class="flex min-h-0 w-full flex-1 flex-col bg-background text-foreground">
+    <main class="mx-auto flex w-full max-w-5xl flex-1 flex-col px-6 py-10 md:py-14">
       <!-- HERO -->
-      <div class="text-center">
-        <h1 class="text-3xl font-semibold tracking-tight md:text-4xl">
-          What do you want to build today?
+      <div>
+        <h1 class="text-h1 font-semibold tracking-tight text-foreground">
+          Your workspaces
         </h1>
-        <p class="mx-auto mt-3 max-w-xl text-sm leading-relaxed text-muted-foreground">
+        <p class="mt-2 max-w-2xl text-lead leading-relaxed text-muted-foreground">
           <template v-if="mode === 'web'">
-            Each chat runs in its own sandboxed workspace. Digi Setu writes
-            Typst documents, code, and PDFs for you — start a new one or
-            jump back into a recent thread.
+            Each chat runs in its own sandboxed workspace — files,
+            terminals and snapshots are scoped to the chat. Pick up a
+            recent thread or start a new one.
           </template>
           <template v-else>
             Pick a folder on this machine. Each folder hosts as many chats
@@ -295,11 +295,11 @@ const isReady = computed(() => cfg.ready);
       </div>
 
       <!-- PRIMARY CTA -->
-      <div class="mx-auto mt-8 w-full max-w-md">
+      <div class="mt-6 max-w-md">
         <button
           v-if="isReady && mode === 'web'"
           type="button"
-          class="flex w-full items-center justify-center gap-2 rounded-lg bg-primary px-5 py-3 text-sm font-semibold text-primary-foreground shadow-md transition-opacity hover:opacity-90 disabled:opacity-60"
+          class="flex w-full items-center justify-center gap-2 rounded-md bg-primary px-4 py-2.5 text-lead font-semibold text-primary-foreground shadow-sm transition-opacity hover:opacity-90 disabled:opacity-60"
           :disabled="busy"
           @click="startNewWebSession"
         >
@@ -310,7 +310,7 @@ const isReady = computed(() => cfg.ready);
         <button
           v-else-if="isReady && mode === 'desktop'"
           type="button"
-          class="flex w-full items-center justify-center gap-2 rounded-lg bg-primary px-5 py-3 text-sm font-semibold text-primary-foreground shadow-md transition-opacity hover:opacity-90 disabled:opacity-60"
+          class="flex w-full items-center justify-center gap-2 rounded-md bg-primary px-4 py-2.5 text-lead font-semibold text-primary-foreground shadow-sm transition-opacity hover:opacity-90 disabled:opacity-60"
           :disabled="busy"
           @click="pickDesktopWorkspace"
         >
@@ -320,7 +320,7 @@ const isReady = computed(() => cfg.ready);
 
         <div
           v-else
-          class="flex items-center justify-center gap-2 rounded-lg border border-border bg-card px-5 py-3 text-sm text-muted-foreground"
+          class="flex items-center justify-center gap-2 rounded-md border border-border bg-card px-4 py-2.5 text-lead text-muted-foreground"
         >
           <Icon icon="codicon:loading" class="h-4 w-4 animate-spin" />
           Loading…
@@ -337,10 +337,10 @@ const isReady = computed(() => cfg.ready);
         class="mt-12"
       >
         <header class="mb-3 flex flex-wrap items-center gap-3">
-          <h2 class="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+          <h2 class="text-body font-semibold uppercase tracking-wide text-muted-foreground">
             {{ mode === "web" ? "Recent chats" : "Recent folders" }}
           </h2>
-          <span class="font-mono text-[11px] text-muted-foreground">
+          <span class="font-mono text-caption text-muted-foreground">
             {{ totalCount }} total
           </span>
 
@@ -360,7 +360,7 @@ const isReady = computed(() => cfg.ready);
               :placeholder="
                 mode === 'web' ? 'Search your chats…' : 'Search folders…'
               "
-              class="w-full rounded-md border border-border bg-card py-1.5 pl-8 pr-7 text-xs text-foreground outline-none placeholder:text-muted-foreground focus:border-primary/50"
+              class="w-full rounded-md border border-border bg-card py-1.5 pl-8 pr-7 text-body text-foreground outline-none placeholder:text-muted-foreground focus:border-primary/50"
             />
             <button
               v-if="search"
@@ -376,7 +376,7 @@ const isReady = computed(() => cfg.ready);
           <button
             v-if="!showAll && hiddenCount > 0 && !search"
             type="button"
-            class="rounded-md border border-border bg-card px-2.5 py-1 text-[11px] font-medium text-foreground hover:border-primary/40"
+            class="rounded-md border border-border bg-card px-2.5 py-1 text-caption font-medium text-foreground hover:border-primary/40"
             :title="`Show all ${totalCount} ${mode === 'web' ? 'chats' : 'folders'}`"
             @click="showAll = true"
           >
@@ -385,7 +385,7 @@ const isReady = computed(() => cfg.ready);
           <button
             v-else-if="showAll && totalCount > COMPACT_LIMIT && !search"
             type="button"
-            class="rounded-md border border-border bg-card px-2.5 py-1 text-[11px] font-medium text-muted-foreground hover:text-foreground"
+            class="rounded-md border border-border bg-card px-2.5 py-1 text-caption font-medium text-muted-foreground hover:text-foreground"
             title="Show only the most recent 5"
             @click="showAll = false"
           >
@@ -410,10 +410,10 @@ const isReady = computed(() => cfg.ready);
                 class="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground"
               />
               <div class="min-w-0 flex-1">
-                <div class="truncate text-sm font-medium text-foreground">
+                <div class="truncate text-lead font-medium text-foreground">
                   {{ s.title || "Untitled chat" }}
                 </div>
-                <div class="font-mono text-[10px] text-muted-foreground">
+                <div class="font-mono text-caption text-muted-foreground">
                   {{ timeShort(s.last_used) }}
                 </div>
               </div>
@@ -456,10 +456,10 @@ const isReady = computed(() => cfg.ready);
                 class="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground"
               />
               <div class="min-w-0 flex-1">
-                <div class="truncate text-sm font-medium text-foreground">
+                <div class="truncate text-lead font-medium text-foreground">
                   {{ w.name }}
                 </div>
-                <div class="truncate font-mono text-[10px] text-muted-foreground">
+                <div class="truncate font-mono text-caption text-muted-foreground">
                   {{ w.path }}
                 </div>
               </div>
@@ -490,7 +490,7 @@ const isReady = computed(() => cfg.ready);
              out. -->
         <p
           v-if="search && (mode === 'web' ? filteredSessions.length === 0 : filteredWorkspaces.length === 0)"
-          class="mt-4 text-center text-xs text-muted-foreground"
+          class="mt-4 text-center text-body text-muted-foreground"
         >
           No matches for "{{ search }}".
         </p>
@@ -499,36 +499,13 @@ const isReady = computed(() => cfg.ready);
       <!-- Empty state for first-time users. -->
       <p
         v-else-if="isReady"
-        class="mt-12 text-center text-xs text-muted-foreground"
+        class="mt-12 text-center text-body text-muted-foreground"
       >
         No {{ mode === "web" ? "chats" : "folders" }} yet — start your first one above.
       </p>
 
-      <!--
-        "Built on top of pi" — small, deliberate credit line. Pi is the
-        underlying agent runtime; we shout the brand (DIGI SETU) and
-        keep this sub-credit understated so it reads like a tech badge,
-        not a competing brand.
-      -->
-      <p class="mx-auto mt-16 max-w-md text-center text-[11px] leading-relaxed text-muted-foreground">
-        <Icon icon="codicon:circuit-board" class="mr-1 inline h-3 w-3 align-text-bottom" />
-        Built on top of
-        <a
-          href="https://github.com/coding-agent/pi"
-          target="_blank"
-          rel="noopener noreferrer"
-          class="font-mono font-semibold text-foreground/80 hover:text-primary hover:underline"
-        >pi</a>
-        — an open-source coding agent. Digi Setu adds the sandbox, the
-        UI, and the production-grade Typst pipeline.
-      </p>
     </main>
 
-    <footer
-      class="border-t border-border bg-card/40 px-6 py-4 text-center text-[11px] text-muted-foreground"
-    >
-      © {{ new Date().getFullYear() }} Digi Setu — built for writers,
-      coders &amp; everyone in between.
-    </footer>
+    <AppFooter />
   </div>
 </template>

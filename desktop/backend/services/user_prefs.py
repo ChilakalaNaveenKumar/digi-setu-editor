@@ -1,26 +1,39 @@
 """
 Per-user UI preferences.
 
-Tiny key/value store for things that aren't billing or auth — currently just
-the permission_mode (auto / approve_risky / approve_all) but designed so we
-can drop in more (theme, default model, default thinking level, etc.) without
-churning the API surface.
+Tiny key/value store for things that aren't billing or auth — currently
+the permission_mode (auto / ask / cautious) and a few desktop-specific
+prefs (per-workspace last-used model, BYOK vs Cloud routing default).
+Designed so we can drop in more (theme, default model, default thinking
+level, etc.) without churning the API surface.
 
-Persistence is plain JSON at web/data/user_prefs.json. We chose flat JSON over
-SQLite because:
+Persistence is plain JSON at web/data/user_prefs.json. We chose flat
+JSON over SQLite because:
   - the dataset is tiny (one row per user, ~64 bytes)
   - it survives restarts without a migration story
   - it's trivial to inspect and bulk-edit during development
 
-If/when this hits ~10k users we'll move it into the same SQLite store the
-CreditLedger eventually wants.
+If/when this hits ~10k users we'll move it into the same SQLite store
+the CreditLedger eventually wants.
 
-Defaults are plan-aware: free/starter users default to `approve_risky`
-(prompt-on-bash/write/edit), pro/enterprise users default to `auto`
-(no prompts, audit log only). Reasoning: paying users are typically
-power users running a lot of agentic code and the per-call modal would
-become an "OK, OK, OK" reflex. Free users are more likely first-time
-users who benefit from the speed bump.
+Permission-mode IDs (canonical → user-facing label):
+    auto       → "Auto"      Run every tool without asking; audit log
+                              records every action.
+    ask        → "Ask"       Ask before bash / write / edit / process.
+                              Reads pass silently. (Default.)
+    cautious   → "Cautious"  Ask before every tool call, including
+                              reads.
+
+Legacy IDs ("approve_risky" ≡ "ask", "approve_all" ≡ "cautious") are
+accepted on read and silently rewritten to the canonical form on the
+first save — so a stale prefs.json keeps working through the upgrade
+without manual intervention.
+
+Defaults are plan-aware: free/starter users default to `ask`, pro/
+enterprise users default to `auto`. Reasoning: paying users are
+typically power users running a lot of agentic code and the per-call
+modal would become an "OK, OK, OK" reflex; free users are more likely
+first-time users who benefit from the speed bump.
 """
 
 from __future__ import annotations
@@ -44,16 +57,38 @@ PREFS_PATH = DATA_ROOT / "user_prefs.json"
 # from the extension without parsing JSON.
 _USERS_DIR = DATA_ROOT / "users"
 
-VALID_PERMISSION_MODES = ("auto", "approve_risky", "approve_all")
-# `approve_risky` matches the Cursor / Cline / Roo Code default — agent
-# runs everything but pops a confirm prompt for risky shell ops (rm,
-# network, sudo). Override with PI_PERMISSION_MODE_DEFAULT for desktop
-# launches that want a different first-launch posture.
+# Canonical permission-mode IDs the rest of the codebase should use.
+VALID_PERMISSION_MODES = ("auto", "ask", "cautious")
+
+# Legacy aliases. These appeared in earlier builds; we map them to the
+# canonical IDs on read (and rewrite on next save). Update this dict if
+# we ever need another rename — never expand the canonical tuple.
+_LEGACY_PERMISSION_ALIASES = {
+    "approve_risky": "ask",
+    "approve_all": "cautious",
+}
+
+
+def normalize_permission_mode(raw: str) -> Optional[str]:
+    """Return the canonical mode for `raw`, or None if it's invalid.
+
+    Accepts the canonical IDs unchanged and the legacy aliases mapped to
+    their modern equivalents. Whitespace and case are normalised.
+    """
+    cleaned = (raw or "").strip().lower()
+    if cleaned in VALID_PERMISSION_MODES:
+        return cleaned
+    return _LEGACY_PERMISSION_ALIASES.get(cleaned)
+
+
+# Default first-launch posture. `ask` matches the Cursor / Cline /
+# Claude Code default — agent runs everything but pops a confirm prompt
+# for risky shell ops (rm, network, sudo). Override with
+# PI_PERMISSION_MODE_DEFAULT for desktop launches that want a different
+# first-launch posture.
 _DEFAULT_FROM_ENV = os.environ.get("PI_PERMISSION_MODE_DEFAULT", "").strip().lower()
-DEFAULT_PERMISSION_MODE = (
-    _DEFAULT_FROM_ENV if _DEFAULT_FROM_ENV in {"auto", "approve_risky", "approve_all"}
-    else "approve_risky"
-)
+_DEFAULT_NORMALISED = normalize_permission_mode(_DEFAULT_FROM_ENV)
+DEFAULT_PERMISSION_MODE = _DEFAULT_NORMALISED if _DEFAULT_NORMALISED else "ask"
 
 # user_id from Clerk looks like "user_2abcXYZ..."; in dev we sometimes
 # pass "anon" or an email. Restrict to filesystem-safe chars to avoid
@@ -126,35 +161,53 @@ class UserPrefs:
 
     def get_permission_mode(self, user_id: str, *, plan_id: Optional[str] = None) -> str:
         """
-        Return the user's chosen mode, falling back to the plan-aware default
-        when no explicit choice has been made.
+        Return the user's chosen mode, falling back to the plan-aware
+        default when no explicit choice has been made.
+
+        Legacy IDs in the on-disk JSON (`approve_risky`, `approve_all`)
+        are silently mapped to the canonical equivalents and rewritten
+        on the next save — users keep their setting through the rename.
         """
         if not user_id:
             return _default_for_plan(plan_id)
         with self._lock:
             row = self._data.get(user_id) or {}
             chosen = row.get("permission_mode")
-        if isinstance(chosen, str) and chosen in VALID_PERMISSION_MODES:
-            return chosen
+        if isinstance(chosen, str):
+            normalised = normalize_permission_mode(chosen)
+            if normalised:
+                # Lazy migration: if the on-disk value was a legacy
+                # alias, rewrite it now so future reads skip the
+                # alias-lookup path. Best-effort — we don't fail the
+                # call if the flush fails.
+                if normalised != chosen:
+                    try:
+                        with self._lock:
+                            self._data.setdefault(user_id, {})["permission_mode"] = normalised
+                            self._flush_locked()
+                    except Exception:  # noqa: BLE001 — defensive
+                        pass
+                return normalised
         return _default_for_plan(plan_id)
 
     def set_permission_mode(self, user_id: str, mode: str) -> str:
         """
-        Persist the user's mode choice. Returns the mode that was actually
-        stored (may differ from input if it was clamped to a valid value).
+        Persist the user's mode choice. Returns the mode that was
+        actually stored (may differ from input if a legacy alias was
+        normalised, or if input was invalid and got clamped to the
+        plan-aware default).
 
         Also writes the mode to the per-user "live" file at
-        web/data/users/<sanitized-user>/permission_mode so any pi process
-        currently running for this user can pick up the new value on its
-        next tool_call (the extension re-reads PI_PERMISSION_MODE_FILE on
-        every tool call). This is what makes mode swaps apply
-        immediately to the running chat instead of only the next spawn.
+        web/data/users/<sanitized-user>/permission_mode so any pi
+        process currently running for this user can pick up the new
+        value on its next tool_call (the extension re-reads
+        PI_PERMISSION_MODE_FILE on every tool call). This is what makes
+        mode swaps apply immediately to the running chat instead of
+        only the next spawn.
         """
         if not user_id:
             return DEFAULT_PERMISSION_MODE
-        cleaned = (mode or "").strip().lower()
-        if cleaned not in VALID_PERMISSION_MODES:
-            cleaned = DEFAULT_PERMISSION_MODE
+        cleaned = normalize_permission_mode(mode) or DEFAULT_PERMISSION_MODE
         with self._lock:
             row = self._data.setdefault(user_id, {})
             row["permission_mode"] = cleaned

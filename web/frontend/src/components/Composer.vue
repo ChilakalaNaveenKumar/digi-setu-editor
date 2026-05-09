@@ -192,7 +192,7 @@ function isImageMime(mime: string): boolean {
       class="pointer-events-none absolute inset-0 z-10 flex items-center justify-center bg-primary/10 backdrop-blur-[1px]"
     >
       <div
-        class="flex items-center gap-2 rounded-md border border-primary bg-card px-3 py-2 text-sm font-medium text-foreground shadow"
+        class="flex items-center gap-2 rounded-md border border-primary bg-card px-3 py-2 text-lead font-medium text-foreground shadow"
       >
         <Icon icon="codicon:cloud-upload" class="h-4 w-4 text-primary" />
         Drop to upload to workspace/uploads/
@@ -213,7 +213,7 @@ function isImageMime(mime: string): boolean {
       <div
         v-for="att in pendingAttachments"
         :key="att.localId"
-        class="group inline-flex max-w-[18rem] items-center gap-1.5 rounded-md border border-border bg-card px-2 py-1 text-xs"
+        class="group inline-flex max-w-[18rem] items-center gap-1.5 rounded-md border border-border bg-card px-2 py-1 text-body"
         :title="att.agentPath"
       >
         <Icon
@@ -227,7 +227,7 @@ function isImageMime(mime: string): boolean {
           class="h-3.5 w-3.5 shrink-0 text-muted-foreground"
         />
         <span class="truncate text-foreground">{{ att.name }}</span>
-        <span class="shrink-0 text-[10px] text-muted-foreground">
+        <span class="shrink-0 text-caption text-muted-foreground">
           {{
             att.size < 1024
               ? `${att.size} B`
@@ -247,7 +247,7 @@ function isImageMime(mime: string): boolean {
       </div>
       <span
         v-if="pendingAttachments.length > 1"
-        class="ml-1 text-[10px] text-muted-foreground"
+        class="ml-1 text-caption text-muted-foreground"
         :title="`Total ${totalPendingBytes} bytes across ${pendingAttachments.length} files`"
       >
         {{ pendingAttachments.length }} files queued
@@ -292,7 +292,7 @@ function isImageMime(mime: string): boolean {
             ? 'Add a question about your attached files…  (⌘/Ctrl + ↵ to send)'
             : 'Ask the agent…  (⌘/Ctrl + ↵ to send)'
         "
-        class="flex-1 resize-none rounded-md border border-input bg-background px-3 py-2 text-sm leading-relaxed text-foreground placeholder:text-muted-foreground outline-none focus:border-ring font-sans"
+        class="flex-1 resize-none rounded-md border border-input bg-background px-3 py-2 text-lead leading-relaxed text-foreground placeholder:text-muted-foreground outline-none focus:border-ring font-sans"
         :disabled="chat.connState !== 'open'"
         @keydown="onKeydown"
         @paste="onPaste"

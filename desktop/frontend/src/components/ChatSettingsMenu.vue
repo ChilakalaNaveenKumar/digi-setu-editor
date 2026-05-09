@@ -27,7 +27,15 @@ import UpgradeModal from "./UpgradeModal.vue";
 
 const billing = useBillingStore();
 const cfg = useConfigStore();
-const { credit, remainingPct, lowCredit, enabled } = storeToRefs(billing);
+const {
+  credit,
+  remainingPct,
+  lowCredit,
+  enabled,
+  exhausted,
+  isAuthoritative,
+  isByok,
+} = storeToRefs(billing);
 const { mode: deployMode } = storeToRefs(cfg);
 
 const open = ref(false);
@@ -111,28 +119,48 @@ function onDocClick(e: MouseEvent): void {
 
 const usageLabel = computed(() => {
   const c = credit.value;
-  if (!c) return "loading…";
-  return `$${c.remaining_usd.toFixed(2)} of $${c.plan.monthly_credit_usd.toFixed(0)}`;
+  if (!c) return "…";
+  if (isByok.value) return "Your key";
+  const cap = c.plan.monthly_credit_usd ?? 0;
+  // Suppress the loud "$0.00 of $0" pair when we don't have an
+  // authoritative cloud reading yet — show an em-dash placeholder
+  // and let the small "Sign in to see live usage" hint below carry
+  // the explanation.
+  if (!isAuthoritative.value && cap === 0) return "—";
+  if (cap === 0) return `$${c.remaining_usd.toFixed(2)}`;
+  return `$${c.remaining_usd.toFixed(2)} of $${cap.toFixed(0)}`;
 });
 
 const usageBarWidth = computed(() => {
+  if (!isAuthoritative.value) return "0%";
+  if ((credit.value?.plan?.monthly_credit_usd ?? 0) === 0) return "0%";
   const pct = Math.max(0, Math.min(100, 100 - remainingPct.value));
   return `${pct}%`;
 });
 
+// Calm three-state palette: muted by default, amber for low, rose for
+// real exhaustion (only authoritative; see store). Reserved-red is
+// out — running low isn't an error, it's a billing nudge.
 const usageBarColor = computed(() => {
-  if (!credit.value) return "bg-muted";
-  if (credit.value.remaining_usd <= 0) return "bg-destructive";
-  if (lowCredit.value) return "bg-warning";
-  return "bg-primary";
+  if (exhausted.value) return "bg-rose-500/70";
+  if (lowCredit.value) return "bg-amber-500/70";
+  return "bg-primary/70";
+});
+
+const usageLabelColor = computed(() => {
+  if (exhausted.value) return "text-rose-300";
+  if (lowCredit.value) return "text-amber-200";
+  return "text-muted-foreground";
 });
 
 const planLabel = computed(() => credit.value?.plan?.label || "Free");
 
-// Subtle red dot on the gear when credit is below the warning threshold,
-// so users notice without us having to keep the chip in the header.
-const showAlert = computed(
-  () => !!credit.value && (credit.value.remaining_usd <= 0 || lowCredit.value),
+// Dot on the gear icon — only fires for real authoritative low/exhausted
+// states, not for the offline fallback (which would always be "0/0").
+const showAlert = computed(() => exhausted.value || lowCredit.value);
+
+const showSignInHint = computed(
+  () => !isAuthoritative.value && !isByok.value,
 );
 
 function close(): void {
@@ -158,7 +186,7 @@ function openUpgrade(): void {
       <span
         v-if="showAlert"
         class="absolute -right-0.5 -top-0.5 h-1.5 w-1.5 rounded-full"
-        :class="credit && credit.remaining_usd <= 0 ? 'bg-destructive' : 'bg-warning'"
+        :class="exhausted ? 'bg-rose-400' : 'bg-amber-400'"
         aria-hidden="true"
       />
     </button>
@@ -170,12 +198,12 @@ function openUpgrade(): void {
       <!-- Permission mode -->
       <div class="border-b border-border px-3 py-2.5">
         <div class="mb-1.5 flex items-baseline justify-between">
-          <span class="font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
+          <span class="font-mono text-caption uppercase tracking-wide text-muted-foreground">
             permissions
           </span>
         </div>
         <PermissionModePicker />
-        <p class="mt-1.5 text-[10px] leading-tight text-muted-foreground">
+        <p class="mt-1.5 text-caption leading-tight text-muted-foreground">
           Controls when pi asks before running tools. Audit trail is
           always recorded.
         </p>
@@ -188,14 +216,14 @@ function openUpgrade(): void {
            default when starting a fresh chat. -->
       <div v-if="showRoutingToggle" class="border-b border-border px-3 py-2.5">
         <div class="mb-1.5 flex items-baseline justify-between">
-          <span class="font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
+          <span class="font-mono text-caption uppercase tracking-wide text-muted-foreground">
             default ai source
           </span>
         </div>
         <div class="flex gap-1 rounded-md border border-border bg-background p-0.5">
           <button
             type="button"
-            class="flex-1 rounded px-2 py-1 text-[11px] font-mono transition-colors disabled:opacity-50"
+            class="flex-1 rounded px-2 py-1 text-caption font-mono transition-colors disabled:opacity-50"
             :class="
               routingDefault === 'byok'
                 ? 'bg-primary text-primary-foreground'
@@ -209,7 +237,7 @@ function openUpgrade(): void {
           </button>
           <button
             type="button"
-            class="flex-1 rounded px-2 py-1 text-[11px] font-mono transition-colors disabled:opacity-50"
+            class="flex-1 rounded px-2 py-1 text-caption font-mono transition-colors disabled:opacity-50"
             :class="
               routingDefault === 'cloud'
                 ? 'bg-primary text-primary-foreground'
@@ -222,7 +250,7 @@ function openUpgrade(): void {
             Cloud subscription
           </button>
         </div>
-        <p class="mt-1.5 text-[10px] leading-tight text-muted-foreground">
+        <p class="mt-1.5 text-caption leading-tight text-muted-foreground">
           New chats start with a model from this source. The model picker
           can override per chat.
         </p>
@@ -231,18 +259,12 @@ function openUpgrade(): void {
       <!-- Credit / plan -->
       <div class="border-b border-border px-3 py-2.5">
         <div class="mb-1.5 flex items-baseline justify-between">
-          <span class="font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
+          <span class="font-mono text-caption uppercase tracking-wide text-muted-foreground">
             credit · {{ planLabel.toLowerCase() }}
           </span>
           <span
-            class="font-mono text-[10px]"
-            :class="
-              credit && credit.remaining_usd <= 0
-                ? 'text-destructive'
-                : lowCredit
-                ? 'text-warning'
-                : 'text-muted-foreground'
-            "
+            class="font-mono text-caption tabular-nums"
+            :class="usageLabelColor"
           >
             {{ usageLabel }}
           </span>
@@ -256,17 +278,23 @@ function openUpgrade(): void {
             :style="{ width: usageBarWidth }"
           />
         </div>
+        <p
+          v-if="showSignInHint"
+          class="mt-1.5 text-caption leading-tight text-muted-foreground"
+        >
+          Sign in to see your live plan and usage.
+        </p>
         <div class="mt-2 flex items-center gap-2">
           <button
             type="button"
-            class="flex-1 rounded border border-border bg-background px-2 py-1 font-mono text-[11px] hover:bg-muted"
+            class="flex-1 rounded border border-border bg-background px-2 py-1 font-mono text-caption hover:bg-muted"
             @click="openUpgrade"
           >
             Upgrade
           </button>
           <RouterLink
             to="/pricing"
-            class="flex-1 rounded border border-border bg-background px-2 py-1 text-center font-mono text-[11px] text-foreground hover:bg-muted"
+            class="flex-1 rounded border border-border bg-background px-2 py-1 text-center font-mono text-caption text-foreground hover:bg-muted"
             @click="close"
           >
             See plans
@@ -275,7 +303,7 @@ function openUpgrade(): void {
       </div>
 
       <!-- Footer hint -->
-      <div class="px-3 py-2 text-[10px] leading-tight text-muted-foreground">
+      <div class="px-3 py-2 text-caption leading-tight text-muted-foreground">
         Settings live next to the model picker so you don't lose visual
         space in the chat. Open this menu any time to change permission
         or check usage.

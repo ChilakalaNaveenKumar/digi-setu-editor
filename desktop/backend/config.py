@@ -29,7 +29,7 @@ Environment knobs (all optional):
                          rejected with 401 if missing.
 
     FEEDBACK_EMAIL_TO    Where /api/feedback delivers messages (default
-                         nchilaka@digi-setu.com).
+                         support@digi-setu.com).
 
 In production Caddy serves the SPA from /srv/pi/www and reverse-proxies
 /api/* and /ws/* to FastAPI on 127.0.0.1:8788, so the backend never
@@ -41,10 +41,10 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-# pi-typst-test/web/backend/config.py
+# digi-setu/desktop/backend/config.py
 #   .parents[0] = backend/
-#   .parents[1] = web/
-#   .parents[2] = pi-typst-test/  ← PROJECT_ROOT (in dev) or /app (in container)
+#   .parents[1] = desktop/
+#   .parents[2] = <repo root>/  ← PROJECT_ROOT (in dev) or <_MEIPASS> (frozen)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 # ── Single source of truth: Vertex AI default region ─────────────────────
@@ -160,8 +160,10 @@ if DEPLOY_MODE == "desktop" and _DESKTOP_HOME is not None:
                 "# api.digi-setu.com and we never store the conversation.\n"
                 "#\n"
                 "# === Permissions ===\n"
-                "# auto / approve_risky / approve_all\n"
-                "# PI_PERMISSION_MODE_DEFAULT=approve_risky\n",
+                "# auto      = run every tool without asking\n"
+                "# ask       = ask before shell / write / edit / process (default)\n"
+                "# cautious  = ask before every tool call, including reads\n"
+                "# PI_PERMISSION_MODE_DEFAULT=ask\n",
                 encoding="utf-8",
             )
         except OSError:
@@ -251,9 +253,77 @@ if _extra:
 # Empty CLERK_SECRET_KEY = "open dev mode" (every request gets user_id
 # "dev"). Setting all three flips the production guard on; see
 # services/auth.py for the verify path.
-CLERK_SECRET_KEY = os.environ.get("CLERK_SECRET_KEY", "").strip()
-CLERK_PUBLISHABLE_KEY = os.environ.get("CLERK_PUBLISHABLE_KEY", "").strip()
+#
+# Tenant matching (CRITICAL):
+#   The JWT issued by Clerk's frontend (pk_xxx) can ONLY be verified
+#   by the matching backend secret (sk_xxx) AND only by an upstream
+#   that uses the same tenant. Mixing tenants gives the user-visible
+#   bug "web shows my Enterprise plan, desktop shows Free" — because
+#   the desktop minted a test-tenant JWT, the cloud verified against
+#   prod, rejected with 401, and the desktop fell back to the
+#   synthetic Free snapshot.
+#
+# To make this hard to misconfigure we auto-pick the prod Clerk pair
+# (CLERK_*_PROD) whenever the desktop is pointed at the prod cloud
+# (PI_CLOUD_API_BASE / PI_RELAY_BASE on digi-setu.com). The dev can
+# still force the test tenant by exporting CLERK_TENANT=test (e.g.
+# when running against a local FastAPI that's also configured with
+# the test tenant).
+_clerk_tenant_override = os.environ.get("CLERK_TENANT", "").strip().lower()
+
+
+def _cloud_is_prod() -> bool:
+    """True if any of the cloud endpoints we'll talk to live on the
+    prod domain (digi-setu.com). Read directly from os.environ rather
+    than the parsed PI_CLOUD_API_BASE / PI_RELAY_BASE because those
+    are computed lower in this file (forward-reference avoidance).
+    """
+    candidates = [
+        os.environ.get("PI_CLOUD_API_BASE", "").strip().lower(),
+        os.environ.get("PI_RELAY_BASE", "").strip().lower(),
+    ]
+    # Defaults baked into the binary point at prod, so an unset env
+    # also means "prod cloud" in practice.
+    if not any(candidates):
+        return True
+    return any("digi-setu.com" in c for c in candidates if c)
+
+
+def _resolve_clerk_pair() -> tuple[str, str]:
+    """Pick the (publishable, secret) Clerk pair that matches the
+    upstream we'll talk to. Falls back to the non-suffixed pair when
+    the prod pair isn't configured.
+    """
+    test_pub = os.environ.get("CLERK_PUBLISHABLE_KEY", "").strip()
+    test_sec = os.environ.get("CLERK_SECRET_KEY", "").strip()
+    prod_pub = os.environ.get("CLERK_PUBLISHABLE_KEY_PROD", "").strip()
+    prod_sec = os.environ.get("CLERK_SECRET_KEY_PROD", "").strip()
+
+    want_prod: bool
+    if _clerk_tenant_override == "prod":
+        want_prod = True
+    elif _clerk_tenant_override == "test":
+        want_prod = False
+    else:
+        want_prod = _cloud_is_prod()
+
+    if want_prod and prod_pub and prod_sec:
+        return prod_pub, prod_sec
+    return test_pub, test_sec
+
+
+CLERK_PUBLISHABLE_KEY, CLERK_SECRET_KEY = _resolve_clerk_pair()
 CLERK_WEBHOOK_SECRET = os.environ.get("CLERK_WEBHOOK_SECRET", "").strip()
+
+# Tag the active tenant for /api/config + log lines so the frontend
+# can render "you're signed into the test tenant" warnings if needed
+# and the operator can spot mismatches in the sidecar log.
+if CLERK_PUBLISHABLE_KEY.startswith("pk_live_"):
+    CLERK_TENANT_KIND = "prod"
+elif CLERK_PUBLISHABLE_KEY.startswith("pk_test_"):
+    CLERK_TENANT_KIND = "test"
+else:
+    CLERK_TENANT_KIND = "unknown"
 
 # Stable identifier we stamp on every workspace/session in dev mode so
 # the frontend's `owner_user_id` filter still works without a real
@@ -334,6 +404,65 @@ BYOK_MODE = DEPLOY_MODE == "desktop" and bool(DETECTED_BYOK_KEYS)
 #     authorise against).
 AUTH_REQUIRED = bool(CLERK_SECRET_KEY) and not BYOK_MODE
 
+
+def refresh_byok_state() -> dict[str, object]:
+    """Re-read ~/.digi-setu/.env into os.environ and recompute the
+    BYOK-related module globals (DETECTED_BYOK_KEYS, BYOK_MODE,
+    AUTH_REQUIRED). Returns a dict of the new values for the caller
+    (the file watcher) to log.
+
+    Mutates module globals in place so that callers using
+    ``import config; config.BYOK_MODE`` see the live value. Callers
+    using ``from config import BYOK_MODE`` capture the value at
+    import time and won't observe the refresh — those call sites
+    that need live values must switch to attribute access. The
+    /api/config endpoint is the primary consumer for the UI gate
+    and reads via attribute access.
+
+    Idempotent. Safe to call from any thread (the underlying
+    ``os.environ`` mutation is GIL-protected; module global writes
+    are atomic in CPython).
+    """
+    global DETECTED_BYOK_KEYS, BYOK_MODE, AUTH_REQUIRED
+    if DEPLOY_MODE == "desktop" and _DESKTOP_HOME is not None:
+        _user_env = _DESKTOP_HOME / ".env"
+        if _user_env.exists():
+            # IMPORTANT: _load_dotenv_into_environ keeps existing env
+            # vars unchanged (`if _k not in os.environ`). When the
+            # user EDITS or REMOVES a key, the in-memory env still
+            # has the old value. To make removals work we drop any
+            # BYOK var that's not present in the new file before
+            # re-loading.
+            try:
+                file_keys: set[str] = set()
+                for _line in _user_env.read_text(encoding="utf-8").splitlines():
+                    _stripped = _line.strip()
+                    if (
+                        not _stripped
+                        or _stripped.startswith("#")
+                        or "=" not in _stripped
+                    ):
+                        continue
+                    _k, _, _ = _stripped.partition("=")
+                    file_keys.add(_k.strip())
+            except OSError:
+                file_keys = set()
+            for _byok_var in (*_BYOK_PROBE_VARS, "GOOGLE_APPLICATION_CREDENTIALS"):
+                if _byok_var not in file_keys and _byok_var in os.environ:
+                    # Best-effort: we only drop vars that the file
+                    # CLAIMS to manage. Vars set by the parent shell
+                    # (operator dev mode) stay put.
+                    os.environ.pop(_byok_var, None)
+            _load_dotenv_into_environ(_user_env)
+    DETECTED_BYOK_KEYS = _byok_keys_present()
+    BYOK_MODE = DEPLOY_MODE == "desktop" and bool(DETECTED_BYOK_KEYS)
+    AUTH_REQUIRED = bool(CLERK_SECRET_KEY) and not BYOK_MODE
+    return {
+        "detected_byok_keys": list(DETECTED_BYOK_KEYS),
+        "byok_mode": BYOK_MODE,
+        "auth_required": AUTH_REQUIRED,
+    }
+
 if DEPLOY_MODE == "desktop":
     import sys as _sys
     if BYOK_MODE:
@@ -351,6 +480,13 @@ if DEPLOY_MODE == "desktop":
                 file=_sys.stderr,
             )
     elif CLERK_SECRET_KEY:
+        print(
+            f"[config] Clerk tenant = {CLERK_TENANT_KIND} "
+            f"(publishable={CLERK_PUBLISHABLE_KEY[:14] + '…' if CLERK_PUBLISHABLE_KEY else 'unset'}). "
+            f"Cloud target = {os.environ.get('PI_CLOUD_API_BASE') or 'https://digi-setu.com'}. "
+            f"Override with CLERK_TENANT=test|prod if these don't match.",
+            file=_sys.stderr,
+        )
         # If the user has an ADC JSON but no PI_OPERATOR_VERTEX flag,
         # they may think they're providing a key. Tell them why we're
         # ignoring it so they don't spend an hour debugging.
@@ -409,9 +545,47 @@ PI_RELAY_PATH = (
     or "/v1/ws/desktop-relay"
 )
 
+# ── Cloud HTTP API base ────────────────────────────────────────────
+# The desktop sidecar is a *thin client* for everything billing-
+# related (plans, monthly spend, activity log, Stripe Checkout /
+# Customer Portal). The cloud — the only place Stripe creds and the
+# canonical CreditLedger live — owns all of that. The sidecar proxies
+# read-only calls to it and the SPA opens the customer-facing pages
+# (https://digi-setu.com/pricing, …/account/billing) in the system
+# browser for write actions.
+#
+#   PI_CLOUD_API_BASE   override the cloud HTTP base. Defaults to the
+#                       APEX domain (https://digi-setu.com) because
+#                       that's where the existing Caddyfile routes
+#                       /api/* to FastAPI on 127.0.0.1:8788. The
+#                       api.digi-setu.com subdomain is intentionally
+#                       narrower — it only serves /v1/* (the desktop
+#                       relay WS); calling /api/* on it returns 404
+#                       (see deploy/caddy/Caddyfile, the api block at
+#                       the bottom). Splitting "API" between two hosts
+#                       is the cost of having shipped /v1/ws/desktop-
+#                       relay before /api/* needed to be reachable
+#                       from a desktop sidecar; we'll consolidate the
+#                       day api.digi-setu.com gets a dedicated VM.
+#   PI_CLOUD_WEB_BASE   override the cloud user-facing site base for
+#                       Upgrade / Manage subscription deep-links.
+#
+# Same hardening as PI_RELAY_BASE: read from process env only, never
+# from the user-controlled ~/.digi-setu/.env, so a tampered config
+# can't redirect billing reads to an attacker's host.
+PI_CLOUD_API_BASE = (
+    os.environ.get("PI_CLOUD_API_BASE", "").strip()
+    or "https://digi-setu.com"
+).rstrip("/")
+
+PI_CLOUD_WEB_BASE = (
+    os.environ.get("PI_CLOUD_WEB_BASE", "").strip()
+    or "https://digi-setu.com"
+).rstrip("/")
+
 
 # ── Feedback delivery ──────────────────────────────────────────────
-FEEDBACK_EMAIL_TO = os.environ.get("FEEDBACK_EMAIL_TO", "").strip() or "nchilaka@digi-setu.com"
+FEEDBACK_EMAIL_TO = os.environ.get("FEEDBACK_EMAIL_TO", "").strip() or "support@digi-setu.com"
 
 
 # ── Admin override ─────────────────────────────────────────────────
@@ -441,32 +615,35 @@ ADMIN_USER_IDS = {
 
 
 # ── Stripe billing ─────────────────────────────────────────────────
-# USD-only for v1 (Stripe Subscriptions don't support INR payments
-# from India yet). When the first paying user from outside the US/EU
-# asks for it we'll add Razorpay (India) or move to Paddle/Lemon
-# Squeezy as Merchant of Record. Until then:
+# *** REMOVED FROM DESKTOP. ***
 #
-#   STRIPE_SECRET_KEY      sk_live_… / sk_test_… — set this to enable
-#                          the /api/billing/* routes. When EMPTY all
-#                          billing routes return 503 and the SPA
-#                          surfaces "billing not configured".
-#   STRIPE_WEBHOOK_SECRET  whsec_… from the Stripe Dashboard webhook
-#                          page. Required when STRIPE_SECRET_KEY is set.
-#   STRIPE_PRICE_STARTER   price_… ids per plan. Created once via
-#   STRIPE_PRICE_PRO       Stripe Dashboard or `stripe prices create`;
-#   STRIPE_PRICE_MAX       see deploy/README.md for the setup recipe.
-#   BILLING_RETURN_URL     where Stripe redirects after checkout
-#                          (success + cancel both go here, with a
-#                          ?billing=success|cancel query). Defaults
-#                          to OAUTH_REDIRECT_BASE.
-STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "").strip()
-STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "").strip()
-BILLING_RETURN_URL = (
-    os.environ.get("BILLING_RETURN_URL", "").strip()
-    or os.environ.get("OAUTH_REDIRECT_BASE", "").strip()
-    or "http://localhost:5173"
-)
-BILLING_ENABLED = bool(STRIPE_SECRET_KEY)
+# Stripe credentials never live on a user's machine. The desktop
+# sidecar has zero knowledge of secret keys, price ids, or webhook
+# secrets — those exist only on the cloud backend at
+# api.digi-setu.com.
+#
+# When the user clicks "Upgrade" or "Manage subscription" in the
+# desktop UI we open https://digi-setu.com/pricing or
+# https://digi-setu.com/account/billing in the system browser
+# (see desktop/frontend/src/lib/native-bridge.ts → openExternal).
+# Stripe Checkout and the Customer Portal run in the user's normal
+# browser session, exactly like every other SaaS desktop app
+# (Notion, Linear, Slack, …).
+#
+# Plan id + monthly spend + activity events are read from the cloud
+# via routes/usage.py (which proxies api.digi-setu.com/api/usage)
+# and cached briefly by services/plan_cache.py. They are NOT
+# authoritative on the desktop — the cloud relay enforces every
+# spend gate at chat-WS time, so a user who deletes their local
+# state file gains nothing.
+#
+# Anything that previously flipped on `BILLING_ENABLED` is now
+# always-on at the cloud (which always has Stripe configured) and
+# always points-to-cloud at the desktop. The constant is kept here
+# as `False` for backwards compatibility with any code that imports
+# it during the deprecation window — those call sites should be
+# converted to PI_CLOUD_WEB_BASE redirects.
+BILLING_ENABLED = False
 
 
 # ── Per-workspace safety limits ────────────────────────────────────

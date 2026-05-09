@@ -14,12 +14,14 @@ TYPST_AGENT_ENV="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)/../referne
 if [[ -f "$TYPST_AGENT_ENV" ]]; then
   # IMPORTANT: we deliberately DO NOT import TYPST_AGENT_ROUTER_MODEL or
   # TYPST_AGENT_COMPACT_MODEL anymore. The legacy typst-agent .env points
-  # those at gemini-3.1-flash-lite-preview, which silently leaks into
-  # PI_TYPST_ROUTER_MODEL via the fallback chain below and degrades
+  # those at gemini-3.1-flash-lite-preview, which would silently leak
+  # into PI_TYPST_ROUTER_MODEL via the fallback chain below and degrade
   # search_docs answers (Flash-Lite hand-waves on niche packages).
-  # search_docs MUST run on Haiku unless an operator explicitly exports
-  # PI_TYPST_ROUTER_MODEL themselves; the right place to override it is
-  # web/backend/.env, not the legacy file.
+  # search_docs defaults to gemini-3-flash-preview (set on line 78 below
+  # and in deploy/docker-compose.yml) — Gemini 3 Flash has a 1M context
+  # window which fits the ~210k-token core Typst corpus comfortably. The
+  # right place to override the default is web/backend/.env, not the
+  # legacy typst-agent file.
   while IFS='=' read -r key value; do
     case "$key" in
       ""|\#*) continue ;;
@@ -106,7 +108,7 @@ if [[ -z "${GOOGLE_CLOUD_PROJECT:-}" ]]; then
 fi
 
 if [[ "${PI_TYPST_ENV_VERBOSE:-0}" == "1" ]]; then
-  echo "── pi-typst-test env ──"
+  echo "── digi-setu env ──"
   echo "  GOOGLE_CLOUD_PROJECT  = $GOOGLE_CLOUD_PROJECT"
   echo "  GOOGLE_CLOUD_LOCATION = $GOOGLE_CLOUD_LOCATION"
   echo "  PI_PROVIDER           = $PI_PROVIDER"

@@ -2,9 +2,8 @@
 Workspace catalogue endpoints.
 
 The Registry owns the actual create/list/rename/delete logic. This module
-maps it to HTTP, validates input via pydantic, scopes every operation to
-the caller's user_id (Clerk in prod, "dev" in dev mode), and converts
-mode-specific errors into the right status codes.
+maps it to HTTP, validates input via pydantic, and scopes every operation
+to the caller's user_id (Clerk in prod, "dev" in dev mode).
 """
 
 from __future__ import annotations
@@ -13,9 +12,8 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from config import DEPLOY_MODE
 from models.workspace import WorkspaceCreate, WorkspaceRename
-from routes._helpers import fs_error, workspace_for_user_or_404
+from routes._helpers import workspace_for_user_or_404
 from services.auth import require_user
 from services.registry import Registry
 
@@ -32,24 +30,10 @@ async def create_workspace(
     payload: WorkspaceCreate, user_id: str = Depends(require_user)
 ) -> dict[str, Any]:
     """
-    Create a workspace. Behaviour depends on `PI_MODE`:
-
-      web    : ignore `path`. Allocate a sandbox under web/data/workspaces/.
-               `name` defaults to "Untitled workspace".
-      desktop: requires `path` (absolute folder the user picked). `name`
-               defaults to the folder basename.
+    Allocate a sandbox under web/data/workspaces/. `path` on the payload
+    is ignored; `name` defaults to "Untitled workspace".
     """
     name = (payload.name or "").strip()
-    if DEPLOY_MODE == "desktop":
-        if not payload.path or not payload.path.strip():
-            raise HTTPException(status_code=400, detail="`path` is required in desktop mode")
-        try:
-            return Registry.instance().register_desktop_workspace(
-                payload.path, name=name, owner_user_id=user_id
-            )
-        except (FileNotFoundError, NotADirectoryError) as exc:
-            raise fs_error(exc)
-
     return Registry.instance().create_web_workspace(name=name, owner_user_id=user_id)
 
 

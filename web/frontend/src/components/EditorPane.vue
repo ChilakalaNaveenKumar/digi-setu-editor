@@ -374,19 +374,19 @@ watch(
     <!-- ── Mode C header: review mode (back button + op label + stats) ── -->
     <header
       v-if="inReview && editorReview"
-      class="flex items-center justify-between border-b border-border bg-card px-3 py-1.5 text-xs"
+      class="flex items-center justify-between border-b border-border bg-card px-3 py-1.5 text-body"
     >
       <div class="flex min-w-0 items-center gap-2">
         <button
           type="button"
-          class="rounded-sm border border-border bg-background px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+          class="rounded-sm border border-border bg-background px-1.5 py-0.5 font-mono text-caption text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
           title="Back to file (Esc)"
           @click="snapshots.exitReviewMode()"
         >
           ← back
         </button>
         <span
-          class="rounded-sm bg-primary/10 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide text-primary"
+          class="rounded-sm bg-primary/10 px-1.5 py-0.5 font-mono text-caption uppercase tracking-wide text-primary"
         >
           diff · {{ editorReview.toolName }}
         </span>
@@ -394,7 +394,7 @@ watch(
           {{ editorReview.path }}
         </span>
       </div>
-      <div class="flex items-center gap-3 font-mono text-[11px] tabular-nums">
+      <div class="flex items-center gap-3 font-mono text-caption tabular-nums">
         <span v-if="editorReview.added > 0" class="text-success">+{{ editorReview.added }}</span>
         <span v-if="editorReview.removed > 0" class="text-destructive">-{{ editorReview.removed }}</span>
       </div>
@@ -403,7 +403,7 @@ watch(
     <!-- ── Mode A/B header: file path + status + lang/size + save ──────── -->
     <header
       v-else
-      class="editor-header flex items-center justify-between gap-2 border-b border-border bg-card px-3 py-1.5 text-xs"
+      class="editor-header flex items-center justify-between gap-2 border-b border-border bg-card px-3 py-1.5 text-body"
     >
       <div class="flex min-w-0 flex-1 items-center gap-2">
         <span class="min-w-0 truncate font-mono text-muted-foreground" :title="currentFile?.path">
@@ -417,15 +417,15 @@ watch(
         ></span>
         <span
           v-if="statusBadge"
-          :class="['shrink-0 rounded-sm px-1.5 py-0.5 text-[10px] font-mono', statusBadge.color]"
+          :class="['shrink-0 rounded-sm px-1.5 py-0.5 text-caption font-mono', statusBadge.color]"
         >
           {{ statusBadge.label }}
         </span>
       </div>
-      <div class="flex shrink-0 items-center gap-1.5 text-[11px] text-muted-foreground">
+      <div class="flex shrink-0 items-center gap-1.5 text-caption text-muted-foreground">
         <span
           v-if="saveError"
-          class="hide-on-narrow rounded-sm bg-destructive/15 px-1.5 py-0.5 text-[10px] text-destructive"
+          class="hide-on-narrow rounded-sm bg-destructive/15 px-1.5 py-0.5 text-caption text-destructive"
           :title="saveError"
         >save failed</span>
 
@@ -433,7 +433,7 @@ watch(
           v-if="isEditableMode"
           type="button"
           :class="[
-            'rounded-sm border px-1.5 py-0.5 font-mono text-[10px] transition-colors',
+            'rounded-sm border px-1.5 py-0.5 font-mono text-caption transition-colors',
             dirty
               ? 'border-primary/50 bg-primary/10 text-primary hover:bg-primary/20'
               : 'border-border bg-background text-muted-foreground',
@@ -514,11 +514,11 @@ watch(
 
     <div
       v-else-if="!currentFile"
-      class="flex flex-1 flex-col items-center justify-center text-center text-sm text-muted-foreground"
+      class="flex flex-1 flex-col items-center justify-center text-center text-lead text-muted-foreground"
     >
-      <div class="mb-2 text-4xl opacity-30">⌘</div>
+      <div class="mb-2 text-h1 opacity-30">⌘</div>
       <p class="mb-1 text-foreground">No file open</p>
-      <p class="max-w-xs text-xs">
+      <p class="max-w-xs text-body">
         Click any file in the left tree, or ask the agent to
         <span class="font-mono text-foreground">write</span>,
         <span class="font-mono text-foreground">read</span>, or
@@ -544,11 +544,11 @@ watch(
 
     <div
       v-else-if="isUnviewable"
-      class="flex flex-1 flex-col items-center justify-center text-center text-sm text-muted-foreground"
+      class="flex flex-1 flex-col items-center justify-center text-center text-lead text-muted-foreground"
     >
-      <div class="mb-2 text-3xl opacity-30">⊘</div>
+      <div class="mb-2 text-h1 opacity-30">⊘</div>
       <p class="mb-1 text-foreground">Can't show this file</p>
-      <p class="max-w-xs text-xs">
+      <p class="max-w-xs text-body">
         {{ currentFile.reason ?? "Binary content not displayed." }}
       </p>
     </div>
@@ -581,7 +581,7 @@ watch(
     >
       <div
         v-if="highlightedLines.length === 0"
-        class="px-4 py-3 text-xs text-muted-foreground"
+        class="px-4 py-3 text-body text-muted-foreground"
       >
         <span class="font-mono italic">
           {{ currentFile.status === "loading" ? "loading…" : "waiting for content…" }}
@@ -624,9 +624,9 @@ watch(
       -->
       <div
         v-if="highlightTruncated"
-        class="sticky bottom-0 z-20 mx-3 mb-3 flex items-center gap-2 rounded-md border border-amber-700/30 bg-amber-950/30 px-3 py-2 text-[11px] text-amber-200/80 shadow-lg"
+        class="sticky bottom-0 z-20 mx-3 mb-3 flex items-center gap-2 rounded-md border border-amber-700/30 bg-amber-950/30 px-3 py-2 text-caption text-amber-200/80 shadow-lg"
       >
-        <span class="text-base leading-none">⚠</span>
+        <span class="text-lead leading-none">⚠</span>
         <span>
           Streaming preview truncated to first
           <strong class="font-semibold">{{ highlightedLines.length.toLocaleString() }}</strong>

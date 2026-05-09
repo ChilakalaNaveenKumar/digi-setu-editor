@@ -137,17 +137,17 @@ function bullets(planId: string): string[] {
     <main class="mx-auto w-full max-w-6xl flex-1 px-6 py-12 md:py-16">
       <!-- HERO -->
       <header class="mx-auto max-w-2xl text-center">
-        <h1 class="text-3xl font-semibold tracking-tight md:text-4xl">
+        <h1 class="text-h1 font-semibold tracking-tight md:text-h1">
           Plans &amp; pricing
         </h1>
-        <p class="mt-3 text-sm leading-relaxed text-muted-foreground md:text-base">
+        <p class="mt-3 text-lead leading-relaxed text-muted-foreground md:text-lead">
           Pay once a month for credit. We pass the actual model + infra cost
           through — no per-token surprises, no hidden margin. Cancel any
           time, no contracts.
         </p>
         <p
           v-if="enabled === false"
-          class="mx-auto mt-4 inline-block rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-warning-foreground"
+          class="mx-auto mt-4 inline-block rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-body text-warning-foreground"
         >
           <Icon icon="codicon:warning" class="mr-1 inline h-3.5 w-3.5 align-text-bottom" />
           Paid plans aren't enabled in this build —
@@ -173,33 +173,33 @@ function bullets(planId: string): string[] {
           <!-- Popular badge -->
           <div
             v-if="p.id === POPULAR_PLAN_ID"
-            class="absolute -top-3 left-1/2 -translate-x-1/2 rounded-full bg-primary px-3 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-primary-foreground shadow"
+            class="absolute -top-3 left-1/2 -translate-x-1/2 rounded-full bg-primary px-3 py-0.5 text-caption font-semibold uppercase tracking-wider text-primary-foreground shadow"
           >
             Most popular
           </div>
           <div
             v-else-if="p.id === currentPlanId"
-            class="absolute -top-3 left-1/2 -translate-x-1/2 rounded-full border border-primary/40 bg-card px-3 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-primary"
+            class="absolute -top-3 left-1/2 -translate-x-1/2 rounded-full border border-primary/40 bg-card px-3 py-0.5 text-caption font-semibold uppercase tracking-wider text-primary"
           >
             Your plan
           </div>
 
           <header>
-            <h3 class="text-lg font-semibold">{{ p.label }}</h3>
+            <h3 class="text-h2 font-semibold">{{ p.label }}</h3>
             <div class="mt-2 flex items-baseline gap-1">
-              <span class="text-3xl font-bold tracking-tight">
+              <span class="text-h1 font-bold tracking-tight">
                 {{ fmtUsd(p.monthly_price_usd) }}
               </span>
-              <span class="text-sm text-muted-foreground">/ month</span>
+              <span class="text-lead text-muted-foreground">/ month</span>
             </div>
-            <p class="mt-2 text-xs leading-snug text-muted-foreground">
+            <p class="mt-2 text-body leading-snug text-muted-foreground">
               {{ p.description }}
             </p>
           </header>
 
           <div class="my-5 h-px bg-border" />
 
-          <ul class="space-y-2 text-sm text-foreground/90">
+          <ul class="space-y-2 text-lead text-foreground/90">
             <li class="flex items-start gap-2">
               <Icon icon="codicon:check" class="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary" />
               <span class="leading-snug">
@@ -220,7 +220,7 @@ function bullets(planId: string): string[] {
           <div class="mt-6">
             <button
               type="button"
-              class="w-full rounded-md px-3 py-2 text-sm font-semibold transition-colors"
+              class="w-full rounded-md px-3 py-2 text-lead font-semibold transition-colors"
               :class="
                 p.id === currentPlanId || p.id === 'free'
                   ? 'border border-border text-muted-foreground cursor-not-allowed'
@@ -240,7 +240,7 @@ function bullets(planId: string): string[] {
       </section>
 
       <!-- TRUST STRIP -->
-      <footer class="mt-12 flex flex-col items-center justify-between gap-3 rounded-lg border border-border bg-card/60 px-5 py-4 text-xs text-muted-foreground sm:flex-row">
+      <footer class="mt-12 flex flex-col items-center justify-between gap-3 rounded-lg border border-border bg-card/60 px-5 py-4 text-body text-muted-foreground sm:flex-row">
         <div class="flex flex-wrap items-center justify-center gap-4 sm:justify-start">
           <span class="flex items-center gap-1.5">
             <Icon icon="codicon:shield" class="h-3.5 w-3.5" />
@@ -258,7 +258,7 @@ function bullets(planId: string): string[] {
         <button
           v-if="enabled && hasCustomer"
           type="button"
-          class="rounded border border-border bg-background px-2.5 py-1 text-xs hover:bg-muted disabled:opacity-50"
+          class="rounded border border-border bg-background px-2.5 py-1 text-body hover:bg-muted disabled:opacity-50"
           :disabled="busy !== null"
           @click="onManage"
         >
@@ -267,7 +267,7 @@ function bullets(planId: string): string[] {
       </footer>
     </main>
 
-    <footer class="border-t border-border bg-card/40 px-6 py-4 text-center text-[11px] text-muted-foreground">
+    <footer class="border-t border-border bg-card/40 px-6 py-4 text-center text-caption text-muted-foreground">
       © {{ new Date().getFullYear() }} Digi Setu
     </footer>
   </div>

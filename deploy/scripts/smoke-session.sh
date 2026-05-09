@@ -224,11 +224,11 @@ test_user_can_install() {
 
 # ── Step 8: cleanup leaves no orphans ──────────────────────────────
 test_no_orphans() {
-  # Spawn-and-kill a probe, then count running pi-typst-test containers.
+  # Spawn-and-kill a probe, then count running digi-setu containers.
   ssh_run "
     sudo docker run -d --rm --name smoke-orphan-probe \
       --network pi-egress \
-      --label pi.app=pi-typst-test \
+      --label pi.app=digi-setu \
       --label pi.user_id=smoke \
       --label pi.session_id=smoke-orphan \
       pi-session:latest sleep 3600 >/dev/null 2>&1 || true
@@ -236,7 +236,7 @@ test_no_orphans() {
     sudo docker rm -f smoke-orphan-probe >/dev/null 2>&1 || true
   " >/dev/null 2>&1
   local count
-  count=$(ssh_run "sudo docker ps --filter label=pi.app=pi-typst-test --format '{{.Names}}' | grep -c smoke-orphan-probe || true" \
+  count=$(ssh_run "sudo docker ps --filter label=pi.app=digi-setu --format '{{.Names}}' | grep -c smoke-orphan-probe || true" \
     | tr -d '[:space:]')
   if [ "${count}" = "0" ] || [ -z "${count}" ]; then
     return 0

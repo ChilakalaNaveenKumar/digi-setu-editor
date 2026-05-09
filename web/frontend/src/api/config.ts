@@ -1,8 +1,6 @@
 import { apiJson } from "./client";
-import type { DeployMode } from "./types";
 
 export interface ServerConfig {
-  mode: DeployMode;
   /**
    * When false the SPA skips Clerk init entirely and behaves as if the
    * (synthetic) "dev" user is always signed in. Backend mirrors this.
@@ -15,8 +13,12 @@ export interface ServerConfig {
    */
   clerk_publishable_key: string;
   /**
-   * Desktop only: true when the user dropped their own AI provider
-   * keys into ~/.digi-setu/.env. Skips login + hides Upgrade buttons.
+   * True when the operator dropped their own AI provider keys into
+   * the backend env. When set the SPA skips the login redirect and
+   * hides Upgrade buttons (the operator pays the AI provider directly,
+   * our subscription is irrelevant). Always false in pure-web cloud
+   * deployments — kept for self-hosted operators who run the web
+   * backend with their own keys.
    */
   byok_mode?: boolean;
   /**

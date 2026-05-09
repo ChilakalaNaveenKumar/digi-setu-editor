@@ -3,15 +3,19 @@ import { createApp } from "vue";
 import { addCollection } from "@iconify/vue";
 import materialIconTheme from "@iconify-json/material-icon-theme/icons.json";
 import codicon from "@iconify-json/codicon/icons.json";
-import { clerkPlugin, getToken } from "@clerk/vue";
 
 import App from "./App.vue";
 import { router } from "./router";
-import { setApiBase, setTokenResolver } from "./api/client";
-import { installDeepLinkBridge } from "./lib/desktop-auth";
+import { setApiBase } from "./api/client";
+import {
+  installDeepLinkBridge,
+  restoreDesktopSession,
+} from "./lib/desktop-auth";
 import { installMenuBridge } from "./lib/menu-bridge";
 import { isDesktop, waitForBackend } from "./lib/native-bridge";
 import { useConfigStore } from "./stores/config";
+import { useAuthStore } from "./stores/auth";
+import { i18n, bootLocale } from "./i18n";
 import "./app.css";
 
 // Pre-register Iconify collections so file/folder/action icons resolve
@@ -29,30 +33,35 @@ document.documentElement.classList.add("dark", "theme-notion");
 
 /**
  * Boot order:
- *  1. Build the Vue app + Pinia + router.
- *  2. Fetch /api/config so we know whether Clerk should be installed
- *     and which publishable key to pass it.
- *  3. Conditionally install Clerk + register the token resolver so
- *     api/client.ts can sign every request.
- *  4. Mount.
+ *  1. Apply persisted locale.
+ *  2. Build the Vue app + Pinia + router + i18n.
+ *  3. Wait for the local sidecar's randomized port and pin every
+ *     fetch() to it (desktop only — web mode uses same-origin paths).
+ *  4. Restore SSO from the OS keychain (silent /desktop-refresh).
+ *  5. Fetch /api/config so the router's beforeEach guard sees the
+ *     correct `requires_setup` / `auth_required` flags before the
+ *     first navigation.
+ *  6. Fetch /api/auth/whoami so BrandHeader can paint the avatar /
+ *     sign-in CTA on first frame without a flash.
+ *  7. Mount.
  *
- * Why we delay mount until after step 3: if we mount first, the
- * router beforeEach guard in router.ts may run before Clerk is ready
- * and bounce the user to /login on the very first paint. Doing the
- * config fetch up front (it's a single tiny GET) keeps the boot path
- * deterministic.
- *
- * Why `getToken()` from `@clerk/shared` and not the `useAuth` composable:
- * composables rely on Vue's `inject()` and only work inside a setup
- * function. The bare `getToken()` walks the global Clerk singleton and
- * is the documented way to grab a token from non-component code
- * (interceptors, websocket bridges, …).
+ * The desktop frontend is intentionally Clerk-free. Sign-in always
+ * happens in the system browser via the web fork's
+ * /desktop/sign-in bounce page. The sidecar (Python) is the only
+ * place that talks to Clerk's SDK. Loopback between the SPA and the
+ * sidecar doesn't need a bearer token (`AUTH_REQUIRED=false` in the
+ * desktop sidecar by default).
  */
 async function boot(): Promise<void> {
+  // Apply persisted locale BEFORE creating the app so the very first
+  // paint never flashes English while we resolve the user's choice.
+  bootLocale();
+
   const app = createApp(App);
   const pinia = createPinia();
   app.use(pinia);
   app.use(router);
+  app.use(i18n);
 
   // Desktop bridge: discover the sidecar's randomized port and pin
   // every API request to `http://127.0.0.1:<port>`. In web mode this
@@ -90,21 +99,55 @@ async function boot(): Promise<void> {
       { capture: true },
     );
 
+    // Suppress the macOS WebKit / Windows WebView2 native right-click
+    // context menu ("Reload", "Inspect Element", "Back/Forward",
+    // "Search With Google…"). These items don't make sense for a
+    // packaged native app — they leak the underlying browser engine
+    // to the user, allow them to reload the SPA mid-stream (same
+    // problem as the reload-combo above), and make the product look
+    // like a wrapped webpage instead of a desktop app. Real text
+    // selection (Cmd+C, double-click, drag-select) and form-field
+    // context menus inside <input>/<textarea> still work — those go
+    // through the OS's text-services menu, not the webview's
+    // navigation menu.
+    window.addEventListener(
+      "contextmenu",
+      (e) => {
+        // Allow the native menu inside text inputs / textareas /
+        // contenteditable so users can still cut/copy/paste with the
+        // mouse on form fields.
+        const target = e.target as HTMLElement | null;
+        if (target) {
+          const tag = target.tagName;
+          if (
+            tag === "INPUT" ||
+            tag === "TEXTAREA" ||
+            target.isContentEditable
+          ) {
+            return;
+          }
+        }
+        e.preventDefault();
+      },
+      { capture: true },
+    );
+
     // Native menu bar (File / Edit / View / Window / Help) is built in
     // src-tauri/src/menu.rs. The bridge listens for Tauri `menu:*`
     // events and translates them into router pushes / store calls so
     // the same menu works no matter which view the user is in.
     void installMenuBridge(router);
 
-    // Wire the pi-typst-test:// deep-link handler. Auth + billing
+    // Wire the digi-setu:// deep-link handler. Auth + billing
     // callbacks from the system browser come through here.
     void installDeepLinkBridge({
       onAuthSuccess: async () => {
-        // Refresh config + reload so the Clerk plugin picks up the
-        // newly-stamped session and the router's beforeEach guard
-        // lets the user past /login.
+        // Re-fetch config + whoami so the router gate flips
+        // requires_setup → false and BrandHeader paints the user's
+        // avatar without a full page reload.
         try {
           await cfg.refresh();
+          await auth.refresh();
         } catch {}
         window.location.replace("/");
       },
@@ -123,29 +166,24 @@ async function boot(): Promise<void> {
   }
 
   const cfg = useConfigStore();
+  const auth = useAuthStore();
+
+  // Persistent SSO: try the OS-keychain → /api/auth/desktop-refresh
+  // path BEFORE the first /api/config call so the response already
+  // reflects the restored session (i.e. requires_setup goes false
+  // again without a flash of the Welcome screen). This is the
+  // "Cursor stays signed in" UX — sign in once, the keychain holds
+  // the long-lived session id, fresh JWTs are minted on every
+  // launch silently. Web mode no-ops this.
+  await restoreDesktopSession();
+
   await cfg.refresh();
-
-  if (cfg.authRequired && cfg.clerkPublishableKey) {
-    app.use(clerkPlugin, {
-      publishableKey: cfg.clerkPublishableKey,
-      // Default Clerk routing — works fine with vue-router history mode.
-      // We override the after-sign-in URL so users land back on the
-      // picker (which then resolves their workspaces). No `appearance`
-      // override on purpose: per-user instruction we ship Clerk's own
-      // styling unmodified, both inside SignIn and inside UserButton.
-      signInForceRedirectUrl: "/",
-      signUpForceRedirectUrl: "/",
-    });
-
-    setTokenResolver(async () => {
-      try {
-        return await getToken();
-      } catch (exc) {
-        console.warn("[auth] getToken failed", exc);
-        return null;
-      }
-    });
-  }
+  // /whoami is a single GET against the local sidecar. Awaiting it
+  // here (in parallel with the cfg.refresh above would be even
+  // better but the latency is sub-ms on loopback) means the very
+  // first paint of BrandHeader already knows the user's email /
+  // avatar — no spinner, no flicker.
+  await auth.refresh();
 
   app.mount("#app");
 }

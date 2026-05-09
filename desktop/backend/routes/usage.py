@@ -1,16 +1,22 @@
 """
 Per-user usage readouts: rate-limit budget + subscription credit.
 
-The chat pane already shows a per-message token chip (driven by the
-`message_end` event). This endpoint surfaces the *cumulative* state
-the SPA needs for two things:
+Architectural note (read me before editing):
 
-  1. The "credits remaining" banner in the picker / chat header.
-  2. The pre-send check that grays out the send button when the user
-     has hit their daily token cap or monthly dollar cap.
+    Subscription credit is OWNED BY THE CLOUD. The desktop sidecar
+    is a thin client. ``GET /api/usage`` and ``GET /api/usage/events``
+    forward to ``digi-setu.com/api/usage`` over HTTPS — see
+    services/cloud_api.py — and never consult any local SQLite ledger
+    for cloud-billed activity. A user who deletes their local data
+    dir gains ZERO free usage; the cloud relay re-checks
+    ``can_spend`` on every chat-WS message regardless of what the
+    desktop says.
 
-It also exposes the public plan catalogue so the SPA can render an
-"Upgrade" button without hard-coding prices.
+    Local SQLite at ``~/.digi-setu/usage.sqlite`` (services/byok_usage)
+    DOES still record BYOK token tallies — but those are *not money*,
+    just a "how much have I used my own provider?" counter. The user
+    pays the provider directly; deleting that file just blanks the
+    Activity page's BYOK tab and harms only themselves.
 
 Shape:
 
@@ -18,14 +24,16 @@ Shape:
         { "plans": [ {id, label, monthly_price_usd, monthly_credit_usd}, … ] }
 
     GET /api/usage            (auth required)
-        { "rate_limits": { day, tokens_used, tokens_budget, … },
-          "credit":      { month, plan, spent_usd, remaining_usd, prompts } }
+        { "rate_limits":   { day, tokens_used, tokens_budget, … },
+          "credit":        { month, plan, spent_usd, remaining_usd, prompts },
+          "source":        "cloud" | "offline_byok" | "offline_signed_out",
+          "cloud_error":   <string|null> }
 
     GET /api/usage/events     (auth required)
-        Recent per-event activity log — the "where did my credit go?"
-        view. Each event is a single LLM call (parent chat turn or a
-        sub-LLM tool call) with its model, four-class token counts,
-        cost breakdown, and which session it belonged to.
+        Recent per-event activity log proxied from the cloud. When
+        the cloud is unreachable returns ``events: []`` plus a
+        ``cloud_error`` field so the SPA can render a "couldn't
+        reach the cloud — your local activity is unaffected" banner.
 """
 
 from __future__ import annotations
@@ -36,47 +44,160 @@ from fastapi import APIRouter, Depends, Query
 
 from config import BYOK_MODE
 from services.auth import require_user
-from services.billing import CreditLedger, plans
+from services.billing import plan_for, plans
 from services.byok_usage import recent_events as byok_recent_events
 from services.byok_usage import summary as byok_summary
+from services.cloud_api import (
+    CloudApiAuthError,
+    CloudApiError,
+    get_json as cloud_get_json,
+)
 from services.rate_limit import RateLimiter
 
 router = APIRouter(tags=["usage"])
 
 
+def _free_credit_snapshot() -> dict[str, Any]:
+    """Synthetic credit shape returned when we can't reach the cloud
+    AND the user isn't BYOK (signed out + offline).
+
+    Matches the cloud's response schema so the SPA doesn't need to
+    branch. We hand it the *real* Free plan cap (e.g. $10) and a
+    matching ``remaining_usd`` so the credit chip doesn't render the
+    misleading red "$0 / $0" exhausted state when the cloud is just
+    temporarily unreachable. The SPA additionally inspects the
+    ``source`` discriminator on the parent response to know this is
+    a fallback, not authoritative spend, and suppresses the
+    "you've used all your credit" banner accordingly.
+    """
+    free = plan_for("free")
+    cap = float(getattr(free, "monthly_credit_usd", 0.0) or 0.0)
+    return {
+        "month": "",
+        "plan": {
+            "id": "free",
+            "label": "Free",
+            "monthly_price_usd": float(getattr(free, "monthly_price_usd", 0.0) or 0.0),
+            "monthly_credit_usd": cap,
+            "stripe_price_id": "",
+            "description": getattr(free, "description", ""),
+        },
+        "spent_usd": 0.0,
+        "remaining_usd": cap,
+        "remaining_pct": 100.0 if cap > 0 else 0.0,
+        "prompts": 0,
+        "monthly_cap_usd": cap,
+    }
+
+
+def _byok_credit_snapshot() -> dict[str, Any]:
+    """Snapshot rendered when the user is offline / signed out but
+    has BYOK keys configured. The credit chip needs *something*
+    to display; we hand it a synthetic plan id of ``byok`` so the
+    SPA can render "BYOK · You pay your provider" instead of a
+    misleading "$0 / $0 left"."""
+    return {
+        "month": "",
+        "plan": {
+            "id": "byok",
+            "label": "BYOK",
+            "monthly_price_usd": 0.0,
+            "monthly_credit_usd": 0.0,
+            "stripe_price_id": "",
+            "description": "Using your own AI provider keys — billed by them, not us.",
+        },
+        "spent_usd": 0.0,
+        "remaining_usd": 0.0,
+        # 100% so the chip doesn't paint itself red — BYOK has no
+        # operator-side budget to exhaust. The SPA short-circuits the
+        # "$X of $Y" label to "Using your own key" when plan.id=byok.
+        "remaining_pct": 100.0,
+        "prompts": 0,
+        "monthly_cap_usd": 0.0,
+    }
+
+
 @router.get("/api/plans")
 async def get_plans() -> dict[str, Any]:
-    """Public plan catalogue. Drives the upgrade flow in the SPA;
-    intentionally unauthenticated so the marketing/landing surface
-    can render prices without a session."""
+    """Public plan catalogue. The desktop SPA uses this only for
+    layout (label + monthly_price + monthly_credit); the actual
+    Upgrade button opens https://digi-setu.com/pricing in the
+    system browser, where Stripe does the real checkout. Kept
+    public (no auth) so the Welcome screen can render prices for
+    a not-signed-in user."""
     return {"plans": plans()}
 
 
 @router.get("/api/usage")
 async def get_usage(user_id: str = Depends(require_user)) -> dict[str, Any]:
+    """Cloud-credit proxy + local rate-limit usage.
+
+    The rate-limit budget is per-machine (a localhost throttle on
+    the LOCAL chat WS, distinct from the cloud's rate limit) and
+    stays computed in-process. The credit half is fetched from the
+    cloud — never trusted from any local file — and cached on the
+    cloud side per the user's plan TTL."""
+    rate_payload = RateLimiter.instance().usage(user_id)
+
+    try:
+        cloud = cloud_get_json("/api/usage")
+    except CloudApiAuthError:
+        return {
+            "rate_limits": rate_payload,
+            "credit": _byok_credit_snapshot() if BYOK_MODE else _free_credit_snapshot(),
+            "source": "offline_byok" if BYOK_MODE else "offline_signed_out",
+            "cloud_error": None,
+        }
+    except CloudApiError as exc:
+        return {
+            "rate_limits": rate_payload,
+            "credit": _byok_credit_snapshot() if BYOK_MODE else _free_credit_snapshot(),
+            "source": "offline_byok" if BYOK_MODE else "offline_signed_out",
+            "cloud_error": str(exc),
+        }
+
+    cloud_credit = (cloud or {}).get("credit") or _free_credit_snapshot()
     return {
-        "rate_limits": RateLimiter.instance().usage(user_id),
-        "credit": CreditLedger.instance().snapshot(user_id),
+        "rate_limits": rate_payload,
+        "credit": cloud_credit,
+        "source": "cloud",
+        "cloud_error": None,
     }
 
 
 @router.get("/api/usage/events")
 async def get_usage_events(
-    user_id: str = Depends(require_user),
+    user_id: str = Depends(require_user),  # noqa: ARG001 — cloud uses the bearer
     limit: int = Query(200, ge=1, le=500),
     since: Optional[str] = Query(
         None,
         description=(
-            "ISO-8601 UTC timestamp. Returns only events strictly after "
-            "this time — used by the SPA to poll incrementally without "
-            "re-shipping the full ring buffer on every refresh."
+            "ISO-8601 UTC timestamp. Forwarded to the cloud, which "
+            "returns only events strictly after this time so the "
+            "Activity table can poll incrementally."
         ),
     ),
 ) -> dict[str, Any]:
-    events = CreditLedger.instance().recent_events(
-        user_id, limit=limit, since_iso=since
-    )
-    return {"events": events, "limit": limit}
+    """Cloud activity log proxy. Empty list + ``cloud_error`` when
+    we can't reach the cloud; the SPA renders a quiet banner rather
+    than treating that as a real "no events" state."""
+    try:
+        cloud = cloud_get_json(
+            "/api/usage/events",
+            params={"limit": limit, "since": since},
+        )
+    except CloudApiAuthError:
+        return {"events": [], "limit": limit, "cloud_error": None, "source": "offline_signed_out"}
+    except CloudApiError as exc:
+        return {"events": [], "limit": limit, "cloud_error": str(exc), "source": "offline"}
+
+    events = (cloud or {}).get("events") or []
+    return {
+        "events": events,
+        "limit": limit,
+        "cloud_error": None,
+        "source": "cloud",
+    }
 
 
 @router.get("/api/usage/byok")

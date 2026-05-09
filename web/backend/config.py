@@ -1,13 +1,12 @@
 """
 Backend-wide configuration constants resolved from env / on-disk paths.
 
-Anything that needs to know "what mode are we in" or "where does data live"
-imports from here so we have one switch to flip between local dev, Cloud
-Run, and the Tauri sidecar.
+Anything that needs to know where data lives or how to talk to the
+outside world imports from here so we have one switch to flip between
+local dev and Cloud Run.
 
 Environment knobs (all optional):
 
-    PI_MODE              "web" (default) or "desktop"
     PI_DATA_ROOT         override for the on-disk data dir. In the VM
                          deploy this is /srv/pi/data (bind-mounted by
                          docker-compose); in dev it stays under web/data/.
@@ -29,7 +28,7 @@ Environment knobs (all optional):
                          rejected with 401 if missing.
 
     FEEDBACK_EMAIL_TO    Where /api/feedback delivers messages (default
-                         nchilaka@digi-setu.com).
+                         support@digi-setu.com).
 
 In production Caddy serves the SPA from /srv/pi/www and reverse-proxies
 /api/* and /ws/* to FastAPI on 127.0.0.1:8788, so the backend never
@@ -41,10 +40,10 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-# pi-typst-test/web/backend/config.py
+# digi-setu/web/backend/config.py
 #   .parents[0] = backend/
 #   .parents[1] = web/
-#   .parents[2] = pi-typst-test/  ← PROJECT_ROOT (in dev) or /app (in container)
+#   .parents[2] = <repo root>/  ← PROJECT_ROOT (in dev) or /app (in container)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 def _load_dotenv_into_environ(path: Path) -> bool:
@@ -75,100 +74,18 @@ def _load_dotenv_into_environ(path: Path) -> bool:
 # Load backend/.env into os.environ before we read anything else.
 # This is dev-mode convenience so users don't have to remember to
 # `export $(cat .env | xargs)` before every uvicorn restart.
-# In production (web mode) env comes from /opt/pi/stack.env via
-# systemd's EnvironmentFile.
+# In production env comes from /opt/pi/stack.env via systemd's
+# EnvironmentFile.
 _BACKEND_DIR = Path(__file__).resolve().parent
 _load_dotenv_into_environ(_BACKEND_DIR / ".env")
 
-# "web" (default) or "desktop". The desktop launcher (Tauri) sets
-# PI_MODE=desktop before spawning uvicorn so the frontend's picker UX
-# branches accordingly.
-DEPLOY_MODE = os.environ.get("PI_MODE", "web").strip().lower() or "web"
-
-
-# ── Desktop home dir (~/.digi-setu/) ───────────────────────────────
-# Desktop mode keeps EVERYTHING under one user-visible folder:
-#   ~/.digi-setu/.env                user-editable (BYOK keys, prefs)
-#   ~/.digi-setu/workspaces/         per-workspace chats + shadow git
-#   ~/.digi-setu/audits/             AI tool-call audit trail
-#   ~/.digi-setu/registry.json       workspace catalogue
-#   ~/.digi-setu/prefs.json          permission_mode + UI prefs
-#
-# The path is set by the Tauri shell via PI_DATA_ROOT, but we recompute
-# it here too as a fallback (running the sidecar binary by hand without
-# Tauri) and use it to locate the .env file. On Windows this becomes
-# %USERPROFILE%\.digi-setu\.
-def _desktop_home() -> Path:
-    explicit = os.environ.get("DIGI_SETU_HOME", "").strip()
-    if explicit:
-        return Path(explicit).expanduser()
-    return Path.home() / ".digi-setu"
-
-
-_DESKTOP_HOME = _desktop_home() if DEPLOY_MODE == "desktop" else None
-
-# In desktop mode load ~/.digi-setu/.env BEFORE we read any of the
-# CLERK_/STRIPE_/ANTHROPIC_/etc. vars below — that's where the user
-# puts their BYOK keys and personal config. We seed an example .env
-# the first time the file is missing so they don't have to guess
-# what to write.
-if DEPLOY_MODE == "desktop" and _DESKTOP_HOME is not None:
-    try:
-        _DESKTOP_HOME.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        print(f"[config] WARN: cannot create {_DESKTOP_HOME}: {exc}", file=__import__("sys").stderr)
-
-    _USER_ENV = _DESKTOP_HOME / ".env"
-    if not _USER_ENV.exists():
-        # Seed a friendly template the user can edit. The defaults
-        # below are commented out — uncommenting any one of them
-        # flips the app into BYOK mode (see AUTH_REQUIRED logic
-        # below). We never write secrets ourselves; this is just a
-        # blank canvas.
-        try:
-            _USER_ENV.write_text(
-                "# Digi Setu — user config\n"
-                "# Edit this file to bring your own AI provider keys.\n"
-                "# Anything you set here wins over the app's built-in defaults.\n"
-                "#\n"
-                "# === Bring your own key (skips Clerk login) ===\n"
-                "# Uncomment ONE of the blocks below and paste your key:\n"
-                "#\n"
-                "# Anthropic (Claude direct):\n"
-                "# ANTHROPIC_API_KEY=sk-ant-...\n"
-                "# PI_PROVIDER=anthropic\n"
-                "# PI_MODEL=claude-sonnet-4-6\n"
-                "#\n"
-                "# Google AI Studio (Gemini, free tier available):\n"
-                "# GEMINI_API_KEY=AIza...\n"
-                "# PI_PROVIDER=google\n"
-                "# PI_MODEL=gemini-3-pro-preview\n"
-                "#\n"
-                "# Vertex AI (your own GCP project):\n"
-                "# GOOGLE_APPLICATION_CREDENTIALS=/Users/you/path/to/service-account.json\n"
-                "# GOOGLE_CLOUD_PROJECT=your-project\n"
-                "# PI_PROVIDER=anthropic-vertex\n"
-                "# PI_MODEL=claude-sonnet-4-6\n"
-                "#\n"
-                "# === Permissions ===\n"
-                "# auto / approve_risky / approve_all\n"
-                "# PI_PERMISSION_MODE_DEFAULT=approve_risky\n",
-                encoding="utf-8",
-            )
-        except OSError:
-            pass
-
-    _load_dotenv_into_environ(_USER_ENV)
-
 
 # Where workspaces, chats, shadows, registry.json all live on local disk.
-# Cloud Run / web prod points this at /tmp or a tmpfs. Desktop points
-# it at ~/.digi-setu/. Local dev keeps the historical web/data/.
+# Cloud Run / prod points this at /tmp or a tmpfs (via PI_DATA_ROOT).
+# Local dev keeps the historical web/data/.
 _data_env = os.environ.get("PI_DATA_ROOT", "").strip()
 if _data_env:
     DATA_ROOT = Path(_data_env).expanduser()
-elif DEPLOY_MODE == "desktop" and _DESKTOP_HOME is not None:
-    DATA_ROOT = _DESKTOP_HOME
 else:
     DATA_ROOT = PROJECT_ROOT / "web" / "data"
 
@@ -200,62 +117,36 @@ DEV_USER_ID = "dev"
 
 
 # ── BYOK (bring-your-own-key) ──────────────────────────────────────
-# In desktop mode, if the user dropped any AI provider credentials
-# into ~/.digi-setu/.env we treat that as "I'm running this fully
-# offline against my own quota; don't make me sign in to Clerk".
+# BYOK was a desktop-only feature: in the desktop fork, users drop AI
+# provider credentials into ~/.digi-setu/.env and chat calls go
+# directly from their machine to the provider, billed against their
+# own account. The hosted SaaS web backend NEVER routes that way —
+# every chat goes through the operator's Clerk-gated subscription
+# pipeline against the operator's Vertex credentials, which are
+# expected to be present in this backend's env.
 #
-# Detection rule: any one of these env vars present and non-empty.
-# Order doesn't matter — pi_session.py picks the right provider
-# based on PI_PROVIDER (which the user also sets, or we infer below).
-_BYOK_PROBE_VARS = (
-    "ANTHROPIC_API_KEY",
-    "GEMINI_API_KEY",
-    "GOOGLE_API_KEY",
-    "GOOGLE_APPLICATION_CREDENTIALS",
-    "OPENAI_API_KEY",
-)
+# We pin BYOK_MODE to False here for two reasons:
+#   1. The web backend uses GOOGLE_APPLICATION_CREDENTIALS for Vertex
+#      auth in production. If we auto-detected BYOK from "any AI
+#      provider env var present" we'd flip BYOK_MODE on in production
+#      and accidentally skip Clerk auth — that's a security hole.
+#   2. The desktop fork (desktop/backend/) keeps its own BYOK gate
+#      and is where the feature actually lives. Web is separate.
+#
+# DETECTED_BYOK_KEYS stays as an empty list so /api/config / /api/models
+# can still report "no BYOK" to the SPA without a special case.
+BYOK_MODE = False
+DETECTED_BYOK_KEYS: list[str] = []
 
-
-def _byok_keys_present() -> list[str]:
-    """Return the list of detected BYOK env var names (for logging)."""
-    return [k for k in _BYOK_PROBE_VARS if os.environ.get(k, "").strip()]
-
-
-DETECTED_BYOK_KEYS = _byok_keys_present()
-BYOK_MODE = DEPLOY_MODE == "desktop" and bool(DETECTED_BYOK_KEYS)
-
-# Auth required iff:
-#   - Clerk is configured (CLERK_SECRET_KEY set) AND
-#   - we're not in BYOK mode (BYOK skips Clerk because the user is
-#     paying their AI provider directly — there's nothing for us to
-#     authorise against).
+# Auth required iff Clerk is configured (CLERK_SECRET_KEY set). The
+# old `not BYOK_MODE` half of this conjunction is redundant now that
+# BYOK_MODE is pinned False, but kept inline for symmetry with the
+# desktop fork's config.
 AUTH_REQUIRED = bool(CLERK_SECRET_KEY) and not BYOK_MODE
-
-if DEPLOY_MODE == "desktop":
-    import sys as _sys
-    if BYOK_MODE:
-        print(
-            f"[config] BYOK mode active — using user-provided keys: "
-            f"{DETECTED_BYOK_KEYS}. Clerk login is OPTIONAL.",
-            file=_sys.stderr,
-        )
-    elif CLERK_SECRET_KEY:
-        print(
-            "[config] No BYOK keys found in ~/.digi-setu/.env — "
-            "Clerk login required for cloud-relay AI access.",
-            file=_sys.stderr,
-        )
-    else:
-        print(
-            "[config] WARN: desktop mode without Clerk OR BYOK keys. "
-            "AI calls will fail until the user signs in OR adds keys "
-            "to ~/.digi-setu/.env.",
-            file=_sys.stderr,
-        )
 
 
 # ── Feedback delivery ──────────────────────────────────────────────
-FEEDBACK_EMAIL_TO = os.environ.get("FEEDBACK_EMAIL_TO", "").strip() or "nchilaka@digi-setu.com"
+FEEDBACK_EMAIL_TO = os.environ.get("FEEDBACK_EMAIL_TO", "").strip() or "support@digi-setu.com"
 
 
 # ── Admin override ─────────────────────────────────────────────────

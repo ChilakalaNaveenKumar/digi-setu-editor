@@ -1,138 +1,191 @@
 <!--
-  Login — flash redirector to Clerk's hosted sign-in page.
+  Login / Welcome.
 
-  Per product decision we don't render Clerk's <SignIn /> widget
-  inline. The hosted page (e.g. https://certain-sunfish-59.accounts.dev
-  /sign-in for dev, https://accounts.<your-domain>.com/sign-in for prod)
-  carries Clerk's full styling, security headers, and branding — and we
-  want the user to experience that exact page rather than an embedded
-  copy.
+  Three states this view handles, in priority order:
 
-  Flow:
-    1. Router guard bounces unauthenticated users to /login?next=…
-    2. This view mounts, waits for Clerk to load.
-    3. If a session is already present (e.g. user opened /login
-       directly while signed in), we just push to `next`.
-    4. Otherwise we call clerk.redirectToSignIn({ redirectUrl }) which
-       full-page-navigates to Clerk's hosted sign-in. After successful
-       auth Clerk's `signInForceRedirectUrl` (configured in main.ts)
-       brings them back to "/", and the picker resolves their session.
+  1. requiresSetup (desktop only, no Clerk session AND no BYOK keys):
+     This is the user's first-launch experience. We render a Welcome
+     screen with a single Sign-in card. BYOK is intentionally NOT
+     surfaced here as a UI option — power users discover it through
+     the docs (drop a key into ~/.digi-setu/.env, the sidecar
+     watcher picks it up live and the Welcome screen no longer
+     shows). Surfacing BYOK on the Welcome screen confused first-
+     run users into thinking the app required them to provide AI
+     credentials before they could try it.
 
-  Dev-mode fallback (auth_required=false): the backend has no Clerk
-  configured, so `redirectToSignIn` doesn't exist. We render a notice
-  and a "continue to picker" button instead.
+  2. authRequired (web prod or desktop with Clerk configured but
+     not yet signed in): bounce sign-in out to the system browser.
+     The Tauri webview can't host Clerk directly (anti-phishing,
+     passkeys, autofill). After Clerk authenticates, the production
+     web app's `/desktop/sign-in` page redirects to a digi-setu://
+     deep link, which the deep-link bridge installed in main.ts
+     picks up and exchanges for a session.
+
+  3. !authRequired (dev mode, no Clerk configured): land on the
+     picker — every request resolves to user_id="dev" anyway.
+
+  All user-facing copy lives in `src/locales/en.json#login`. Adding a
+  language is a matter of duplicating that file.
 -->
 <script setup lang="ts">
-import { computed, onMounted, watch, ref } from "vue";
+import { computed, onMounted, ref } from "vue";
 import { useRoute, useRouter, RouterLink } from "vue-router";
-import { useClerk } from "@clerk/vue";
 
-import BrandHeader from "../components/BrandHeader.vue";
+import AppFooter from "../components/AppFooter.vue";
 import { isDesktop } from "../lib/native-bridge";
 import { startDesktopSignIn } from "../lib/desktop-auth";
 import { useConfigStore } from "../stores/config";
 
+// Desktop frontend is intentionally Clerk-free. Sign-in always
+// happens in the system browser (anti-phishing + passkeys); the
+// session_id comes back via deep-link, and the sidecar mints the
+// JWT server-side. So this view never imports @clerk/vue and never
+// renders <SignIn />. See `lib/desktop-auth.ts` and
+// `routes/desktop_auth.py` for the full handshake.
+
 const route = useRoute();
 const router = useRouter();
 const cfg = useConfigStore();
-const clerk = useClerk();
 
-const status = ref<"loading" | "redirecting" | "error" | "waiting-browser">("loading");
-const errMsg = ref("");
+type Status = "idle" | "loading" | "waiting-browser" | "error";
+const status = ref<Status>("idle");
 
 const redirectUrl = computed(() => {
   const next = route.query.next;
   return typeof next === "string" && next.startsWith("/") ? next : "/";
 });
 
-async function handoff(): Promise<void> {
-  if (!cfg.authRequired) return;
+const showWelcome = computed(
+  () => isDesktop() && (cfg.requiresSetup || (!cfg.authRequired && !cfg.byokMode)),
+);
 
-  // Desktop: bounce sign-in out to the system browser. The Tauri
-  // webview can't host Clerk's UI directly (anti-phishing, passkeys,
-  // autofill all break). After Clerk authenticates the user, the
-  // production web app's /desktop/sign-in page redirects to a
-  // pi-typst-test:// deep link, which the deep-link bridge installed
-  // in main.ts picks up and exchanges for a session.
-  if (isDesktop()) {
-    status.value = "waiting-browser";
-    try {
-      await startDesktopSignIn();
-    } catch (exc) {
-      console.error("[login] startDesktopSignIn failed", exc);
-      errMsg.value = exc instanceof Error ? exc.message : String(exc);
-      status.value = "error";
-    }
-    return;
-  }
-
-  const c = clerk.value;
-  if (!c) return;
-
-  // Already signed in? Skip Clerk and go straight to the picker /
-  // requested page.
-  if (c.session) {
-    await router.replace(redirectUrl.value);
-    return;
-  }
-
-  status.value = "redirecting";
+async function startSignIn(): Promise<void> {
+  status.value = "waiting-browser";
   try {
-    // Full-page navigate to Clerk's hosted sign-in page. After auth
-    // Clerk redirects back to `redirectUrl` (origin-absolute so it
-    // crosses the accounts.dev → app boundary cleanly).
-    await c.redirectToSignIn({
-      signInForceRedirectUrl: window.location.origin + redirectUrl.value,
-    });
+    await startDesktopSignIn();
   } catch (exc) {
-    console.error("[login] redirectToSignIn failed", exc);
-    errMsg.value = exc instanceof Error ? exc.message : String(exc);
+    console.error("[login] startDesktopSignIn failed", exc);
     status.value = "error";
   }
+}
+
+async function handoff(): Promise<void> {
+  // Welcome / setup screen owns its own state — don't auto-redirect.
+  if (showWelcome.value) return;
+  // Auth disabled (BYOK or dev). The router's beforeEach already
+  // bounced /login to "/" in this case, but we land here defensively.
+  if (!cfg.authRequired) {
+    void router.replace(redirectUrl.value);
+    return;
+  }
+  // authRequired without a session → bounce to the system browser.
+  // Same path on desktop AND web prod (web mode also redirects to
+  // the hosted /desktop/sign-in bounce so the auth path is uniform).
+  void startSignIn();
 }
 
 onMounted(() => {
   void handoff();
 });
-
-// Clerk loads asynchronously after the plugin is installed; the ref
-// goes from null → instance once `clerk-js` finishes booting. Watch
-// for that and kick off the redirect the moment it's ready.
-watch(
-  () => clerk.value,
-  (v) => {
-    if (v) void handoff();
-  },
-);
 </script>
 
 <template>
-  <div class="flex min-h-screen flex-col bg-background text-foreground">
-    <BrandHeader
-      :show-account="false"
-      :show-feedback="false"
-      :links="[
-        { to: '/pricing', label: 'Pricing' },
-        { to: '/privacy', label: 'Privacy' },
-        { to: '/terms', label: 'Terms' },
-      ]"
-    />
-
+  <div class="flex min-h-0 flex-1 flex-col bg-background text-foreground">
     <main class="flex flex-1 flex-col items-center justify-center px-6 py-12">
-      <div
-        v-if="cfg.authRequired"
-        class="flex flex-col items-center gap-3 text-sm text-muted-foreground"
+      <!-- ── Welcome (desktop, no Clerk session AND no BYOK keys) ── -->
+      <section
+        v-if="showWelcome"
+        class="w-full max-w-md"
+        aria-labelledby="welcome-title"
       >
-        <template v-if="status === 'error'">
-          <p class="font-medium text-destructive">
-            Couldn't redirect to Clerk.
+        <div class="mb-8 text-center">
+          <h1
+            id="welcome-title"
+            class="text-h1 font-semibold tracking-tight text-foreground"
+          >
+            {{ $t("login.welcomeTitle") }}
+          </h1>
+          <p class="mt-2 text-lead text-muted-foreground">
+            {{ $t("login.welcomeSubtitle") }}
           </p>
-          <p class="font-mono text-[11px]">{{ errMsg }}</p>
+        </div>
+
+        <article
+          class="flex flex-col rounded-lg border border-border bg-card p-6 text-foreground"
+        >
+          <h2 class="text-h2 font-semibold tracking-tight">
+            {{ $t("login.signIn.title") }}
+          </h2>
+          <p class="mt-2 text-body text-muted-foreground">
+            {{ $t("login.signIn.blurb") }}
+          </p>
           <button
             type="button"
-            class="mt-2 rounded-md border border-border bg-card px-3 py-1.5 text-xs font-medium text-foreground hover:border-primary/50"
+            class="mt-5 inline-flex items-center justify-center gap-2 rounded-md bg-primary px-4 py-2.5 text-body font-semibold text-primary-foreground shadow-sm transition-opacity hover:opacity-90 disabled:opacity-60"
+            :disabled="status === 'waiting-browser'"
+            @click="startSignIn"
+          >
+            <span
+              v-if="status === 'waiting-browser'"
+              class="inline-block h-3.5 w-3.5 animate-spin rounded-full border-2 border-primary-foreground/40 border-t-primary-foreground"
+              aria-hidden="true"
+            />
+            {{
+              status === "waiting-browser"
+                ? $t("login.signIn.ctaWaiting")
+                : $t("login.signIn.cta")
+            }}
+          </button>
+          <button
+            v-if="status === 'waiting-browser'"
+            type="button"
+            class="mt-2 text-caption text-muted-foreground underline-offset-2 hover:underline"
+            @click="startSignIn"
+          >
+            {{ $t("login.signIn.reopen") }}
+          </button>
+        </article>
+
+        <!-- Escape hatch: 'Continue without signing in' takes the user
+             straight to the picker. They can open folders, browse, etc.;
+             the chat surface itself prompts for sign-in at message-send
+             time. This is what makes 'Open folder' actually feel
+             ungated — the Welcome screen is a friendly default, not a
+             blocking wall. -->
+        <div class="mt-4 text-center">
+          <RouterLink
+            to="/"
+            class="text-body text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+          >{{ $t("login.continueAsGuest") }}</RouterLink>
+          <p class="mt-1 text-caption text-muted-foreground">
+            {{ $t("login.continueAsGuestHint") }}
+          </p>
+        </div>
+
+        <p
+          v-if="status === 'error'"
+          class="mt-6 text-center text-body text-destructive"
+        >
+          {{ $t("login.error") }}
+          <span class="text-muted-foreground">— {{ $t("login.errorDetail") }}</span>
+        </p>
+      </section>
+
+      <!-- ── Web prod or desktop with Clerk: bounce / redirect spinner ── -->
+      <div
+        v-else-if="cfg.authRequired"
+        class="flex flex-col items-center gap-3 text-lead text-muted-foreground"
+      >
+        <template v-if="status === 'error'">
+          <p class="font-medium text-destructive">{{ $t("login.error") }}</p>
+          <p class="text-body">{{ $t("login.errorDetail") }}</p>
+          <button
+            type="button"
+            class="mt-2 rounded-md border border-border bg-card px-3 py-1.5 text-body font-medium text-foreground hover:border-primary/50"
             @click="handoff"
-          >Try again</button>
+          >
+            {{ $t("common.tryAgain") }}
+          </button>
         </template>
         <template v-else>
           <span
@@ -140,49 +193,37 @@ watch(
             aria-hidden="true"
           />
           <p>
-            <template v-if="status === 'redirecting'">
-              Redirecting to Clerk…
+            <template v-if="status === 'waiting-browser'">
+              {{ $t("login.signIn.ctaWaiting") }}
             </template>
-            <template v-else-if="status === 'waiting-browser'">
-              Sign in in your browser, then return here. We're listening
-              for the redirect…
-            </template>
-            <template v-else>Loading…</template>
+            <template v-else>{{ $t("login.loading") }}</template>
           </p>
           <button
             v-if="status === 'waiting-browser'"
             type="button"
-            class="mt-2 rounded-md border border-border bg-card px-3 py-1.5 text-xs font-medium text-foreground hover:border-primary/50"
+            class="mt-2 rounded-md border border-border bg-card px-3 py-1.5 text-body font-medium text-foreground hover:border-primary/50"
             @click="handoff"
-          >Reopen browser</button>
+          >
+            {{ $t("login.signIn.reopen") }}
+          </button>
         </template>
       </div>
 
+      <!-- ── Dev mode (no Clerk, no BYOK): just continue ── -->
       <div
         v-else
-        class="w-full max-w-md rounded-lg border border-border bg-card p-6 text-sm text-foreground"
+        class="w-full max-w-md rounded-lg border border-border bg-card p-6 text-lead text-foreground"
       >
-        <p class="mb-2 font-medium">Auth is disabled on this server.</p>
-        <p class="mb-4 text-muted-foreground">
-          The backend is running without
-          <code class="font-mono text-[11px]">CLERK_SECRET_KEY</code>, so
-          every request resolves to the synthetic
-          <code class="font-mono text-[11px]">dev</code> user. Set the
-          <code class="font-mono text-[11px]">CLERK_*</code> env vars in
-          <code class="font-mono text-[11px]">web/backend/.env</code> and
-          restart uvicorn to enable real sign-in.
-        </p>
+        <p class="mb-2 font-medium">{{ $t("login.alreadySignedIn") }}</p>
         <RouterLink
           :to="redirectUrl"
-          class="block w-full rounded-md bg-primary px-4 py-2 text-center text-sm font-semibold text-primary-foreground hover:opacity-90"
+          class="block w-full rounded-md bg-primary px-4 py-2 text-center text-lead font-semibold text-primary-foreground hover:opacity-90"
         >
-          Continue to picker
+          {{ $t("nav.sessions") }}
         </RouterLink>
       </div>
     </main>
 
-    <footer class="border-t border-border bg-card/40 px-6 py-4 text-center text-[11px] text-muted-foreground">
-      © {{ new Date().getFullYear() }} Digi Setu
-    </footer>
+    <AppFooter />
   </div>
 </template>

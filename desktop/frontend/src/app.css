@@ -9,6 +9,35 @@
 @tailwind utilities;
 
 /* ────────────────────────────────────────────────────────────────────────
+ * Bundled webfonts — self-hosted to keep the desktop app working offline
+ * and to avoid third-party (Google Fonts) cookies on the web edition.
+ *
+ * Inter           — UI text. SIL OFL 1.1.  See public/fonts/Inter-LICENSE.txt
+ * JetBrains Mono  — Code, paths, commands. SIL OFL 1.1.
+ *                                          See public/fonts/JetBrainsMono-LICENSE.txt
+ *
+ * Both ship as variable fonts (single woff2 spans weight 100..900). We
+ * declare the full weight axis range so any `font-weight: 500/600/700/…`
+ * resolves at the OS level — no separate weight files needed.
+ * ──────────────────────────────────────────────────────────────────────── */
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url("/fonts/InterVariable.woff2") format("woff2-variations"),
+       url("/fonts/InterVariable.woff2") format("woff2");
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 100 800;
+  font-display: swap;
+  src: url("/fonts/JetBrainsMono.woff2") format("woff2-variations"),
+       url("/fonts/JetBrainsMono.woff2") format("woff2");
+}
+
+/* ────────────────────────────────────────────────────────────────────────
  * Design tokens.
  *
  * Every UI color is a CSS custom property. Components NEVER hardcode hex.
@@ -26,10 +55,36 @@
 /* Light fallback (kept thin — we force `.dark` in main.ts). */
 :root {
   --radius: 0.5rem;
-  --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
-    "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif;
-  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
-    "Liberation Mono", "Courier New", monospace;
+  /* UI prose — Inter first, system fallback while the woff2 streams in. */
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system,
+    BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial,
+    "Noto Sans", sans-serif;
+  /* Code / paths / commands — JetBrains Mono first, system fallback. */
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco,
+    Consolas, "Liberation Mono", "Courier New", monospace;
+
+  /* ───────────────────────────────────────────────────────────────────
+   * Z-INDEX SCALE
+   *
+   * One scale, one source of truth. Components use `z-[var(--z-…)]`
+   * (or matching semantic Tailwind utility) instead of arbitrary
+   * z-30/z-40/z-50/z-[70] values that drift apart across files and
+   * cause the kind of overlap bugs the user flagged with the account
+   * dropdown vs. the model picker tooltip.
+   *
+   *   --z-base       0    page chrome (header, footer)
+   *   --z-header     30   sticky brand header
+   *   --z-popover    50   menus, dropdowns, history popover, model list
+   *   --z-modal      80   blocking modals (Upgrade, Confirm, Permission)
+   *   --z-toast      90   transient notifications
+   *   --z-overlay    100  full-screen drag/drop overlay
+   * ─────────────────────────────────────────────────────────────────── */
+  --z-base:    0;
+  --z-header:  30;
+  --z-popover: 50;
+  --z-modal:   80;
+  --z-toast:   90;
+  --z-overlay: 100;
 }
 
 /* ────────────────────────────────────────────────────────────────────────
@@ -80,14 +135,18 @@
  * Add new themes here. Apply by toggling the class on <html>.
  * ──────────────────────────────────────────────────────────────────────── */
 
-/* Notion teal — soft teal accent, productive doc-craft vibe (default). */
+/* Notion teal — soft teal accent, productive doc-craft vibe (default).
+ * --primary tuned to a punchier mid-teal so white foreground text on
+ * primary CTA buttons (Sign in, Pay, etc.) has 4.5:1+ contrast. The
+ * earlier teal-400 + near-black foreground combo read as muddy in
+ * the dark theme; mid-teal + white is the canonical CTA look. */
 .theme-notion {
-  --primary:           oklch(0.78 0.13 175);   /* teal-400 */
-  --primary-foreground: oklch(0.18 0 0);
-  --accent:            oklch(0.78 0.13 175 / 0.15);
-  --accent-foreground: oklch(0.85 0.13 175);
-  --user-bubble-bg:    oklch(0.78 0.13 175 / 0.08);
-  --user-bubble-border: oklch(0.78 0.13 175 / 0.30);
+  --primary:           oklch(0.66 0.14 178);   /* teal-500 */
+  --primary-foreground: oklch(0.99 0 0);       /* near-white */
+  --accent:            oklch(0.66 0.14 178 / 0.15);
+  --accent-foreground: oklch(0.85 0.13 178);
+  --user-bubble-bg:    oklch(0.66 0.14 178 / 0.08);
+  --user-bubble-border: oklch(0.66 0.14 178 / 0.30);
   --rail-running:      var(--warning);
   --rail-success:      var(--success);
   --rail-error:        var(--destructive);
@@ -165,6 +224,13 @@ body {
   font-family: var(--font-sans);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  /* Inter ships an opinionated default tracking that's slightly too wide
+   * for IDE-density UIs; -0.006em is the rsms.me/inter recommendation
+   * for screen UI. `cv11` selects Inter's single-storey lowercase l (so
+   * "1lI" don't collide), and `tnum` aligns digits in usage tables and
+   * file sizes. */
+  font-feature-settings: "cv11", "tnum";
+  letter-spacing: -0.006em;
 }
 
 /* Smooth thin scrollbars on every dark surface. */
@@ -218,10 +284,22 @@ body {
   animation: pi-shimmer 2.6s ease-in-out infinite;
 }
 
-/* User-bubble token-driven gradient (replaces pi-web-ui's hardcoded oranges). */
+/* User-bubble — slim left accent rail, NO full border / heavy fill.
+ *
+ * Earlier version wrapped every user message in a chunky bordered card
+ * with a translucent teal fill. Result: the user's "Hi" looked like a
+ * loud announcement banner sitting next to a plain assistant paragraph,
+ * so the conversation read as label-vs-paragraph instead of a dialogue.
+ *
+ * The new style keeps the same vertical rhythm as the assistant message
+ * (same line-height, same margin) and adds a 2 px accent rail on the
+ * left so you can still scan-read who said what without your eyes
+ * dropping into a coloured pit on every user turn. */
 .user-bubble {
-  background: var(--user-bubble-bg);
-  border: 1px solid var(--user-bubble-border);
+  background: transparent;
+  border: 0;
+  border-left: 2px solid var(--user-bubble-border);
+  border-radius: 0;
 }
 
 /* Permission-prompt attention pulse.

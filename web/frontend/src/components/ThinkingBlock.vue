@@ -56,7 +56,7 @@ const verb = computed(() => (isOpen.value && props.streaming ? "Thinking" : "Tho
   <div class="my-1.5 px-1">
     <button
       type="button"
-      class="inline-flex items-center gap-1.5 text-[11px] uppercase tracking-wide text-muted-foreground transition-colors hover:text-foreground"
+      class="inline-flex items-center gap-1.5 text-caption uppercase tracking-wide text-muted-foreground transition-colors hover:text-foreground"
       :class="{ 'animate-shimmer': isOpen && streaming }"
       @click="expanded = !expanded"
     >

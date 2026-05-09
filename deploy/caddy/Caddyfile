@@ -198,6 +198,28 @@ digi-setu.com, www.digi-setu.com {
 		reverse_proxy 127.0.0.1:8788
 	}
 
+	# ── /downloads/* — desktop installer artefacts ──────────────
+	# Serves the .dmg / .pkg / .zip the operator drops into
+	# /srv/pi/downloads on the VM. Cached for an hour by browsers
+	# (the URL embeds the version, so a fresh release uses a new
+	# filename and dodges the cache automatically).
+	#
+	# Anti-hotlink: we deliberately do NOT enable directory listing.
+	# Users hit specific filenames the /download landing page links
+	# to, never the bare /downloads/ index. This is also the reason
+	# we keep the artefacts on the VM rather than a public bucket
+	# for v1 — keeps the surface area small while we figure out
+	# what bandwidth the launch generates.
+	handle_path /downloads/* {
+		root * /srv/pi/downloads
+		header Cache-Control "public, max-age=3600, immutable"
+		header Content-Disposition "attachment"
+		# Directory browsing is OFF by default in Caddy v2's
+		# `file_server` directive — omit the `browse` arg entirely
+		# so we don't enumerate every artefact ever staged here.
+		file_server
+	}
+
 	# Static SPA. `try_files` falls through to index.html so Vue Router
 	# wins on hard refreshes of /chat/<sid> etc.
 	handle {

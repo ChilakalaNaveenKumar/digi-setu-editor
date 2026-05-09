@@ -21,7 +21,7 @@ desktop/
 │   │   ├── main.rs            entry point
 │   │   ├── lib.rs             Tauri builder, plugin wiring, lifecycle
 │   │   ├── sidecar.rs         spawn FastAPI binary, port discovery, kill on exit
-│   │   ├── deeplink.rs        pi-typst-test://… URL scheme handler
+│   │   ├── deeplink.rs        digi-setu://… URL scheme handler
 │   │   └── commands.rs        IPC: pick_folder, get_backend_port, open_external_url
 │   ├── capabilities/          Tauri v2 permission grants for the webview
 │   ├── icons/                 .icns / .ico / @2x PNGs (regen via `tauri icon`)
@@ -132,19 +132,19 @@ at runtime via:
 | **Docker isolation** | every chat in `pi-session` container | subprocess only, in the user's folder |
 | **Egress proxy** | MITM HTTPS for Vertex tokens | **skipped** (egress runs through user's network) |
 | **Folder picker** | `window.prompt(...)` (web flow rarely uses this) | native `tauri-plugin-dialog` |
-| **Sign in** | inline Clerk hosted page | external browser → `pi-typst-test://auth/callback` deep link |
-| **Stripe Checkout** | full-page navigate to Stripe | external browser → `pi-typst-test://billing/return` deep link |
+| **Sign in** | inline Clerk hosted page | external browser → `digi-setu://auth/callback` deep link |
+| **Stripe Checkout** | full-page navigate to Stripe | external browser → `digi-setu://billing/return` deep link |
 | **Permission mode default** | `approve_risky` (Cursor-style) | `approve_risky` (Cursor-style) |
-| **Shadow git** | `web/data/shadows/<wsid>/` | OS app-data dir (e.g. `~/Library/Application Support/com.digisetu.pi-typst-test/data/shadows/`) |
+| **Shadow git** | `web/data/shadows/<wsid>/` | OS app-data dir (e.g. `~/Library/Application Support/com.digisetu.desktop/data/shadows/`) |
 | **pi CLI** | global npm install on the VM | bundled inside the .app/.exe |
 | **Node.js** | system Node on the VM | bundled inside the .app/.exe |
 
 ## Data location
 
 ```
-macOS    ~/Library/Application Support/com.digisetu.pi-typst-test/data/
-Windows  %APPDATA%\com.digisetu.pi-typst-test\data\
-Linux    ~/.local/share/com.digisetu.pi-typst-test/data/
+macOS    ~/Library/Application Support/com.digisetu.desktop/data/
+Windows  %APPDATA%\com.digisetu.desktop\data\
+Linux    ~/.local/share/com.digisetu.desktop/data/
 ```
 
 This is exactly the pattern Cline uses for its shadow-git checkpoint
@@ -161,9 +161,9 @@ The deep-link round-trip is documented in:
 
 For end-to-end auth in production you must:
 
-1. Add `pi-typst-test://auth/callback` and `digi-setu://auth/callback`
-   to **Clerk dashboard → Authorized redirect URIs**.
-2. Add `pi-typst-test` and `digi-setu` to **Allowed redirect schemes**.
+1. Add `digi-setu://auth/callback` to **Clerk dashboard → Authorized
+   redirect URIs**.
+2. Add `digi-setu` to **Allowed redirect schemes**.
 3. Build the production `/desktop/sign-in?state=…&return=…` page on
    the web app — it must:
    - Render Clerk's SignIn component
@@ -171,9 +171,9 @@ For end-to-end auth in production you must:
      `users.createTicket()` (server-side)
    - `window.location = ${return}?token=${ticket}&state=${state}`
 4. Wire the same flow for Stripe Checkout success/cancel URLs (the
-   billing store already sends `pi-typst-test://billing/return` as
+   billing store already sends `digi-setu://billing/return` as
    `return_url` in desktop mode — see
-   `web/frontend/src/stores/billing.ts`).
+   `desktop/frontend/src/stores/billing.ts`).
 
 The `routes/desktop_auth.py:desktop_exchange` endpoint accepts the
 ticket, calls Clerk to verify the resulting session, and stamps a
@@ -182,7 +182,7 @@ process-local desktop session for subsequent API calls.
 ## Troubleshooting
 
 ### "Sidecar binary missing"
-Run `npm run sidecar:build`. The error message in `~/Library/Logs/com.digisetu.pi-typst-test/`
+Run `npm run sidecar:build`. The error message in `~/Library/Logs/com.digisetu.desktop/`
 (Mac) or the dev console (Windows) lists the paths it tried.
 
 ### "vendor/pi/node_modules/.bin/pi missing"
@@ -202,7 +202,7 @@ the sidecar likely crashed during boot — check the dev terminal for
 PyInstaller errors.
 
 ### Clerk login: "redirect URI not allowed"
-You haven't added `pi-typst-test://auth/callback` to the Clerk
+You haven't added `digi-setu://auth/callback` to the Clerk
 dashboard's allowed redirect URIs. See *Auth + billing wiring* above.
 
 ### Mac: "Digi Setu can't be opened because Apple cannot check it for malicious software"

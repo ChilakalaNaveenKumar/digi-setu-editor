@@ -87,6 +87,21 @@ _BUCKETS: dict[str, tuple[int, float]] = {
 _DAILY_TOKEN_BUDGET = _int_env("RL_DAILY_TOKEN_BUDGET", 0)
 
 
+# Hard cap on concurrent (open at the same instant) chat WebSockets per
+# user. Distinct from the burst-limited "ws.connect" bucket above:
+# - "ws.connect" stops a script that opens 100 sockets in 5 s.
+# - This cap stops a single user (or a tab-hoarder) from holding 50
+#   live pi subprocesses open at once. Cursor's web product uses the
+#   same model: you can open multiple chats but only N run at a time.
+# Default 5 satisfies the user-visible promise: "≥3 in parallel on web,
+# ≥5 in parallel on desktop". Both transports share the same cloud pi
+# pool (web hits /ws/sessions/* directly, desktop tunnels through
+# /v1/ws/desktop-relay) so a single integer is enough — we don't need
+# to split the budget per transport. Setting RL_MAX_CONCURRENT_CHATS=0
+# disables the cap (e.g. for the dev loop or integration tests).
+_MAX_CONCURRENT_CHATS = _int_env("RL_MAX_CONCURRENT_CHATS", 5)
+
+
 def _is_admin_user(user_id: str) -> bool:
     """Lazy import so rate_limit stays import-cheap. Returns False on
     any auth failure so a Clerk outage can't accidentally unlock
@@ -163,6 +178,10 @@ class RateLimiter:
         self._lock = threading.Lock()
         self._buckets: dict[str, dict[str, _TokenBucket]] = {}
         self._tokens: dict[str, dict[str, Any]] = {}
+        # Concurrent-chat counters. Keyed by user_id. We don't shard
+        # by purpose like the buckets do — the only consumer right now
+        # is the chat WS, and one int per user is plenty.
+        self._concurrent: dict[str, int] = {}
 
     # ── bucket access ────────────────────────────────────────────
     def _bucket(self, user_id: str, key: str) -> Optional[_TokenBucket]:
@@ -181,6 +200,51 @@ class RateLimiter:
         with self._lock:
             b = self._bucket(user_id, key)
             return True if b is None else b.try_take(n)
+
+    # ── concurrent-chat slot management ──────────────────────────
+    def acquire_chat_slot(self, user_id: str) -> tuple[bool, int, int]:
+        """Try to claim one of the user's concurrent chat slots.
+
+        Returns a 3-tuple `(granted, current, cap)`:
+          granted — True if the slot was reserved, False if the cap
+                    is hit. Caller must close the WS with 4429 when
+                    granted is False (we don't raise here because
+                    the chat WS handler decides the close code).
+          current — number of chats now open for this user (post-claim
+                    when granted, post-rejection when denied).
+          cap     — the configured maximum (so the SPA can show
+                    "3 of 3 chats open — close one to start a new one").
+
+        Caller MUST pair every successful acquire with a
+        `release_chat_slot(user_id)` in a finally block, otherwise the
+        counter will leak across reconnects until the process restarts.
+        Admin users bypass the cap (we still increment so /api/usage
+        shows real activity, but never deny).
+        """
+        cap = _MAX_CONCURRENT_CHATS
+        with self._lock:
+            current = self._concurrent.get(user_id, 0)
+            if cap > 0 and current >= cap and not _is_admin_user(user_id):
+                return (False, current, cap)
+            self._concurrent[user_id] = current + 1
+            return (True, current + 1, cap)
+
+    def release_chat_slot(self, user_id: str) -> None:
+        """Drop the user's chat-slot count by one. No-op when already
+        at zero — the close handler may be called twice on connection
+        teardown and we'd rather under-count than panic.
+        """
+        with self._lock:
+            current = self._concurrent.get(user_id, 0)
+            if current <= 1:
+                self._concurrent.pop(user_id, None)
+            else:
+                self._concurrent[user_id] = current - 1
+
+    def concurrent_chats(self, user_id: str) -> tuple[int, int]:
+        """Snapshot for the SPA's chat-slot indicator. (current, cap)."""
+        with self._lock:
+            return (self._concurrent.get(user_id, 0), _MAX_CONCURRENT_CHATS)
 
     def check(self, user_id: str, key: str, n: float = 1.0) -> None:
         """Raise 429 if the bucket is empty. Use as a FastAPI dep glue."""
