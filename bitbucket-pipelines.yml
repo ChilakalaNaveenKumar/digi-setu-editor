@@ -38,7 +38,10 @@
 #
 #   ── always required ─────────────────────────────────────────────
 #   GCP_SA_KEY_B64        base64-encoded JSON service-account key with:
-#                           - roles/cloudbuild.builds.editor
+#                           - roles/cloudbuild.builds.builder
+#                           - roles/serviceusage.serviceUsageConsumer
+#                           - roles/storage.objectAdmin
+#                           - roles/logging.logWriter
 #                           - roles/artifactregistry.writer
 #                           - roles/secretmanager.secretAccessor
 #                           - roles/iap.tunnelResourceAccessor

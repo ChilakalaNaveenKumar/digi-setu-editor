@@ -229,9 +229,25 @@ seed_ci_sa() {
     local name="${CI_SA_NAME:-digi-setu-ci}"
     local email="${name}@${PROJECT}.iam.gserviceaccount.com"
     local roles=(
-        roles/cloudbuild.builds.editor
+        # cloudbuild.builds.builder is a superset of .editor — it
+        # also covers the staging bucket reads, log writes, and AR
+        # uploads that `gcloud builds submit` does behind the scenes.
+        roles/cloudbuild.builds.builder
+        # Required separately because `gcloud builds submit` checks
+        # serviceusage.services.use on the project before it touches
+        # the staging bucket. Builder doesn't include it.
+        roles/serviceusage.serviceUsageConsumer
+        # The Cloud Build staging bucket (gs://PROJECT_cloudbuild)
+        # holds the source tarball; we need read+write on it.
+        roles/storage.objectAdmin
+        # Cloud Build streams logs to GCL — without this the build
+        # still works but `gcloud builds submit` can't tail logs.
+        roles/logging.logWriter
+        # Push pi-backend / pi-session images to AR after the build.
         roles/artifactregistry.writer
+        # Hydrate build.rs's compile-time CLERK_*_PROD from GSM.
         roles/secretmanager.secretAccessor
+        # Tunnel the `gcloud compute scp / ssh` traffic through IAP.
         roles/iap.tunnelResourceAccessor
         # remote-deploy.sh's roll_stack step ssh'es into the VM and
         # runs `sudo systemctl restart pi.service` + `sudo docker pull`.
@@ -239,6 +255,8 @@ seed_ci_sa() {
         # (osLogin alone is read-only). The VM's PAM is configured to
         # grant sudo to anyone with osAdminLogin.
         roles/compute.osAdminLogin
+        # Lets the SA impersonate the VM SA when needed (used by
+        # gcloud compute ssh + the docker login over metadata).
         roles/iam.serviceAccountUser
     )
     if gcloud iam service-accounts describe "${email}" --project "${PROJECT}" >/dev/null 2>&1; then
