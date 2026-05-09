@@ -202,6 +202,81 @@ seed_iam() {
     done
 }
 
+# ─────────────────────────────────────────────────────────────────────
+# CI service account provisioning (Bitbucket Pipelines + GHA)
+#
+# Bitbucket Pipelines + GitHub Actions need a service account with
+# these roles to run the full release pipeline:
+#
+#   roles/cloudbuild.builds.editor          submit Cloud Build jobs
+#   roles/artifactregistry.writer            push pi-backend / pi-session images
+#   roles/secretmanager.secretAccessor       hydrate build.rs's CLERK_*_PROD
+#   roles/iap.tunnelResourceAccessor         tunnel for `gcloud compute scp`
+#   roles/compute.osLogin                    ssh into digi-setu-live as a user
+#   roles/iam.serviceAccountUser             impersonate the VM SA for IAP
+#
+# We separate this from the VM SA because (a) we never want to export
+# a key for the SA the VM itself runs as — that would be a privilege
+# escalation if the key ever leaks, and (b) the CI account can be
+# rotated independently.
+#
+# The function is fully idempotent: running it twice is a no-op.
+# It prints the freshly-generated key to stdout (base64-encoded) so
+# you can pipe straight into `pbcopy` and paste into Bitbucket's
+# "GCP_SA_KEY_B64" variable.
+seed_ci_sa() {
+    require_gcloud
+    local name="${CI_SA_NAME:-digi-setu-ci}"
+    local email="${name}@${PROJECT}.iam.gserviceaccount.com"
+    local roles=(
+        roles/cloudbuild.builds.editor
+        roles/artifactregistry.writer
+        roles/secretmanager.secretAccessor
+        roles/iap.tunnelResourceAccessor
+        roles/compute.osLogin
+        roles/iam.serviceAccountUser
+        # remote-deploy.sh's roll_stack step shells in via gcloud
+        # compute ssh and runs `sudo systemctl restart pi.service`.
+        # OS Login + sudo policy on the VM grants that — no extra
+        # role needed beyond compute.osLogin + the host's sudoers.
+    )
+    if gcloud iam service-accounts describe "${email}" --project "${PROJECT}" >/dev/null 2>&1; then
+        log "service account ${email} exists; will (re)assert role bindings only"
+    else
+        log "creating service account ${email}"
+        gcloud iam service-accounts create "${name}" \
+            --project "${PROJECT}" \
+            --display-name "Digi Setu CI (Bitbucket Pipelines + GHA)" >/dev/null
+    fi
+    local r
+    for r in "${roles[@]}"; do
+        gcloud projects add-iam-policy-binding "${PROJECT}" \
+            --member "serviceAccount:${email}" \
+            --role "${r}" \
+            --condition=None \
+            >/dev/null && log "  ${r}: bound" || warn "  ${r}: bind failed"
+    done
+    # Generate a fresh JSON key and emit it base64-encoded so the dev
+    # can paste straight into Bitbucket's repo variables UI without
+    # newlines / quoting issues. We delete the on-disk copy so the
+    # only persisted record of the key is whatever the operator does
+    # with stdout.
+    local keyfile
+    keyfile=$(mktemp)
+    gcloud iam service-accounts keys create "${keyfile}" \
+        --iam-account "${email}" --project "${PROJECT}" >/dev/null
+    log "fresh key for ${email} (base64 below; paste into GCP_SA_KEY_B64):"
+    echo
+    base64 < "${keyfile}" | tr -d '\n'
+    echo
+    rm -f "${keyfile}"
+    echo
+    log "next step: paste the value above into:"
+    log "  Bitbucket → Repo settings → Pipelines → Variables → GCP_SA_KEY_B64 (Secured)"
+    log "  GitHub    → Repo settings → Secrets & variables → Actions → GCP_SA_KEY"
+    log "    (for GHA, base64-decode first: \`echo \$KEY_B64 | base64 -d\` then paste)"
+}
+
 usage() {
     cat <<'USAGE' >&2
 Usage:
@@ -210,6 +285,9 @@ Usage:
   secrets-sync.sh pull-all           Print stack.env-shaped output to stdout.
   secrets-sync.sh list               Show which secrets exist + version info.
   secrets-sync.sh seed-iam           Grant the VM SA secretAccessor on each.
+  secrets-sync.sh seed-ci-sa         Provision the CI service account
+                                     (Bitbucket Pipelines / GHA) and
+                                     emit a fresh base64 key on stdout.
 
 Env overrides:
   GCP_PROJECT (default digi-setu-dev)
@@ -245,6 +323,9 @@ case "${cmd}" in
         ;;
     seed-iam)
         seed_iam
+        ;;
+    seed-ci-sa)
+        seed_ci_sa
         ;;
     -h|--help|help)
         usage

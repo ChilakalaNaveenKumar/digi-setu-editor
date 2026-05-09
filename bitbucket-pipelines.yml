@@ -1,30 +1,59 @@
-# Bitbucket Pipelines configuration.
+# Bitbucket Pipelines — single source of truth for ALL deployments.
 #
-# Why both this and .github/workflows/release.yml exist:
-#   - The repo is mirrored to GitHub for free Windows runners that
-#     Bitbucket doesn't offer. Linux builds run on whichever side the
-#     dev pushes to first; both pipelines write to the same VM via
-#     deploy/scripts/upload-installer.sh.
-#   - macOS builds intentionally stay local (notarisation needs the
-#     dev's own Developer ID + app-specific password).
+# What runs on every push to `main`:
+#   1. Cloud backend (parallel) — Cloud Build the pi-backend +
+#      pi-session images, push to Artifact Registry, ssh into the VM
+#      and roll docker-compose. Same as `bash deploy/scripts/remote-deploy.sh backend`
+#      from a laptop.
+#   2. Web frontend (parallel) — build the Vue SPA in a deterministic
+#      Node container, stream `dist/` to /srv/pi/www on the VM. Same
+#      as `bash deploy/scripts/remote-deploy.sh frontend`.
+#   3. Linux .deb (parallel) — full Tauri release build inside an
+#      ubuntu:22.04 step, upload to digi-setu.com/downloads/.
+#   4. Mirror to GitHub (sequential, last) — push the same commit
+#      and any new tags to the GitHub mirror. Pushing a tag fires
+#      .github/workflows/release.yml which builds Windows .exe / .msi
+#      on a windows-latest runner (Bitbucket has no Windows agents).
 #
-# What runs:
-#   - Every PR : npm + pip lint + tests on the web and desktop trees
-#   - main+tag : full Linux release build, uploaded to digi-setu.com
+# What runs on every PR (or non-main branch push):
+#   - Web + desktop frontend typecheck + build (lints, vite build)
+#   - Backend pytest smoke
+#
+# What runs on `v*.*.*` tag push:
+#   - Same as main, plus the tag is mirrored to GitHub which triggers
+#     the GHA Windows + Linux release jobs (those upload .exe / .msi /
+#     .deb / .AppImage to digi-setu.com/downloads/).
+#
+# Why GitHub for Windows: Bitbucket Cloud has no Windows runners. We
+# could attach a self-hosted Windows runner with the label "windows"
+# but that needs a Windows host on the team's network. GHA's free
+# windows-latest runners are simpler.
+#
+# Why macOS isn't here: Tauri's macOS bundler must run under macOS,
+# and Apple notarisation needs the dev's own Developer ID. The Mac
+# DMG stays a `bash desktop/scripts/release.sh --mac` from a dev's
+# laptop — automated with `make release-mac` if you prefer.
 #
 # Required pipeline variables (Repository settings → Pipelines → Variables):
-#   GCP_SA_KEY_B64    base64-encoded JSON service-account key with
-#                     roles/secretmanager.secretAccessor on GCP_PROJECT
-#                     and roles/compute.osLogin on the upload VM.
-#   GCP_PROJECT       digi-setu-dev
-#   GCP_VM            digi-setu-live
-#   GCP_ZONE          us-central1-a
 #
-# Self-hosted Windows runner (optional):
-#   Bitbucket has no managed Windows agents. To build Windows here
-#   instead of on GitHub, attach a Windows self-hosted runner with
-#   the label "windows" and add a step similar to the linux-release
-#   one below; the pwsh script lives at desktop/scripts/build-windows.ps1.
+#   ── always required ─────────────────────────────────────────────
+#   GCP_SA_KEY_B64        base64-encoded JSON service-account key with:
+#                           - roles/cloudbuild.builds.editor
+#                           - roles/artifactregistry.writer
+#                           - roles/secretmanager.secretAccessor
+#                           - roles/iap.tunnelResourceAccessor
+#                           - roles/compute.osLogin
+#                         (run `deploy/scripts/secrets-sync.sh seed-iam`
+#                          to provision an SA with this exact role set)
+#   GCP_PROJECT           digi-setu-dev
+#   GCP_VM                digi-setu-live
+#   GCP_ZONE              us-central1-a
+#
+#   ── for the GitHub-mirror step ──────────────────────────────────
+#   GH_MIRROR_TOKEN       GitHub PAT with `repo` + `workflow` scope
+#                         on ChilakalaNaveenKumar/digi-setu-editor
+#   GH_MIRROR_URL         https://github.com/ChilakalaNaveenKumar/digi-setu-editor.git
+#                         (override only if you fork / rename)
 
 image: ubuntu:22.04
 
@@ -34,18 +63,67 @@ definitions:
     cargo-git: ~/.cargo/git
     cargo-target: desktop/src-tauri/target/x86_64-unknown-linux-gnu
 
+  services:
+    docker:
+      memory: 4096
+
   steps:
+    # ── Common bootstrap shared by every step that talks to GCP ────
+    # Activates the SA, points gcloud at the right project, makes
+    # `gcloud compute scp` work non-interactively over IAP.
+    - step: &activate-gcp
+        name: (template — never invoked alone)
+        script:
+          - apt-get update -qq && apt-get install -y --no-install-recommends curl ca-certificates python3 gnupg
+          - curl -fsSL https://sdk.cloud.google.com | bash -s -- --disable-prompts --install-dir=/opt
+          - export PATH="/opt/google-cloud-sdk/bin:$PATH"
+          - echo "$GCP_SA_KEY_B64" | base64 -d > /tmp/sa.json
+          - gcloud auth activate-service-account --key-file=/tmp/sa.json
+          - gcloud config set project "$GCP_PROJECT"
+
+    # ── 1. Cloud backend: Cloud Build the image, roll the VM ───────
+    - step: &cloud-backend
+        name: Cloud backend (rebuild image + roll VM)
+        image: google/cloud-sdk:slim
+        script:
+          - apt-get update -qq && apt-get install -y --no-install-recommends git
+          - echo "$GCP_SA_KEY_B64" | base64 -d > /tmp/sa.json
+          - gcloud auth activate-service-account --key-file=/tmp/sa.json
+          - gcloud config set project "$GCP_PROJECT"
+          # remote-deploy.sh does build_backend (Cloud Build) + roll_stack
+          # (ssh into VM, swap image tag, restart pi.service). Both rely
+          # on the SA having the IAM roles listed in the file header.
+          - bash deploy/scripts/remote-deploy.sh backend
+
+    # ── 2. Web frontend: build SPA in container, stream to /srv/pi/www
+    - step: &web-frontend
+        name: Web frontend (rebuild SPA + deploy to /srv/pi/www)
+        image: google/cloud-sdk:slim
+        services:
+          - docker
+        script:
+          - apt-get update -qq && apt-get install -y --no-install-recommends git docker.io
+          - echo "$GCP_SA_KEY_B64" | base64 -d > /tmp/sa.json
+          - gcloud auth activate-service-account --key-file=/tmp/sa.json
+          - gcloud config set project "$GCP_PROJECT"
+          # `remote-deploy.sh frontend` builds via deploy/Dockerfile.frontend
+          # then `docker run --rm | gcloud compute ssh tar -x` into /srv/pi/www.
+          # Caddy serves the resulting dist as a read-only mount, so the new
+          # bundle is live the moment tar finishes.
+          - bash deploy/scripts/remote-deploy.sh frontend
+
+    # ── 3. Linux .deb release (Tauri bundle + upload) ──────────────
     - step: &linux-release
-        name: Linux release build (.deb + .AppImage)
+        name: Linux .deb release build + upload
         image: ubuntu:22.04
-        size: 2x          # Tauri's Rust release link is RAM-hungry
+        size: 2x        # Tauri's Rust release link is RAM-hungry
         caches:
           - cargo-registry
           - cargo-git
           - cargo-target
           - node
         script:
-          - apt-get update
+          - apt-get update -qq
           - >
             apt-get install -y --no-install-recommends
             ca-certificates curl wget git file build-essential pkg-config
@@ -54,7 +132,7 @@ definitions:
             libssl-dev libffi-dev zlib1g-dev libsqlite3-dev libbz2-dev
             liblzma-dev libreadline-dev tk-dev libncurses-dev
             desktop-file-utils fakeroot dpkg-dev
-            software-properties-common gnupg lsb-release
+            software-properties-common gnupg lsb-release python3
           - add-apt-repository -y ppa:deadsnakes/ppa
           - apt-get install -y --no-install-recommends python3.11 python3.11-venv python3.11-dev
           - curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
@@ -62,15 +140,14 @@ definitions:
           - curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
           - source $HOME/.cargo/env
           - rustup target add x86_64-unknown-linux-gnu
-          - wget -qO /usr/local/bin/appimagetool https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
-          - chmod +x /usr/local/bin/appimagetool
-          # gcloud for both secret access and the SCP upload at the end.
           - >
             curl -fsSL https://sdk.cloud.google.com | bash -s -- --disable-prompts --install-dir=/opt
           - export PATH="/opt/google-cloud-sdk/bin:$PATH"
           - echo "$GCP_SA_KEY_B64" | base64 -d > /tmp/sa.json
           - gcloud auth activate-service-account --key-file=/tmp/sa.json
           - gcloud config set project "$GCP_PROJECT"
+          # Hydrate build.rs's compile-time env from GSM. Same shape
+          # release.sh writes locally so build behaviour is identical.
           - >
             : > .release-secrets.tmp.env;
             for k in CLERK_PUBLISHABLE_KEY_PROD CLERK_SECRET_KEY_PROD; do
@@ -79,47 +156,112 @@ definitions:
             done;
             { echo "PI_CLOUD_API_BASE=https://digi-setu.com"; echo "PI_RELAY_BASE=https://api.digi-setu.com"; echo "CLERK_TENANT=prod"; } >> .release-secrets.tmp.env
           - export TAURI_BUILD_ENV="$BITBUCKET_CLONE_DIR/.release-secrets.tmp.env"
-          - export APPIMAGETOOL_PATH=/usr/local/bin/appimagetool
-          - export APPIMAGE_EXTRACT_AND_RUN=1
+          # AppImage stays disabled by default — Tauri downloads its own
+          # linuxdeploy.AppImage which needs FUSE (not available in
+          # cloud Bitbucket runners). Set LINUX_BUILD_APPIMAGE=1 in
+          # repository variables once you have a self-hosted runner
+          # with /dev/fuse.
+          - export LINUX_BUILD_APPIMAGE="${LINUX_BUILD_APPIMAGE:-0}"
           - bash desktop/scripts/build-linux-inside.sh
           - >
-            for f in /tmp/Digi-Setu-*-amd64.deb /tmp/Digi-Setu-*-amd64.AppImage; do
+            for f in desktop/build-out/linux/deb/*.deb desktop/build-out/linux/appimage/*.AppImage; do
               [ -f "$f" ] || continue;
-              # upload-installer.sh uses gcloud compute scp; the SA key
-              # already activated above carries roles/compute.osLogin.
+              # Normalise filename (Tauri puts a space in it) before upload.
+              base=$(basename "$f");
+              norm="/tmp/${base// /-}";
+              norm="${norm/Digi-Setu_/Digi-Setu-}";
+              norm="${norm/_amd64/-amd64}";
+              cp "$f" "$norm";
               GCP_PROJECT="$GCP_PROJECT" GCP_VM="$GCP_VM" GCP_ZONE="$GCP_ZONE" \
-                bash deploy/scripts/upload-installer.sh "$f";
+                bash deploy/scripts/upload-installer.sh "$norm";
             done
         artifacts:
+          - "desktop/build-out/linux/**"
           - "/tmp/Digi-Setu-*-amd64.deb"
           - "/tmp/Digi-Setu-*-amd64.AppImage"
 
-pipelines:
-  default:
-    - parallel:
-        - step:
-            name: Web frontend lint + typecheck
-            image: node:22
-            caches:
-              - node
-            script:
-              - cd web/frontend
-              - npm ci --no-audit --no-fund
-              - npm run typecheck || true   # Pinned in package.json once we add it
-              - npm run build
-        - step:
-            name: Backend pytest (smoke)
-            image: python:3.11-slim
-            script:
-              - apt-get update && apt-get install -y --no-install-recommends build-essential
-              - cd web/backend
-              - pip install -r requirements.txt pytest
-              - pytest -q tests/ || true    # Aspirational until the suite stabilises
+    # ── 4. Mirror to GitHub so GHA can build Windows ───────────────
+    # Pushing the same commit + tags to ChilakalaNaveenKumar/digi-setu-editor
+    # automatically triggers .github/workflows/release.yml on every
+    # `v*.*.*` tag, which produces the Windows .exe / .msi (signed
+    # via Azure Trusted Signing when secrets are configured).
+    - step: &github-mirror
+        name: Mirror commit + tags to GitHub (Windows CI fires from there)
+        image: alpine:3.20
+        script:
+          - apk add --no-cache git
+          - git config --global user.email "ci@digi-setu.com"
+          - git config --global user.name "Bitbucket Pipelines"
+          - git remote add github "https://x-access-token:${GH_MIRROR_TOKEN}@github.com/${GH_MIRROR_REPO:-ChilakalaNaveenKumar/digi-setu-editor}.git"
+          # Bitbucket clones shallow by default; --no-shallow-since avoids
+          # the "did not receive expected object" pack-negotiation error
+          # that sinks fresh pushes to an empty / divergent target.
+          - git fetch --unshallow origin "$BITBUCKET_BRANCH" || git fetch origin "$BITBUCKET_BRANCH"
+          # Always push the branch. Push the tag too if this run was
+          # triggered by a tag push.
+          - git push --force-with-lease github "HEAD:${BITBUCKET_BRANCH:-main}"
+          - >
+            if [ -n "${BITBUCKET_TAG}" ]; then
+              git push github "${BITBUCKET_TAG}";
+              echo "[mirror] pushed tag ${BITBUCKET_TAG} → GHA windows job will fire";
+            fi
 
+    # ── PR / branch CI: cheap typecheck + smoke tests ──────────────
+    - step: &web-typecheck
+        name: Web frontend typecheck + build
+        image: node:22
+        caches:
+          - node
+        script:
+          - cd web/frontend
+          - npm ci --no-audit --no-fund
+          - npm run typecheck || true
+          - npm run build
+
+    - step: &desktop-typecheck
+        name: Desktop frontend typecheck + build
+        image: node:22
+        caches:
+          - node
+        script:
+          - cd desktop/frontend
+          - npm ci --no-audit --no-fund
+          - npm run typecheck || true
+          - npm run build
+
+    - step: &backend-pytest
+        name: Backend pytest smoke
+        image: python:3.11-slim
+        script:
+          - apt-get update -qq && apt-get install -y --no-install-recommends build-essential
+          - cd web/backend
+          - pip install -q -r requirements.txt pytest
+          - pytest -q tests/ || true
+
+pipelines:
+  # Pull-requests + non-main branches: cheap typecheck only.
+  pull-requests:
+    "**":
+      - parallel:
+          - step: *web-typecheck
+          - step: *desktop-typecheck
+          - step: *backend-pytest
+
+  # Push to main: rebuild + redeploy EVERYTHING in parallel,
+  # then mirror to GitHub so GHA picks up the Windows build path.
   branches:
     main:
-      - step: *linux-release
+      - parallel:
+          - step: *cloud-backend
+          - step: *web-frontend
+          - step: *linux-release
+      - step: *github-mirror
 
+  # Tag push: same as main, but also fires GHA Windows + Linux jobs.
   tags:
     "v*":
-      - step: *linux-release
+      - parallel:
+          - step: *cloud-backend
+          - step: *web-frontend
+          - step: *linux-release
+      - step: *github-mirror
