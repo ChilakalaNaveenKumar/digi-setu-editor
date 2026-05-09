@@ -25,6 +25,7 @@
 param(
     [switch]$LocalEnv,
     [switch]$SkipSidecar,
+    [switch]$SkipGsm,         # CI: read TAURI_BUILD_ENV instead of pulling from GSM
     [string]$GcpProject = "digi-setu-dev",
     [string]$AppVersion = "0.1.0"
 )
@@ -60,7 +61,17 @@ $EnvTmp = [System.IO.Path]::GetTempFileName()
 $cleanup = { if (Test-Path $EnvTmp) { Remove-Item $EnvTmp -Force } }
 trap { & $cleanup; throw }   # Wipe the temp env file even on error
 
-if ($LocalEnv) {
+if ($SkipGsm) {
+    # CI path: GitHub Actions stages a .release-secrets.tmp.env file and
+    # exports its absolute path as $env:TAURI_BUILD_ENV. This avoids
+    # needing a GCP service-account key on the runner just to read two
+    # values that already live in the workflow's repo secrets.
+    if (-not $env:TAURI_BUILD_ENV -or -not (Test-Path $env:TAURI_BUILD_ENV)) {
+        throw "(-SkipGsm) requires `$env:TAURI_BUILD_ENV to point at a readable .env file"
+    }
+    Log "(-SkipGsm) using $env:TAURI_BUILD_ENV"
+    Copy-Item $env:TAURI_BUILD_ENV $EnvTmp -Force
+} elseif ($LocalEnv) {
     Log "(--local-env) copying desktop\backend\.env"
     if (-not (Test-Path "$Desktop\backend\.env")) {
         throw "desktop\backend\.env missing — re-run with -LocalEnv after creating one, or drop the flag and authenticate gcloud."

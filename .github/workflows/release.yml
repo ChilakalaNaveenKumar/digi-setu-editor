@@ -15,28 +15,33 @@
 #   - Manual dispatch                 → builds + uploads (op picks tag)
 #
 # Required repository secrets (Settings → Secrets and variables → Actions):
-#   GCP_PROJECT                       digi-setu-dev (or whichever project
-#                                     hosts your build-time secrets in GSM)
-#   GCP_SA_KEY                        JSON service-account key with
-#                                     roles/secretmanager.secretAccessor
-#                                     against GCP_PROJECT
-#   GCP_VM                            digi-setu-live (default in
-#                                     upload-installer.sh; override only
-#                                     if you ship to a different VM)
-#   GCP_ZONE                          us-central1-a
-#   TRUSTED_SIGNING_DLIB_PATH         path to Microsoft.Trusted.Signing
-#                                     .Client.dll on the runner (we
-#                                     install it via dotnet during the job)
-#   TRUSTED_SIGNING_ENDPOINT          e.g. https://eus.codesigning.azure.net
-#   TRUSTED_SIGNING_ACCOUNT           your TS account name
-#   TRUSTED_SIGNING_PROFILE           your TS certificate-profile name
-#   AZURE_CLIENT_ID/CLIENT_SECRET     service principal with the
-#   AZURE_TENANT_ID                   "Trusted Signing Certificate Profile
-#                                     Signer" role on the cert profile
 #
-# Without the TRUSTED_SIGNING_* secrets the Windows job ships UNSIGNED.
-# That keeps the workflow runnable from day one — SmartScreen will
-# warn, but the binary works (download-page footnote covers it).
+#   Build-time (always required):
+#     CLERK_PUBLISHABLE_KEY_PROD      pk_live_… (read by build.rs)
+#     CLERK_SECRET_KEY_PROD           sk_live_… (read by build.rs)
+#
+#   Cloud upload (optional — without these the artefacts are still
+#                 uploaded as workflow artefacts, but NOT pushed to
+#                 https://digi-setu.com/downloads/. You can manually
+#                 download + upload via deploy/scripts/upload-installer.sh
+#                 from your laptop):
+#     GCP_SA_KEY                      JSON service-account key with
+#                                     roles/iap.tunnelResourceAccessor +
+#                                     roles/compute.osLogin so
+#                                     `gcloud compute scp` succeeds
+#     GCP_PROJECT                     digi-setu-dev   (default)
+#     GCP_VM                          digi-setu-live  (default)
+#     GCP_ZONE                        us-central1-a   (default)
+#
+#   Windows code-signing (optional — without these the .exe / .msi
+#                         ship UNSIGNED and SmartScreen will warn on
+#                         first launch; perfect for early access):
+#     TRUSTED_SIGNING_ENDPOINT        e.g. https://eus.codesigning.azure.net
+#     TRUSTED_SIGNING_ACCOUNT         your TS account name
+#     TRUSTED_SIGNING_PROFILE         your TS certificate-profile name
+#     AZURE_CLIENT_ID/CLIENT_SECRET   service principal with the
+#     AZURE_TENANT_ID                 "Trusted Signing Certificate Profile
+#                                     Signer" role on the cert profile
 
 name: release
 
@@ -79,12 +84,14 @@ jobs:
             desktop/src-tauri/target
           key: cargo-windows-${{ hashFiles('desktop/src-tauri/Cargo.lock') }}
 
-      - name: Authenticate to Google Cloud
+      - name: Authenticate to Google Cloud (only if SA key provided)
+        if: ${{ secrets.GCP_SA_KEY != '' }}
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      - name: Set up gcloud SDK
+      - name: Set up gcloud SDK (only if SA key provided)
+        if: ${{ secrets.GCP_SA_KEY != '' }}
         uses: google-github-actions/setup-gcloud@v2
 
       - name: Install Trusted Signing Dlib (optional)
@@ -103,10 +110,30 @@ jobs:
           if (-not $dll) { throw "Trusted Signing Dlib install did not produce the expected dll" }
           "TRUSTED_SIGNING_DLIB_PATH=$dll" >> $env:GITHUB_ENV
 
+      - name: Stage build env (Clerk keys come straight from GHA secrets)
+        shell: bash
+        env:
+          CLERK_PUBLISHABLE_KEY_PROD: ${{ secrets.CLERK_PUBLISHABLE_KEY_PROD }}
+          CLERK_SECRET_KEY_PROD: ${{ secrets.CLERK_SECRET_KEY_PROD }}
+        run: |
+          # build.rs reads CLERK_*_PROD + the cloud-target URLs at compile
+          # time. We feed them via a .env file (same shape release.sh writes)
+          # so the Tauri build behaves identically on the runner and on a
+          # dev's laptop. The cloud-target URLs are public; no need to
+          # surface them as separate GHA secrets.
+          {
+            echo "CLERK_PUBLISHABLE_KEY_PROD=$CLERK_PUBLISHABLE_KEY_PROD"
+            echo "CLERK_SECRET_KEY_PROD=$CLERK_SECRET_KEY_PROD"
+            echo "PI_CLOUD_API_BASE=https://digi-setu.com"
+            echo "PI_RELAY_BASE=https://api.digi-setu.com"
+            echo "CLERK_TENANT=prod"
+          } > .release-secrets.tmp.env
+          chmod 0600 .release-secrets.tmp.env
+
       - name: Build Windows installers
         shell: pwsh
         env:
-          GCP_PROJECT: ${{ secrets.GCP_PROJECT || 'digi-setu-dev' }}
+          TAURI_BUILD_ENV: ${{ github.workspace }}/.release-secrets.tmp.env
           TRUSTED_SIGNING_ENDPOINT: ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
           TRUSTED_SIGNING_ACCOUNT:  ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
           TRUSTED_SIGNING_PROFILE:  ${{ secrets.TRUSTED_SIGNING_PROFILE }}
@@ -114,19 +141,16 @@ jobs:
           AZURE_CLIENT_SECRET:      ${{ secrets.AZURE_CLIENT_SECRET }}
           AZURE_TENANT_ID:          ${{ secrets.AZURE_TENANT_ID }}
         run: |
-          .\desktop\scripts\build-windows.ps1 -GcpProject $env:GCP_PROJECT -AppVersion $env:APP_VERSION
+          .\desktop\scripts\build-windows.ps1 -AppVersion $env:APP_VERSION -SkipGsm
 
-      - name: Upload to digi-setu.com via gcloud SCP
+      - name: Upload to digi-setu.com via gcloud SCP (only if SA key provided)
+        if: ${{ secrets.GCP_SA_KEY != '' }}
         shell: bash
         env:
           GCP_PROJECT: ${{ secrets.GCP_PROJECT || 'digi-setu-dev' }}
           GCP_VM:      ${{ secrets.GCP_VM      || 'digi-setu-live' }}
           GCP_ZONE:    ${{ secrets.GCP_ZONE    || 'us-central1-a' }}
         run: |
-          # Tauri's bundle filenames have spaces; build-windows.ps1
-          # already stages normalised copies under $TEMP. We re-use
-          # upload-installer.sh from the cloud deploy scripts so the
-          # SHA-verify path stays a single implementation.
           for f in "$RUNNER_TEMP/Digi-Setu-${APP_VERSION}-x64-setup.exe" "$RUNNER_TEMP/Digi-Setu-${APP_VERSION}-x64.msi"; do
             if [[ -f "$f" ]]; then
               bash deploy/scripts/upload-installer.sh "$f"
@@ -177,27 +201,27 @@ jobs:
             desktop/src-tauri/target
           key: cargo-linux-${{ hashFiles('desktop/src-tauri/Cargo.lock') }}
 
-      - uses: google-github-actions/auth@v2
+      - if: ${{ secrets.GCP_SA_KEY != '' }}
+        uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      - uses: google-github-actions/setup-gcloud@v2
+      - if: ${{ secrets.GCP_SA_KEY != '' }}
+        uses: google-github-actions/setup-gcloud@v2
 
-      - name: Hydrate build env from Google Secret Manager
+      - name: Stage build env (Clerk keys come straight from GHA secrets)
         shell: bash
         env:
-          GCP_PROJECT: ${{ secrets.GCP_PROJECT || 'digi-setu-dev' }}
+          CLERK_PUBLISHABLE_KEY_PROD: ${{ secrets.CLERK_PUBLISHABLE_KEY_PROD }}
+          CLERK_SECRET_KEY_PROD: ${{ secrets.CLERK_SECRET_KEY_PROD }}
         run: |
-          : > .release-secrets.tmp.env
-          for k in CLERK_PUBLISHABLE_KEY_PROD CLERK_SECRET_KEY_PROD; do
-            v=$(gcloud secrets versions access latest --project "$GCP_PROJECT" --secret "$k" 2>/dev/null || true)
-            [[ -n "$v" ]] && printf '%s=%s\n' "$k" "$v" >> .release-secrets.tmp.env
-          done
           {
+            echo "CLERK_PUBLISHABLE_KEY_PROD=$CLERK_PUBLISHABLE_KEY_PROD"
+            echo "CLERK_SECRET_KEY_PROD=$CLERK_SECRET_KEY_PROD"
             echo "PI_CLOUD_API_BASE=https://digi-setu.com"
             echo "PI_RELAY_BASE=https://api.digi-setu.com"
             echo "CLERK_TENANT=prod"
-          } >> .release-secrets.tmp.env
+          } > .release-secrets.tmp.env
 
       - name: Build (PyInstaller sidecar + frontend + Tauri Linux bundle)
         env:
@@ -208,7 +232,8 @@ jobs:
           # the Docker layer and execute the steps directly.
           bash desktop/scripts/build-linux-inside.sh
 
-      - name: Upload artefacts to digi-setu.com
+      - name: Upload artefacts to digi-setu.com (only if SA key provided)
+        if: ${{ secrets.GCP_SA_KEY != '' }}
         env:
           GCP_PROJECT: ${{ secrets.GCP_PROJECT || 'digi-setu-dev' }}
           GCP_VM:      ${{ secrets.GCP_VM      || 'digi-setu-live' }}
