@@ -60,6 +60,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # GitHub Actions doesn't allow `secrets.X` inside `step.if` conditions.
+      # Instead we surface the booleans as step outputs first, then gate
+      # subsequent steps on `steps.flags.outputs.has_*`.
+      - id: flags
+        shell: bash
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          TS_ENDPOINT: ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
+        run: |
+          [[ -n "$GCP_SA_KEY"  ]] && echo "has_gcp=true" >> "$GITHUB_OUTPUT" || echo "has_gcp=false" >> "$GITHUB_OUTPUT"
+          [[ -n "$TS_ENDPOINT" ]] && echo "has_ts=true"  >> "$GITHUB_OUTPUT" || echo "has_ts=false"  >> "$GITHUB_OUTPUT"
+
       - name: Set up Rust (stable + windows-msvc target)
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -85,17 +97,17 @@ jobs:
           key: cargo-windows-${{ hashFiles('desktop/src-tauri/Cargo.lock') }}
 
       - name: Authenticate to Google Cloud (only if SA key provided)
-        if: ${{ secrets.GCP_SA_KEY != '' }}
+        if: steps.flags.outputs.has_gcp == 'true'
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
       - name: Set up gcloud SDK (only if SA key provided)
-        if: ${{ secrets.GCP_SA_KEY != '' }}
+        if: steps.flags.outputs.has_gcp == 'true'
         uses: google-github-actions/setup-gcloud@v2
 
       - name: Install Trusted Signing Dlib (optional)
-        if: ${{ secrets.TRUSTED_SIGNING_ENDPOINT != '' }}
+        if: steps.flags.outputs.has_ts == 'true'
         shell: pwsh
         run: |
           # The Dlib ships as a NuGet package. Pull it once into a
@@ -144,7 +156,7 @@ jobs:
           .\desktop\scripts\build-windows.ps1 -AppVersion $env:APP_VERSION -SkipGsm
 
       - name: Upload to digi-setu.com via gcloud SCP (only if SA key provided)
-        if: ${{ secrets.GCP_SA_KEY != '' }}
+        if: steps.flags.outputs.has_gcp == 'true'
         shell: bash
         env:
           GCP_PROJECT: ${{ secrets.GCP_PROJECT || 'digi-setu-dev' }}
@@ -175,6 +187,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - id: flags
+        shell: bash
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+        run: |
+          [[ -n "$GCP_SA_KEY" ]] && echo "has_gcp=true" >> "$GITHUB_OUTPUT" || echo "has_gcp=false" >> "$GITHUB_OUTPUT"
+
       - name: Install Tauri 2 system deps
         run: |
           sudo apt-get update
@@ -201,12 +220,12 @@ jobs:
             desktop/src-tauri/target
           key: cargo-linux-${{ hashFiles('desktop/src-tauri/Cargo.lock') }}
 
-      - if: ${{ secrets.GCP_SA_KEY != '' }}
+      - if: steps.flags.outputs.has_gcp == 'true'
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      - if: ${{ secrets.GCP_SA_KEY != '' }}
+      - if: steps.flags.outputs.has_gcp == 'true'
         uses: google-github-actions/setup-gcloud@v2
 
       - name: Stage build env (Clerk keys come straight from GHA secrets)
@@ -233,7 +252,7 @@ jobs:
           bash desktop/scripts/build-linux-inside.sh
 
       - name: Upload artefacts to digi-setu.com (only if SA key provided)
-        if: ${{ secrets.GCP_SA_KEY != '' }}
+        if: steps.flags.outputs.has_gcp == 'true'
         env:
           GCP_PROJECT: ${{ secrets.GCP_PROJECT || 'digi-setu-dev' }}
           GCP_VM:      ${{ secrets.GCP_VM      || 'digi-setu-live' }}
