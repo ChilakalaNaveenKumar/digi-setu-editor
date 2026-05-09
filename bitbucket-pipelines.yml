@@ -129,6 +129,15 @@ definitions:
           - cargo-target
           - node
         script:
+          # tzdata + a few other apt packages (libssl, dpkg-dev) try to
+          # ask debconf questions ("which timezone?") on a fresh
+          # ubuntu:22.04 image. Bitbucket runners have no TTY → the
+          # readline frontend deadlocks and the step eventually times
+          # out after 60 min. Pre-seeding both vars makes every
+          # apt-get install below fully unattended.
+          - export DEBIAN_FRONTEND=noninteractive
+          - export TZ=Etc/UTC
+          - ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
           - apt-get update -qq
           - >
             apt-get install -y --no-install-recommends
