@@ -180,6 +180,12 @@ definitions:
             done;
             { echo "PI_CLOUD_API_BASE=https://digi-setu.com"; echo "PI_RELAY_BASE=https://api.digi-setu.com"; echo "CLERK_TENANT=prod"; } >> .release-secrets.tmp.env
           - export TAURI_BUILD_ENV="$BITBUCKET_CLONE_DIR/.release-secrets.tmp.env"
+          # build-linux-inside.sh defaults WORKSPACE=/workspace because
+          # it normally runs inside our Docker linux-builder image with
+          # the repo bind-mounted there. On a Bitbucket runner the
+          # checkout lives at $BITBUCKET_CLONE_DIR instead, so point
+          # the script at it explicitly.
+          - export WORKSPACE="$BITBUCKET_CLONE_DIR"
           # AppImage stays disabled by default — Tauri downloads its own
           # linuxdeploy.AppImage which needs FUSE (not available in
           # cloud Bitbucket runners). Set LINUX_BUILD_APPIMAGE=1 in
