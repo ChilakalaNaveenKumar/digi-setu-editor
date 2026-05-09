@@ -72,6 +72,25 @@ run() {
   fi
 }
 
+# Strict host key checking on `gcloud compute ssh` defaults to `yes`,
+# which is correct for dev laptops (we never want to silently accept
+# a new host key for an existing VM — that would mean MITM). But on a
+# fresh CI runner there's no ~/.ssh/known_hosts entry yet, so the
+# first ssh call always fails with "Host key verification failed".
+# `accept-new` is the OpenSSH-blessed compromise: on first contact
+# write the host key to known_hosts (and trust GCP's metadata to be
+# the source of truth for that key), then enforce strict checking on
+# every subsequent call. Bitbucket exports CI=true, which we use as
+# the trigger; ops can also override explicitly via env var.
+SSH_STRICT="${SSH_STRICT:-${STRICT_HOST_KEY_CHECKING:-}}"
+if [[ -z "${SSH_STRICT}" ]]; then
+  if [[ -n "${CI:-}" ]]; then
+    SSH_STRICT="accept-new"
+  else
+    SSH_STRICT="yes"
+  fi
+fi
+
 ssh_remote() {
   # OS Login + project SSH keys do not populate ~/.ssh for raw `ssh
   # ubuntu@<external-ip>` — always hop through `gcloud compute ssh`.
@@ -101,7 +120,7 @@ ssh_remote() {
     gcloud compute ssh "${VM}" \
       --project "${PROJECT}" \
       --zone "${ZONE}" \
-      --strict-host-key-checking=yes \
+      --strict-host-key-checking="${SSH_STRICT}" \
       --command="echo '${enc}' | base64 -d | bash -s"
   fi
 }
@@ -111,7 +130,7 @@ scp_remote() {
   run gcloud compute scp --recurse \
     --project "${PROJECT}" \
     --zone "${ZONE}" \
-    --strict-host-key-checking=yes \
+    --strict-host-key-checking="${SSH_STRICT}" \
     "${src}" "${VM}:${dst}"
 }
 
@@ -282,7 +301,7 @@ push_frontend() {
   docker run --rm pi-frontend:${TAG} | gcloud compute ssh "${VM}" \
     --project "${PROJECT}" \
     --zone "${ZONE}" \
-    --strict-host-key-checking=yes \
+    --strict-host-key-checking="${SSH_STRICT}" \
     --command='sudo install -d -m 0755 -o root -g root /srv/pi/www && sudo find /srv/pi/www -mindepth 1 -delete && sudo tar xf - -C /srv/pi/www'
 }
 
