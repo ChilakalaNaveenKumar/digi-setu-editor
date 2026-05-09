@@ -68,10 +68,13 @@ definitions:
     cargo-git: ~/.cargo/git
     cargo-target: desktop/src-tauri/target/x86_64-unknown-linux-gnu
 
-  # The default `docker` service gets 1024 MB which is plenty for the
-  # Vite build container we run in the web-frontend step. We keep the
-  # default so the parent step (1x = 4096 MB) keeps 3072 MB for its
-  # own scripts (Bitbucket rejects the YAML otherwise).
+  services:
+    # Bumped from the default 1 GB so the docker container that runs
+    # `vite build` has enough headroom (peak ~2.5 GB on our SPA). Only
+    # safe on 2x+ steps; on 1x this trips the validator because the
+    # parent step needs >=1 GB for its own scripts.
+    docker:
+      memory: 4096
 
   steps:
     # ── Common bootstrap shared by every step that talks to GCP ────
@@ -105,6 +108,12 @@ definitions:
     - step: &web-frontend
         name: Web frontend (rebuild SPA + deploy to /srv/pi/www)
         image: google/cloud-sdk:slim
+        # Vite's "rendering chunks" pass on our 821-module SPA peaks
+        # at ~2.5 GB. With a 1x runner (4 GB total) and the default
+        # 1 GB docker service, npm build inside docker gets OOM'd
+        # (exit 137). 2x = 8 GB total → docker can have 4 GB and the
+        # step script still keeps 4 GB for itself.
+        size: 2x
         services:
           - docker
         script:
