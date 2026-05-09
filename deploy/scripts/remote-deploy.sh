@@ -77,15 +77,18 @@ run() {
 # a new host key for an existing VM — that would mean MITM). But on a
 # fresh CI runner there's no ~/.ssh/known_hosts entry yet, so the
 # first ssh call always fails with "Host key verification failed".
-# `accept-new` is the OpenSSH-blessed compromise: on first contact
-# write the host key to known_hosts (and trust GCP's metadata to be
-# the source of truth for that key), then enforce strict checking on
-# every subsequent call. Bitbucket exports CI=true, which we use as
-# the trigger; ops can also override explicitly via env var.
+#
+# gcloud's --strict-host-key-checking only accepts {ask,no,yes} —
+# it does NOT honor OpenSSH's `accept-new`. On CI we drop to `no`:
+# every build is a fresh container, and the destination is already
+# authenticated by the IAP tunnel + the CI SA's compute.osAdminLogin
+# binding (an unauthorized intermediate can't terminate IAP for our
+# project). `CI` is exported by Bitbucket / GHA / GitLab so we use
+# it as the auto-trigger; ops can override either way via env var.
 SSH_STRICT="${SSH_STRICT:-${STRICT_HOST_KEY_CHECKING:-}}"
 if [[ -z "${SSH_STRICT}" ]]; then
   if [[ -n "${CI:-}" ]]; then
-    SSH_STRICT="accept-new"
+    SSH_STRICT="no"
   else
     SSH_STRICT="yes"
   fi
