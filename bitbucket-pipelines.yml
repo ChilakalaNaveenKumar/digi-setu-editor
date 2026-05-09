@@ -264,6 +264,8 @@ definitions:
 
 pipelines:
   # Pull-requests + non-main branches: cheap typecheck only.
+  # Kept parallel because these are read-only, fast, and there's no
+  # cross-step state to corrupt.
   pull-requests:
     "**":
       - parallel:
@@ -271,21 +273,42 @@ pipelines:
           - step: *desktop-typecheck
           - step: *backend-pytest
 
-  # Push to main: rebuild + redeploy EVERYTHING in parallel,
-  # then mirror to GitHub so GHA picks up the Windows build path.
+  # Push to main: redeploy EVERYTHING sequentially.
+  #
+  # Why sequential and not parallel:
+  #   - Bitbucket charges per parallel runner-minute, so 4 steps in
+  #     parallel cost 4x runner-minutes vs sequential. Sequential
+  #     keeps us comfortably under the 3,500 min/mo plan even on
+  #     heavy days.
+  #   - Each runner is a fresh container; sequential lets one finish
+  #     and free its memory before the next starts (matters for the
+  #     2x web-frontend + 2x linux-release back-to-back).
+  #   - A failure in cloud-backend means the API is broken; you
+  #     probably don't want to also push a new SPA that talks to
+  #     the broken API. Sequential gives natural fail-fast: any
+  #     red step stops the chain.
+  #   - The build log becomes linear and readable (no interleaved
+  #     output across parallel runners).
+  #
+  # Order is cheapest → most expensive, so a config error is caught
+  # in 30 s instead of 10 min:
+  #   1. cloud-backend  (~3 min — Cloud Build runs remotely)
+  #   2. web-frontend   (~5 min — Vite + tar over SSH)
+  #   3. linux-release  (~12 min — full Tauri Rust release link)
+  #   4. github-mirror  (~10 s — git push)
   branches:
     main:
-      - parallel:
-          - step: *cloud-backend
-          - step: *web-frontend
-          - step: *linux-release
+      - step: *cloud-backend
+      - step: *web-frontend
+      - step: *linux-release
       - step: *github-mirror
 
-  # Tag push: same as main, but also fires GHA Windows + Linux jobs.
+  # Tag push: same chain as main. Pushing the tag in the mirror step
+  # additionally fires .github/workflows/release.yml on a windows-latest
+  # GHA runner which produces the .exe / .msi.
   tags:
     "v*":
-      - parallel:
-          - step: *cloud-backend
-          - step: *web-frontend
-          - step: *linux-release
+      - step: *cloud-backend
+      - step: *web-frontend
+      - step: *linux-release
       - step: *github-mirror

@@ -21,7 +21,14 @@ COPY web/frontend/ ./
 # VITE_API_BASE is unset → SPA uses the same-origin "/api" prefix,
 # which Caddy reverse-proxies to the backend. Everything stays on
 # https://digi-setu.com — no CORS, no separate API host.
-RUN npm run build
+#
+# `build:deploy` is `vite build` only (no vue-tsc). Skipping the
+# typecheck here saves ~1.5 GB of memory at peak (TypeScript holds
+# the full project AST in RAM) and ~30 s of wall time. The PR
+# pipeline still runs `npm run typecheck`, so type errors gate
+# merges — they just don't gate deploys, which is the right
+# tradeoff for a downstream-of-merge step.
+RUN npm run build:deploy
 
 # Final tiny stage that just owns the dist tree. Built once, then
 # scripts/remote-deploy.sh extracts /dist via `docker run`.
