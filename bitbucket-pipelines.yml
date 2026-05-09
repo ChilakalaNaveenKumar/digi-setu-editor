@@ -65,9 +65,10 @@ definitions:
     cargo-git: ~/.cargo/git
     cargo-target: desktop/src-tauri/target/x86_64-unknown-linux-gnu
 
-  services:
-    docker:
-      memory: 4096
+  # The default `docker` service gets 1024 MB which is plenty for the
+  # Vite build container we run in the web-frontend step. We keep the
+  # default so the parent step (1x = 4096 MB) keeps 3072 MB for its
+  # own scripts (Bitbucket rejects the YAML otherwise).
 
   steps:
     # ── Common bootstrap shared by every step that talks to GCP ────
