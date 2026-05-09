@@ -42,9 +42,11 @@
 #                           - roles/artifactregistry.writer
 #                           - roles/secretmanager.secretAccessor
 #                           - roles/iap.tunnelResourceAccessor
-#                           - roles/compute.osLogin
-#                         (run `deploy/scripts/secrets-sync.sh seed-iam`
-#                          to provision an SA with this exact role set)
+#                           - roles/compute.osAdminLogin   (sudo via OS Login)
+#                           - roles/iam.serviceAccountUser
+#                         (run `deploy/scripts/secrets-sync.sh seed-ci-sa`
+#                          once to provision an SA with this exact set
+#                          and emit a base64 key on stdout — paste below)
 #   GCP_PROJECT           digi-setu-dev
 #   GCP_VM                digi-setu-live
 #   GCP_ZONE              us-central1-a

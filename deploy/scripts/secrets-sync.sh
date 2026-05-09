@@ -233,12 +233,13 @@ seed_ci_sa() {
         roles/artifactregistry.writer
         roles/secretmanager.secretAccessor
         roles/iap.tunnelResourceAccessor
-        roles/compute.osLogin
+        # remote-deploy.sh's roll_stack step ssh'es into the VM and
+        # runs `sudo systemctl restart pi.service` + `sudo docker pull`.
+        # That requires sudo over OS Login → roles/compute.osAdminLogin
+        # (osLogin alone is read-only). The VM's PAM is configured to
+        # grant sudo to anyone with osAdminLogin.
+        roles/compute.osAdminLogin
         roles/iam.serviceAccountUser
-        # remote-deploy.sh's roll_stack step shells in via gcloud
-        # compute ssh and runs `sudo systemctl restart pi.service`.
-        # OS Login + sudo policy on the VM grants that — no extra
-        # role needed beyond compute.osLogin + the host's sudoers.
     )
     if gcloud iam service-accounts describe "${email}" --project "${PROJECT}" >/dev/null 2>&1; then
         log "service account ${email} exists; will (re)assert role bindings only"
