@@ -85,7 +85,12 @@ _MODELS: list[ModelSpec] = [
         cost=ModelCost(input=3.0, output=15.0, cache_read=0.30, cache_write=3.75),
         context_window=1_000_000,
         reasoning=True,
-        min_plan="starter",
+        # Open to every plan including Free — Sonnet is the default
+        # everywhere; we'd rather a Free user have a great first
+        # experience than push them onto Haiku to cut a few cents
+        # of compute on the trial. Free has a hard daily $-cap that
+        # protects us from runaway use.
+        min_plan="free",
         blurb="Default. Balanced quality + speed across most tasks.",
     ),
     ModelSpec(
@@ -97,7 +102,9 @@ _MODELS: list[ModelSpec] = [
         cost=ModelCost(input=5.0, output=25.0, cache_read=0.50, cache_write=6.25),
         context_window=200_000,
         reasoning=True,
-        min_plan="pro",
+        # Free can pick Opus too; the daily-$-cap on Free is the
+        # actual guardrail, not an artificial picker filter.
+        min_plan="free",
         blurb="Strongest reasoning. ~5× the cost of Sonnet — pick it when you mean it.",
     ),
     # ── Google ───────────────────────────────────────────────────
@@ -137,7 +144,7 @@ _MODELS: list[ModelSpec] = [
         cost=ModelCost(input=2.00, output=12.0, cache_read=0.20, cache_write=0.0),
         context_window=2_000_000,
         reasoning=True,
-        min_plan="starter",
+        min_plan="free",
         blurb="Google's strongest. 2M context window for whole-codebase tasks.",
     ),
     # ── Hidden / internal models ─────────────────────────────────
