@@ -392,6 +392,21 @@ roll_stack() {
   ssh_remote "set -e
 sudo test -f ${REMOTE_ROOT}/stack.env || { echo 'ERROR: ${REMOTE_ROOT}/stack.env missing — populate it before rolling' >&2; exit 1; }
 
+# Free disk before pulling. Without this, the 96 GB root partition
+# fills up after ~30 deploys (each backend image is ~3 GB and the per-
+# session image is ~3 GB, both retained as superseded layers). When the
+# disk hits 100 % the next \`docker pull\` fails mid-extract, the systemd
+# unit exits non-zero, and Bitbucket reports the pipeline as failed even
+# though the image was pushed cleanly to Artifact Registry. Pruning
+# anything not currently in use keeps the VM healthy without any human
+# intervention. \`|| true\` because prune is a maintenance op — its
+# failure should never abort an otherwise-good deploy.
+echo \"[roll] pruning old docker resources\"
+sudo docker container prune -f 2>&1 | tail -1 || true
+sudo docker image prune -af --filter until=72h 2>&1 | tail -1 || true
+sudo docker builder prune -af 2>&1 | tail -1 || true
+echo \"[roll] disk after prune: \$(df -h / | awk 'NR==2 {print \$3 \"/\" \$2 \" (\" \$5 \" used)\"}')\"
+
 # Pin BACKEND_IMAGE to the freshly-pushed tag so this rollout is
 # deterministic. Subsequent reloads can flip back to :latest if you
 # prefer rolling tags.
