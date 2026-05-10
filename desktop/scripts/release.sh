@@ -16,12 +16,14 @@
 #       macOS dock auto-downscales the single 1024px PNG and the
 #       result looks blurry. Pass --skip-icons to reuse what's on disk.
 #   4.  macOS path (when --mac or --all):
-#       a. PyInstaller sidecar
-#       b. Vite frontend dist
-#       c. tauri build --target <host arch> --bundles app
-#       d. Deep ad-hoc sign
-#       e. create-dmg with drag-to-Applications layout
-#       f. Upload to digi-setu.com/downloads/ via upload-installer.sh
+#       a. PyInstaller sidecar (host-arch frozen FastAPI)
+#       b. Vendor Node + pi-coding-agent (desktop/pi-runtime/vendor/)
+#       c. Regenerate THIRD_PARTY_LICENSES.txt
+#       d. npm install + Vite frontend dist
+#       e. tauri build --target <host arch> --bundles app
+#       f. Deep ad-hoc sign
+#       g. create-dmg with drag-to-Applications layout
+#       h. Upload to digi-setu.com/downloads/ via upload-installer.sh
 #   5.  Linux path (when --linux or --all):
 #       a. Build (or reuse) the digi-setu/linux-builder Docker image
 #       b. Run build-linux-inside.sh inside the container — fresh
@@ -273,10 +275,38 @@ build_sidecar_mac() {
     bash "${DESKTOP}/sidecar/build_sidecar.sh"
 }
 
+vendor_pi_runtime_mac() {
+    [[ ${DMG_ONLY} -eq 1 ]] && return 0
+    banner "macOS · vendor Node + pi-coding-agent"
+    # Idempotent on a dev's laptop (skips re-download if the platform's
+    # tarball already lives under desktop/pi-runtime/vendor). On a fresh
+    # CI runner this is the only step that makes pi-coding-agent + the
+    # node binary visible to Tauri's bundle.resources block.
+    bash "${DESKTOP}/pi-runtime/fetch-node.sh" --current-platform-only
+    bash "${DESKTOP}/pi-runtime/install-pi.sh"
+}
+
+regen_third_party_licenses_mac() {
+    [[ ${DMG_ONLY} -eq 1 ]] && return 0
+    banner "regenerate THIRD_PARTY_LICENSES.txt"
+    # Must run AFTER pi-runtime is vendored (so node_modules exist) and
+    # BEFORE the sidecar build (so the frozen binary picks up the file).
+    # Help → Open Source Licenses surfaces this to the user offline.
+    node "${HERE}/gen-third-party-licenses.mjs"
+}
+
 build_frontend_mac() {
     [[ ${DMG_ONLY} -eq 1 ]] && return 0
     banner "macOS · build frontend"
-    ( cd "${DESKTOP}/frontend" && npm run build )
+    # `npm install` (not `npm ci`) for forgiving behaviour on a dev's
+    # laptop where node_modules might already exist with a slightly
+    # different lockfile state. On CI the cache key is keyed off
+    # package-lock.json so this still installs from the lockfile in
+    # practice. --no-audit + --no-fund cuts ~10s of network chatter
+    # we don't care about during a release.
+    ( cd "${DESKTOP}/frontend" && \
+      npm install --no-audit --no-fund --prefer-offline && \
+      npm run build )
 }
 
 build_tauri_mac() {
@@ -288,6 +318,11 @@ build_tauri_mac() {
     # backend/.env fallback is layered below in priority — shell env
     # wins). The `|| true` keeps the trap-safe `set -e` from killing
     # us on a malformed env line; build.rs just won't see the bad var.
+    # `npm install` here picks up @tauri-apps/cli from desktop/package.json's
+    # devDependencies so `npx tauri` resolves to the workspace-pinned
+    # version. On a dev's laptop this is a no-op (~1s) because the
+    # tree is already populated; on a fresh CI runner it's the only
+    # way `npx tauri` finds the cli at all.
     # Only ask Tauri for the .app bundle. Tauri's bundle_dmg.sh has
     # been flaky (creates a corrupt DMG at random ~1 in 5 builds, see
     # https://github.com/tauri-apps/tauri/issues/3055). We hand the
@@ -295,6 +330,7 @@ build_tauri_mac() {
     # drag-to-Applications window AND deterministic exit codes.
     ( set -a; source "${ENV_TMP}" || true; set +a;
       cd "${DESKTOP}" && \
+      npm install --no-audit --no-fund --prefer-offline && \
       npx tauri build --target "${TARGET}" --bundles app )
 }
 
@@ -325,7 +361,23 @@ build_dmg() {
 
 mac_pipeline() {
     [[ ${DO_MAC} -eq 1 ]] || return 0
+    # Order matters:
+    #   1. sidecar      — PyInstaller-frozen FastAPI (host-arch).
+    #   2. pi-runtime   — vendored Node + pi-coding-agent. Must come
+    #                      before the licenses step (which scans
+    #                      node_modules) and before the Tauri build
+    #                      (whose bundle.resources block ships the
+    #                      vendor/ directory).
+    #   3. licenses     — regenerates THIRD_PARTY_LICENSES.txt that
+    #                      Help → Open Source Licenses reads.
+    #   4. frontend     — npm install + Vite build → frontend/dist.
+    #   5. tauri build  — assembles the .app from sidecar + dist + rust.
+    #   6. ad-hoc sign  — strict codesign with `-` identity so Gatekeeper
+    #                      accepts it after a right-click → Open.
+    #   7. DMG          — create-dmg gives the drag-to-Applications UX.
     build_sidecar_mac
+    vendor_pi_runtime_mac
+    regen_third_party_licenses_mac
     build_frontend_mac
     build_tauri_mac
     sign_app_mac

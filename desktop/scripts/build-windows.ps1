@@ -152,6 +152,14 @@ try {
 Log "running tauri build..."
 Push-Location $Desktop
 try {
+    # Install desktop-level deps so `npx tauri` resolves to the
+    # workspace-pinned @tauri-apps/cli (declared in
+    # desktop/package.json's devDependencies). On a dev's laptop this
+    # is a no-op; on a fresh CI runner it's the only way npx finds
+    # tauri at all (otherwise: "npm error could not determine
+    # executable to run").
+    & npm install --no-audit --no-fund --prefer-offline
+    if ($LASTEXITCODE -ne 0) { throw "desktop npm install failed" }
     & npx tauri build --target $Target --bundles nsis,msi
     if ($LASTEXITCODE -ne 0) { throw "tauri build failed" }
 } finally { Pop-Location }
