@@ -331,8 +331,15 @@ materialize_stack_env() {
     STRIPE_WEBHOOK_SECRET
   )
   local managed_str="${managed[*]}"
+  # NOTE: do NOT pass `-o root -g root` to install here. /opt/pi was
+  # already created by ensure_remote_dirs with the ssh user as owner
+  # so that subsequent `cd /opt/pi` calls in roll_stack don't trip
+  # over a 0700 root-owned dir (every CI ssh session is a fresh
+  # OS Login user that doesn't own root-only paths). install with
+  # -o would silently chown the dir to root and then roll_stack's
+  # `cd /opt/pi` dies with Permission denied.
   ssh_remote "set -euo pipefail
-sudo install -d -m 0700 -o root -g root /opt/pi
+sudo install -d -m 0755 /opt/pi
 TMP=\$(sudo mktemp /opt/pi/stack.env.new.XXXXXX)
 sudo chmod 0600 \"\${TMP}\"
 
@@ -377,14 +384,18 @@ echo '  ok — stack.env regenerated from GSM'
 roll_stack() {
   log "rolling docker compose on ${VM} (image tag ${TAG})"
   materialize_stack_env
+  # The remote bash payload below intentionally uses absolute paths
+  # everywhere instead of `cd ${REMOTE_ROOT}`. A non-root ssh user
+  # (which OS Login creates on every fresh CI session) might not be
+  # able to enter /opt/pi if its mode/owner gets reasserted to root
+  # by some other step. sudo+abspath sidesteps the issue entirely.
   ssh_remote "set -e
-cd ${REMOTE_ROOT}
-test -f ./stack.env || { echo 'ERROR: ${REMOTE_ROOT}/stack.env missing — populate it before rolling' >&2; exit 1; }
+sudo test -f ${REMOTE_ROOT}/stack.env || { echo 'ERROR: ${REMOTE_ROOT}/stack.env missing — populate it before rolling' >&2; exit 1; }
 
 # Pin BACKEND_IMAGE to the freshly-pushed tag so this rollout is
 # deterministic. Subsequent reloads can flip back to :latest if you
 # prefer rolling tags.
-sudo sed -i 's|^BACKEND_IMAGE=.*|BACKEND_IMAGE=${BACKEND_IMAGE}:${TAG}|' ./stack.env
+sudo sed -i 's|^BACKEND_IMAGE=.*|BACKEND_IMAGE=${BACKEND_IMAGE}:${TAG}|' ${REMOTE_ROOT}/stack.env
 
 # AR pull auth via the VM's attached service-account token.
 TOK=\$(curl -fsS -H 'Metadata-Flavor: Google' \\
@@ -410,9 +421,14 @@ sudo systemctl restart pi.service
 sleep 5
 sudo systemctl status --no-pager pi.service | sed -n '1,12p'
 
-# Caddyfile is bind-mounted — `up -d` does NOT detect that change on
+# Caddyfile is bind-mounted — '\''up -d'\'' does NOT detect that change on
 # its own. Reload Caddy in-place so config edits go live without
 # dropping in-flight TLS connections.
+# (Using single-quotes around 'up -d' instead of backticks — the
+#  whole heredoc is a bash double-quoted string, and backticks would
+#  get expanded as command substitution by the local shell BEFORE
+#  the payload is sent over ssh, which previously blew up with
+#  "up: command not found" on the runner.)
 if sudo docker ps --format '{{.Names}}' | grep -q '^pi-caddy$'; then
   sudo docker exec pi-caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile || \\
     sudo docker compose --env-file ${REMOTE_ROOT}/stack.env -f ${REMOTE_ROOT}/docker-compose.yml restart caddy
