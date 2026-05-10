@@ -676,12 +676,44 @@ class _ConnectHandler(socketserver.BaseRequestHandler):
         logger.info("egress-proxy: %s METADATA-FAKE %s", peer, path)
 
         if "/token" in path_l:
-            # Fake bearer that satisfies the SDK's parsing. The proxy
-            # injects the real one on the upstream Vertex request.
-            body = (
-                b'{"access_token":"fake-egress-bootstrap-token",'
-                b'"expires_in":3600,"token_type":"Bearer"}'
-            )
+            # Serve a REAL ADC bearer token here (not a placeholder).
+            # Original design: serve fake-egress-bootstrap-token, then
+            # swap on the upstream MITM. That swap breaks for SDKs that
+            # use HTTP/2 multiplexing or chunked-transfer POST bodies
+            # (Node fetch / Undici, @anthropic-ai/vertex-sdk's stream
+            # endpoint, @google/genai's :generateContent), so the SDK
+            # ends up sending the literal "fake-egress-bootstrap-token"
+            # to Vertex which returns 401 ACCESS_TOKEN_TYPE_UNSUPPORTED.
+            # By giving the SDK a real token up front we make the
+            # downstream MITM swap a no-op safety net rather than a
+            # critical correctness path, which fixes Claude streaming
+            # and Gemini sub-router calls in one shot.
+            real_token = _get_vertex_token()
+            if real_token:
+                expiry = 3600
+                # Try to compute a tighter TTL from the credential's
+                # cached expiry so the SDK doesn't keep this token past
+                # its real lifetime; fall back to 1 h if unavailable.
+                try:
+                    if _CREDS is not None and _CREDS.expiry is not None:
+                        from datetime import datetime, timezone
+                        delta = (_CREDS.expiry - datetime.now(timezone.utc).replace(tzinfo=None)).total_seconds()
+                        if 60 < delta < 3600:
+                            expiry = int(delta)
+                except Exception:
+                    pass
+                body = (
+                    b'{"access_token":"' + real_token.encode("ascii") + b'",'
+                    b'"expires_in":' + str(expiry).encode("ascii") + b',"token_type":"Bearer"}'
+                )
+            else:
+                # ADC genuinely unavailable — return the old placeholder
+                # so the SDK's bootstrap path doesn't crash, and let the
+                # downstream call surface the real error.
+                body = (
+                    b'{"access_token":"fake-egress-bootstrap-token",'
+                    b'"expires_in":60,"token_type":"Bearer"}'
+                )
             ctype = "application/json; charset=utf-8"
         elif "project-id" in path_l or "numeric-project-id" in path_l:
             project = os.environ.get("GOOGLE_CLOUD_PROJECT", "").strip().encode("utf-8")
