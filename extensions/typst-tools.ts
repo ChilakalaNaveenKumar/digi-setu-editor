@@ -416,6 +416,84 @@ export default function (pi: ExtensionAPI) {
 					isError: true,
 				};
 			}
+
+			// ── Remote mode (desktop cloud-relay path) ────────────────────────
+			// When PI_TYPST_DOCS_REMOTE_URL is set, the corpus + LLM call live
+			// on the server (see web/backend/routes/typst_docs.py). The tool
+			// becomes a thin POST so we don't ship 1-2 MB of corpus over the
+			// wire on every search_docs invocation, and Vertex's prefix cache
+			// hits across users for ~90% off + sub-second response.
+			//
+			// Set by services/relay_spawn.py on the desktop sidecar; pointed
+			// at the localhost JWT-injecting proxy which forwards to
+			// ${PI_CLOUD_API_BASE}/v1/typst/search_docs. Empty / unset on web
+			// + BYOK so the existing local-LLM path runs unchanged.
+			const remoteUrl = (process.env.PI_TYPST_DOCS_REMOTE_URL ?? "").trim();
+			if (remoteUrl) {
+				const t0Remote = Date.now();
+				try {
+					const resp = await fetch(remoteUrl, {
+						method: "POST",
+						headers: { "Content-Type": "application/json" },
+						body: JSON.stringify({
+							package: params.package,
+							query: params.query,
+						}),
+					});
+					if (!resp.ok) {
+						const bodyText = await resp.text().catch(() => "");
+						const details: SearchDetails = {
+							ok: false,
+							error: `remote search_docs failed: HTTP ${resp.status} ${bodyText.slice(0, 300)}`,
+						};
+						return {
+							content: [{
+								type: "text" as const,
+								text: `search_docs failed (${params.package}): HTTP ${resp.status}`,
+							}],
+							details,
+							isError: true,
+						};
+					}
+					const data = (await resp.json()) as {
+						answer: string;
+						cited?: string[];
+						elapsedMs?: number;
+						model?: string;
+						usage?: { input: number; output: number; cacheRead: number; cacheWrite: number };
+					};
+					const elapsed = data.elapsedMs ?? Date.now() - t0Remote;
+					const model = data.model ?? ROUTER_MODEL;
+					const usage = data.usage ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+					const tokInfo = usage.cacheRead || usage.cacheWrite
+						? `in=${usage.input} (cached_read=${usage.cacheRead}${usage.cacheWrite ? ` cached_write=${usage.cacheWrite}` : ""}) out=${usage.output}`
+						: `in=${usage.input} out=${usage.output}`;
+					const header = `Package: ${params.package} · model: ${model} · ${elapsed}ms · ${tokInfo} · remote`;
+					const details: SearchDetails = {
+						ok: true,
+						package: params.package,
+						cited: data.cited ?? [],
+						elapsedMs: elapsed,
+						usage: { ...usage, model },
+					};
+					return {
+						content: [{ type: "text" as const, text: `${header}\n\n${data.answer}` }],
+						details,
+					};
+				} catch (err: unknown) {
+					const msg = err instanceof Error ? err.message : String(err);
+					const details: SearchDetails = { ok: false, error: `remote: ${msg}` };
+					return {
+						content: [{
+							type: "text" as const,
+							text: `search_docs failed (${params.package}): ${msg}`,
+						}],
+						details,
+						isError: true,
+					};
+				}
+			}
+
 			const t0 = Date.now();
 			const dump = await loadCorpus(guidesRoot);
 			const corpusText = dump.get(params.package) ?? "";

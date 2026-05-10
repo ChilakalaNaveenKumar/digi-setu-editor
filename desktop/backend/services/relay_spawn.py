@@ -133,6 +133,14 @@ def cloud_relay_subprocess_env(spec: ModelSpec, env: dict[str, str]) -> dict[str
         # makes the wrapper prefer this env var when set.
         out["GOOGLE_VERTEX_BASE_URL"] = f"{base}/vertex/"
 
+    # Tell the typst-tools.ts extension to call the server endpoint
+    # for search_docs instead of doing the LLM call locally with a
+    # 210k-token corpus over the wire. The extension's `execute`
+    # function checks this env var and falls through to the existing
+    # local-LLM path when it's empty (BYOK mode keeps the local
+    # behaviour because the user's own keys are direct-to-provider).
+    out["PI_TYPST_DOCS_REMOTE_URL"] = f"{base}/typst/search_docs"
+
     # Strip ADC + Vertex hints. The local pi must NOT walk the ADC
     # chain — there is no Application Default Credentials file on a
     # user's laptop, and even if one existed by accident (operator

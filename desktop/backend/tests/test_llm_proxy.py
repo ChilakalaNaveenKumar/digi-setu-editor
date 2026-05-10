@@ -296,6 +296,98 @@ def test_proxy_forwards_to_cloud_relay_vertex_path(app, monkeypatch):
     )
 
 
+def test_typst_search_docs_forwards_to_cloud(app, monkeypatch):
+    """Local extension POSTs {package, query} → proxy injects the JWT
+    and forwards to ${PI_CLOUD_API_BASE}/v1/typst/search_docs verbatim."""
+    import routes.llm_proxy as _proxy
+    captured: dict = {}
+
+    monkeypatch.setattr(_proxy, "_fresh_bearer", lambda: "REAL-JWT")
+
+    class _StubResp:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+        text = "{}"
+
+        def json(self):
+            return {
+                "answer": "use canvas + draw.line",
+                "cited": ["guides/cetz/canvas.md"],
+                "elapsedMs": 1234,
+                "model": "gemini-3-flash-preview",
+                "usage": {"input": 1000, "output": 100, "cacheRead": 199000, "cacheWrite": 0},
+            }
+
+    class _StubClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return None
+
+        async def post(self, url, content=None, headers=None):
+            captured["url"] = url
+            captured["headers"] = dict(headers or {})
+            captured["content"] = content
+            return _StubResp()
+
+    monkeypatch.setattr(_proxy.httpx, "AsyncClient", _StubClient)
+
+    client = TestClient(app)
+    resp = client.post(
+        "/llm-proxy/typst/search_docs",
+        headers={"Authorization": "Bearer SMUGGLED"},
+        json={"package": "cetz", "query": "draw a curve"},
+    )
+    assert resp.status_code == 200
+    assert captured["url"] == "https://digi-setu.test/v1/typst/search_docs"
+    assert captured["headers"].get("authorization") == "Bearer REAL-JWT"
+    body = resp.json()
+    assert body["answer"] == "use canvas + draw.line"
+    assert body["cited"] == ["guides/cetz/canvas.md"]
+
+
+def test_typst_search_docs_401_when_signed_out(app, monkeypatch):
+    import routes.llm_proxy as _proxy
+    monkeypatch.setattr(_proxy, "_fresh_bearer", lambda: None)
+
+    client = TestClient(app)
+    resp = client.post(
+        "/llm-proxy/typst/search_docs",
+        json={"package": "cetz", "query": "x"},
+    )
+    assert resp.status_code == 401
+    assert resp.json().get("detail", {}).get("code") == "desktop_signin_required"
+
+
+def test_relay_spawn_sets_typst_remote_url(monkeypatch):
+    """relay_spawn must set PI_TYPST_DOCS_REMOTE_URL alongside the
+    Vertex base URL so the extension knows to use the server-side
+    search_docs path. Both providers should see this env var (gemini
+    user might still call search_docs even if their main model is
+    Anthropic, etc.)."""
+    monkeypatch.setenv("PORT", "8788")
+    from services.relay_spawn import cloud_relay_subprocess_env
+    from services.models_registry import ModelCost, ModelSpec
+
+    for provider in ("anthropic-vertex", "google-vertex"):
+        spec = ModelSpec(
+            id="m", name="m", provider=provider, pi_provider=provider,
+            family="anthropic" if "anthropic" in provider else "google",
+            cost=ModelCost(input=1.0, output=1.0, cache_read=0.0, cache_write=0.0),
+            context_window=200_000, reasoning=False, min_plan="free",
+            blurb="", hidden=False,
+        )
+        out = cloud_relay_subprocess_env(spec, {})
+        assert (
+            out["PI_TYPST_DOCS_REMOTE_URL"]
+            == "http://127.0.0.1:8788/llm-proxy/typst/search_docs"
+        ), f"missing or wrong PI_TYPST_DOCS_REMOTE_URL for {provider}"
+
+
 def test_proxy_health_reports_signin_state(app, monkeypatch):
     import routes.llm_proxy as _proxy
 

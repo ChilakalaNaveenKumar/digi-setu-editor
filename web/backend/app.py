@@ -70,6 +70,7 @@ from routes import (
     health,
     llm_relay,
     models as models_route,
+    typst_docs,
     prefs,
     sessions,
     snapshots,
@@ -161,6 +162,10 @@ def create_app() -> FastAPI:
     # gating, rate limiting, and per-call billing. See
     # routes/llm_relay.py for the full threat model.
     app.include_router(llm_relay.router)
+    # Typst docs — server-side search_docs so the corpus stays here
+    # (not on user laptops) and Vertex's prefix cache hits across
+    # users. See routes/typst_docs.py for the full rationale.
+    app.include_router(typst_docs.router)
 
     # Public (unauth) auth-side endpoints: webhook + feedback.
     # auth_webhook is Clerk-signature-verified; feedback requires a

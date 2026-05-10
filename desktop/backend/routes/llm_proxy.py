@@ -40,6 +40,10 @@ hit the cloud relay's defenses to actually spend money.
 Endpoints
 ---------
 - POST /llm-proxy/vertex/{rest:path}    Catch-all Vertex passthrough.
+- POST /llm-proxy/typst/search_docs     Server-side typst doc search
+                                         (corpus lives on the VM, not
+                                         on the laptop — see
+                                         web/backend/routes/typst_docs.py).
 - GET  /llm-proxy/_health                Sign-in probe (no auth).
 """
 
@@ -190,6 +194,58 @@ async def vertex_passthrough(rest: str, request: Request):
             media_type=media_type,
         )
 
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(upstream_url, content=body, headers=headers)
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={"code": "relay_unreachable", "message": str(exc)},
+        )
+
+    if resp.headers.get("content-type", "").startswith("application/json"):
+        try:
+            return JSONResponse(content=resp.json(), status_code=resp.status_code)
+        except ValueError:
+            pass
+    return JSONResponse(
+        content={"raw": resp.text},
+        status_code=resp.status_code,
+    )
+
+
+# ── Typst docs (server-side corpus + LLM call) ────────────────────────
+@router.post("/typst/search_docs")
+async def typst_search_docs(request: Request):
+    """Forward a search_docs JSON brief to the cloud's typst endpoint.
+
+    The local extension (extensions/typst-tools.ts) POSTs ``{package,
+    query}`` here; we inject the cached Clerk JWT and forward to
+    ``${PI_CLOUD_API_BASE}/v1/typst/search_docs``. The cloud responds
+    with ``{answer, cited, elapsedMs, model, usage}``, which we replay
+    verbatim back to the extension. Body is small (~100 bytes up,
+    ~5 KB down) — no streaming, no special handling.
+    """
+    bearer = _fresh_bearer()
+    if not bearer:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "desktop_signin_required",
+                "message": (
+                    "No active sign-in for this desktop. Open the app "
+                    "and sign in to continue."
+                ),
+            },
+        )
+
+    body = await request.body()
+    headers = _scrub_headers(dict(request.headers))
+    headers["authorization"] = f"Bearer {bearer}"
+    headers["content-type"] = headers.get("content-type") or "application/json"
+
+    upstream_url = f"{PI_CLOUD_API_BASE}/v1/typst/search_docs"
+    timeout = httpx.Timeout(connect=15.0, read=180.0, write=60.0, pool=15.0)
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(upstream_url, content=body, headers=headers)
