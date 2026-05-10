@@ -98,3 +98,61 @@ pub fn app_data_dir(app: AppHandle) -> Result<String, String> {
 pub fn open_new_window(app: AppHandle) -> Result<(), String> {
     crate::menu::open_new_window(&app).map_err(|err| err.to_string())
 }
+
+/// Force-restart the FastAPI sidecar.
+///
+/// Called from the SPA's frontend-side health watchdog when the
+/// chat WebSocket bridge can't reach the backend after exhausting
+/// its own reconnect attempts AND a direct ``GET /healthz`` probe
+/// also times out — i.e. when the user is staring at a stuck
+/// "Lost connection" banner that the WebSocket layer can't unstick.
+///
+/// Implementation: kill the current child (if alive), let the
+/// watchdog's normal "child exited" path notice and spawn a fresh
+/// sidecar. We deliberately route through the watchdog rather than
+/// calling ``spawn_sidecar`` directly so the AppState book-keeping
+/// (port update, ``backend-restarted`` emit, etc.) stays in one
+/// code path.
+///
+/// Returns Ok with the (still-old) port if a respawn is in flight;
+/// the SPA then waits for the ``backend-restarted`` event before
+/// rebinding its API base. If there's no live sidecar handle to
+/// kill we return an Err so the SPA can show a clear "couldn't
+/// restart, please reopen the app" message rather than a silent
+/// no-op.
+#[tauri::command]
+pub fn restart_sidecar(state: State<'_, AppState>) -> Result<u16, String> {
+    let port = state
+        .backend_port
+        .lock()
+        .unwrap()
+        .ok_or_else(|| "no sidecar handle to restart".to_string())?;
+
+    // Take a clone of the handle (cheap — Arc bumps), don't take()
+    // it out of AppState. The watchdog still owns its own clone and
+    // will pick up the exit. We also preserve the AppState's handle
+    // so the next .terminate() on app-exit still has something to
+    // kill if the watchdog hasn't yet replaced the child slot.
+    //
+    // Dereference the guard before .clone() — MutexGuard isn't Clone
+    // but the Option<SidecarHandle> inside it is.
+    let handle = (*state.sidecar.lock().unwrap()).clone();
+    let Some(handle) = handle else {
+        return Err("sidecar already shut down".to_string());
+    };
+
+    // Kill the child but DON'T flip the shutdown flag — we WANT
+    // the watchdog to respawn this one. ``handle.terminate()``
+    // would set ``shutdown=true`` and stop the watchdog forever,
+    // so we open the lock and kill manually.
+    if let Some(mut child) = handle.kill_child_for_restart() {
+        match child.kill() {
+            Ok(_) => log::info!("restart_sidecar: SIGKILL sent to pid={}", child.id()),
+            Err(err) => {
+                log::warn!("restart_sidecar: kill failed: {err} (assuming already dead)");
+            }
+        }
+        let _ = child.wait();
+    }
+    Ok(port)
+}

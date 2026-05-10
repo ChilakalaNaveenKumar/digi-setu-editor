@@ -427,6 +427,24 @@ export const useChatStore = defineStore("chat", () => {
     return true;
   }
 
+  /**
+   * Re-open the WS against a freshly respawned sidecar. Called by the
+   * Tauri-side watchdog handler in `main.ts` when the sidecar exits
+   * and comes back on a (potentially different) port.
+   *
+   * The flow is intentionally minimal: the API client already had its
+   * base URL rebound by `setApiBase()` BEFORE we get here, so this
+   * just needs to drop the dead bridge and re-open. We don't surface
+   * a toast — the existing chat-error banner already shows
+   * "ws_unreachable" while the sidecar is down, and replacing it
+   * with a more granular "Backend restarted, reconnecting" event
+   * would just add noise during the most-stressful 1-2 seconds.
+   */
+  function reanchorBridge(): void {
+    if (!session.value?.id) return;
+    void reconnect();
+  }
+
   // ── inbound dispatcher ──────────────────────────────────────────────
   function _dispatch(evt: RpcEvent & Record<string, unknown>): void {
     if (DEBUG_EVENTS) {
@@ -786,6 +804,7 @@ export const useChatStore = defineStore("chat", () => {
     connect,
     disconnect,
     reconnect,
+    reanchorBridge,
     sendPrompt,
     enqueueMessage,
     removeQueued,

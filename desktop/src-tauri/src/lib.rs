@@ -101,11 +101,24 @@ pub fn run() {
                         log::info!("Sidecar up on 127.0.0.1:{port}");
                         let state = app_handle.state::<AppState>();
                         *state.backend_port.lock().unwrap() = Some(port);
+                        // Clone the handle into the watchdog BEFORE
+                        // moving the original into AppState — both
+                        // references share the same child / shutdown
+                        // Arc, so .terminate() on app-exit and the
+                        // watchdog's poll see the same state.
+                        let watchdog_handle = handle.clone();
                         *state.sidecar.lock().unwrap() = Some(handle);
                         // Tell the webview the port is ready. The SPA's
                         // bootstrap listens for this event before issuing
                         // its first API call (see frontend-bridge).
                         let _ = app_handle.emit("backend-ready", port);
+                        // Continuous liveness watchdog. If the sidecar
+                        // ever exits (panic, OOM, broken pi import, OS
+                        // kill) the watchdog respawns it and emits
+                        // ``backend-restarted`` with the new port so
+                        // the SPA can rebind its API base + force
+                        // every open WS to reconnect.
+                        sidecar::spawn_watchdog(app_handle.clone(), watchdog_handle);
                     }
                     Err(err) => {
                         log::error!("Failed to spawn sidecar: {err}");
@@ -132,6 +145,7 @@ pub fn run() {
             commands::app_data_dir,
             commands::is_desktop,
             commands::open_new_window,
+            commands::restart_sidecar,
             secure_storage::secure_store_session,
             secure_storage::secure_load_session,
             secure_storage::secure_delete_session,

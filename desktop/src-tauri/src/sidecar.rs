@@ -26,10 +26,11 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 /// Window of time the sidecar gets to come up before we give up. Cold
 /// PyInstaller boot is ~1–2s on Mac, ~3s on Win — 30s is generous but
@@ -37,17 +38,32 @@ use tauri::{AppHandle, Manager};
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Cloneable so the watchdog and AppState can share the same child +
+/// shutdown state without each side maintaining its own view. Both
+/// ``child`` and ``shutdown`` are Arc-wrapped — clones are cheap and
+/// every clone observes the same underlying state.
+#[derive(Clone)]
 pub struct SidecarHandle {
     /// Wrapped in Arc<Mutex> because Tauri's WindowEvent handler runs
     /// on a different thread than the spawn task. We need Send + Sync
     /// to be allowed in `AppState` while still being able to .kill().
     child: Arc<Mutex<Option<Child>>>,
+    /// Set true on user/system-initiated termination so the watchdog
+    /// stops trying to respawn. Without this the watchdog would treat
+    /// our `terminate()` call (e.g. last window closing) as a crash and
+    /// fight us by spawning a new sidecar mid-app-shutdown.
+    shutdown: Arc<AtomicBool>,
 }
 
 impl SidecarHandle {
     /// Best-effort SIGTERM / TerminateProcess. Logs but never panics —
-    /// if the child's already gone, fine.
+    /// if the child's already gone, fine. Also flips ``shutdown`` so
+    /// the watchdog, if still running, stops respawning the child.
     pub fn terminate(&self) {
+        // Do this FIRST so the watchdog sees the shutdown flag before
+        // it observes the child's exit; otherwise there's a window
+        // where the watchdog races us and starts a respawn.
+        self.shutdown.store(true, Ordering::SeqCst);
         if let Some(mut child) = self.child.lock().unwrap().take() {
             match child.kill() {
                 Ok(_) => log::info!("Sidecar terminate signal sent (pid={})", child.id()),
@@ -55,6 +71,21 @@ impl SidecarHandle {
             }
             let _ = child.wait();
         }
+    }
+
+    /// True when the user / app shutdown sequence asked us to stop.
+    /// Watchdog reads this before each respawn attempt.
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst)
+    }
+
+    /// For ``restart_sidecar`` IPC: take the live child without flipping
+    /// the shutdown flag, so the watchdog can respawn after we kill it.
+    /// ``terminate()`` is the right call for app-exit (sets shutdown);
+    /// this method is the right call for "user asked to recover from
+    /// a stuck state, keep the watchdog active".
+    pub fn kill_child_for_restart(&self) -> Option<Child> {
+        self.child.lock().unwrap().take()
     }
 }
 
@@ -194,30 +225,51 @@ fn locate_pi_runtime(pi_vendor: &Path) -> (PathBuf, PathBuf) {
     (node_bin, pi_dir)
 }
 
-/// Where the backend should keep its registry/snapshots/chats/audit/
-/// shadow-git/everything-else.
+/// Where the backend keeps its registry/snapshots/chats/audit/
+/// shadow-git/everything-else — INCLUDING the bundled pi runtime
+/// that the sidecar self-heals on every boot (see
+/// `services.pi_integrity` on the Python side).
 ///
-/// Per product decision we put EVERYTHING under `~/.digi-setu/` (or
-/// `%USERPROFILE%\.digi-setu\` on Windows) — chats, workspaces,
-/// audits, snapshots, *and* the user-editable `.env`. One folder the
-/// user can `cd ~/.digi-setu`, back up, sync, or wipe.
+/// Resolution order:
+///   1. `DIGI_SETU_HOME` env override (tests, CI, multi-profile).
+///   2. Tauri's `app_data_dir()` — the platform-standard app-data
+///      location:
+///        macOS:   ~/Library/Application Support/com.digi-setu.desktop/
+///        Windows: %APPDATA%\Digi Setu\
+///        Linux:   ~/.local/share/digi-setu/
+///      This is what every other macOS/Windows app does, and (more
+///      importantly) it's the only folder that survives an OS upgrade
+///      reset / app reinstall on Windows without admin rights. The
+///      legacy `~/.digi-setu/` Unix-hidden folder we used to hand out
+///      breaks the Windows AppData convention and isn't visible in
+///      Finder on Mac without ⌘⇧.
+///   3. `~/.digi-setu/` legacy fallback if Tauri's helper fails (only
+///      hits in unit-test contexts where there's no real AppHandle).
 ///
-/// Rationale (vs. the OS app-data dir Tauri normally hands out):
-///   - User-discoverable. `~/Library/Application Support/...` is
-///     hidden in Finder by default; people lose their data.
-///   - Single source of truth for "your Digi Setu state". Backups,
-///     migration to a new machine, "rm everything and start over"
-///     all become a one-line operation.
-///   - Mirrors how Claude Code, Aider, fish, ssh, gnupg, npm, gh,
-///     etc. all use `~/.<tool>/`. Familiar shape.
-///
-/// Override with `DIGI_SETU_HOME` env var if you ever need to point
-/// elsewhere (handy for tests / CI / multiple-profile setups).
-fn resolve_data_root(_app: &AppHandle) -> PathBuf {
+/// Migration: the Python sidecar's `services.pi_integrity` checks
+/// for a legacy `~/.digi-setu/` on first boot and `mv`s its contents
+/// to the new path so existing chats / login / `.env` carry over
+/// without the user noticing. See that module for the full migration
+/// rules (idempotent, never overwrites a non-empty target, leaves the
+/// legacy dir as an empty marker so we don't re-migrate every boot).
+fn resolve_data_root(app: &AppHandle) -> PathBuf {
     if let Some(override_path) = std::env::var_os("DIGI_SETU_HOME") {
         return PathBuf::from(override_path);
     }
 
+    // Tauri's path manager returns the platform-standard app-data
+    // dir, derived from the bundle identifier (com.digi-setu.desktop)
+    // on macOS and the app product name on Windows / Linux. This is
+    // the canonical place for our pi-runtime + chats + workspaces.
+    if let Ok(dir) = app.path().app_data_dir() {
+        return dir;
+    }
+
+    log::warn!(
+        "app_data_dir() failed; falling back to legacy ~/.digi-setu/. \
+         pi-runtime self-heal still works but Windows users may hit \
+         this if %APPDATA% is unset."
+    );
     if let Some(home) = home_dir() {
         return home.join(".digi-setu");
     }
@@ -351,8 +403,19 @@ pub async fn spawn_sidecar(
         // Tell pi_session.py where the bundled Node + pi live so the
         // FastAPI backend can spawn `pi --mode rpc` without depending
         // on whatever Node the user happens to have on their PATH.
+        //
+        // These are the BUNDLE paths (read-only, code-signed). The
+        // sidecar's ``services.pi_integrity`` boot hook mirrors the
+        // bundle vendor dir into ``$DIGI_SETU_HOME/pi-runtime/`` and
+        // overrides these env vars to point at the writable user-
+        // folder copy before any pi process is spawned. We also pass
+        // the bundle vendor dir explicitly so integrity knows where
+        // to mirror FROM (the bundle is the source of truth — every
+        // app update brings a fresh bundle that supersedes the
+        // user-folder copy).
         .env("PI_DESKTOP_NODE_BIN", &paths.node_bin)
         .env("PI_DESKTOP_PI_DIR", &paths.pi_dir)
+        .env("PI_DESKTOP_BUNDLE_VENDOR_DIR", &paths.pi_runtime_root)
         // Default the AI's permission posture to the Cursor-style
         // approve-risky mode. The user can toggle it from the UI;
         // this is just the first-launch default.
@@ -421,13 +484,154 @@ pub async fn spawn_sidecar(
     }
 
     let child_arc = Arc::new(Mutex::new(Some(child)));
+    let shutdown = Arc::new(AtomicBool::new(false));
     let handle = SidecarHandle {
         child: child_arc.clone(),
+        shutdown: shutdown.clone(),
     };
 
     wait_for_health(port, &child_arc).await?;
 
     Ok((handle, port))
+}
+
+/// Continuous liveness watchdog. Polls the sidecar child every
+/// ``WATCHDOG_INTERVAL`` and, if the process exits unexpectedly,
+/// respawns it with exponential backoff.
+///
+/// Why we need this beyond the health-check at startup:
+///   * Long-running PyInstaller builds can OOM (especially after a
+///     leaky LLM streaming session); macOS will kill us silently.
+///   * A panicking import inside the sidecar (corrupted registry.json,
+///     missing pi-runtime, broken ~/.digi-setu/.env) takes the
+///     process down. Without a watchdog the user has to quit and
+///     reopen the .app, AND if they don't know which exact file is
+///     poisoned, even relaunching just hangs.
+///   * The OS sleep/wake transition can leave the FastAPI uvicorn
+///     event loop in a wedged state. We can't detect that here
+///     directly, but if the SPA's health watchdog escalates to
+///     ``restart_sidecar`` we at least have one place to do the
+///     respawn.
+///
+/// Backoff: ``WATCHDOG_BACKOFF_SCHEDULE`` slots, capped. After the
+/// last slot, attempts continue at the cap interval — we never give
+/// up entirely, because "give up and tell the user to reinstall"
+/// is a worse UX than "keep trying every minute, the user can quit
+/// when they're tired of waiting."
+///
+/// Emits two Tauri events the SPA listens for:
+///   * ``backend-restarting``  — sidecar exited; we're attempting to
+///                               respawn. Frontend can show a banner.
+///   * ``backend-restarted``   — new sidecar is up on the listed port.
+///                               Frontend rebinds ``_apiBase`` and
+///                               force-reconnects every WS.
+const WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
+const WATCHDOG_BACKOFF_SCHEDULE: &[u64] = &[2, 5, 10, 20, 30, 60];
+
+pub fn spawn_watchdog(app: AppHandle, sidecar_handle: SidecarHandle) {
+    tauri::async_runtime::spawn(async move {
+        watchdog_loop(app, sidecar_handle).await;
+    });
+}
+
+async fn watchdog_loop(app: AppHandle, handle: SidecarHandle) {
+    loop {
+        tokio::time::sleep(WATCHDOG_INTERVAL).await;
+
+        // Bail if shutdown started — happens right before .terminate()
+        // returns control to the app's WindowEvent handler.
+        if handle.is_shutting_down() {
+            log::info!("Watchdog: shutdown flag set, exiting");
+            return;
+        }
+
+        // Snapshot the child's status without holding the lock across
+        // the .await below. If it exited, we surface the exit code
+        // (useful for debugging crash loops).
+        let exit_status = {
+            let mut guard = handle.child.lock().unwrap();
+            match guard.as_mut() {
+                Some(c) => match c.try_wait() {
+                    Ok(Some(status)) => Some(status),
+                    Ok(None) => continue, // still running
+                    Err(err) => {
+                        log::warn!("Watchdog: try_wait failed: {err}");
+                        continue;
+                    }
+                },
+                None => {
+                    // .terminate() took the child but didn't flip the
+                    // shutdown flag in time? Defensive — treat as
+                    // shutdown and exit.
+                    log::warn!("Watchdog: child slot empty without shutdown flag");
+                    return;
+                }
+            }
+        };
+
+        let Some(status) = exit_status else { continue };
+        log::warn!(
+            "Watchdog: sidecar exited with status {:?}; respawning",
+            status.code()
+        );
+        let _ = app.emit("backend-restarting", status.code().unwrap_or(-1));
+
+        // Drop the dead child handle so the next .kill_orphan_sidecars
+        // sweep doesn't double-kill it.
+        {
+            let mut guard = handle.child.lock().unwrap();
+            *guard = None;
+        }
+
+        // Respawn with backoff. We DON'T re-create the SidecarHandle —
+        // the existing one's child slot gets refilled. This way the
+        // outer AppState reference (held by `terminate()` on shutdown)
+        // still points at the live process.
+        let mut attempt: usize = 0;
+        loop {
+            if handle.is_shutting_down() {
+                return;
+            }
+
+            match spawn_sidecar(&app).await {
+                Ok((new_handle, new_port)) => {
+                    log::info!("Watchdog: respawned sidecar on port {new_port}");
+                    // Move the new child + shutdown flag into the live
+                    // handle. We keep the original `shutdown` Arc so
+                    // any outstanding callers of `is_shutting_down`
+                    // continue to see the same state.
+                    {
+                        let mut guard = handle.child.lock().unwrap();
+                        *guard = std::mem::replace(
+                            &mut *new_handle.child.lock().unwrap(),
+                            None,
+                        );
+                    }
+
+                    // Update AppState.backend_port so future
+                    // `get_backend_port` IPC calls return the new port.
+                    let state = app.state::<crate::AppState>();
+                    *state.backend_port.lock().unwrap() = Some(new_port);
+
+                    let _ = app.emit("backend-restarted", new_port);
+                    break;
+                }
+                Err(err) => {
+                    let slot = WATCHDOG_BACKOFF_SCHEDULE
+                        .get(attempt)
+                        .copied()
+                        .unwrap_or(*WATCHDOG_BACKOFF_SCHEDULE.last().unwrap());
+                    log::error!(
+                        "Watchdog: respawn attempt {attempt} failed: {err} \
+                         (next attempt in {slot}s)"
+                    );
+                    let _ = app.emit("backend-restart-failed", err.to_string());
+                    attempt = attempt.saturating_add(1);
+                    tokio::time::sleep(Duration::from_secs(slot)).await;
+                }
+            }
+        }
+    }
 }
 
 fn pump<R: std::io::Read>(stream: &'static str, mut reader: R) {

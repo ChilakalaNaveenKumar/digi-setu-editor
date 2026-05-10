@@ -12,7 +12,11 @@ import {
   restoreDesktopSession,
 } from "./lib/desktop-auth";
 import { installMenuBridge } from "./lib/menu-bridge";
-import { isDesktop, waitForBackend } from "./lib/native-bridge";
+import {
+  isDesktop,
+  onBackendLifecycle,
+  waitForBackend,
+} from "./lib/native-bridge";
 import { useConfigStore } from "./stores/config";
 import { useAuthStore } from "./stores/auth";
 import { i18n, bootLocale } from "./i18n";
@@ -137,6 +141,40 @@ async function boot(): Promise<void> {
     // events and translates them into router pushes / store calls so
     // the same menu works no matter which view the user is in.
     void installMenuBridge(router);
+
+    // Sidecar self-heal: subscribe to the watchdog's lifecycle events
+    // BEFORE the SPA opens any WebSockets so the very first crash
+    // is observable. The handler:
+    //   * On `restarted`, rebinds the API base to the new port and
+    //     forces the chat bridge (if any) to reconnect against it.
+    //   * On `restarting` / `restartFailed`, only logs — the SPA's
+    //     existing connection-error banner already covers the user-
+    //     visible state, no need for a duplicate toast.
+    // See desktop/src-tauri/src/sidecar.rs#watchdog_loop for the
+    // backoff schedule.
+    void onBackendLifecycle((event) => {
+      if (event.kind === "restarted") {
+        console.info(
+          `[boot] sidecar respawned on port ${event.port} — rebinding API base`,
+        );
+        setApiBase(`http://127.0.0.1:${event.port}`);
+        // Re-anchor any open chat WebSocket against the new port.
+        // We import on demand so the listener costs nothing on web.
+        void import("./stores/chat").then(({ useChatStore }) => {
+          try {
+            useChatStore().reanchorBridge();
+          } catch (exc) {
+            console.warn("[boot] reanchorBridge failed", exc);
+          }
+        });
+      } else if (event.kind === "restarting") {
+        console.warn(
+          `[boot] sidecar exited (code ${event.previousExitCode}); watchdog respawning`,
+        );
+      } else {
+        console.warn(`[boot] sidecar respawn attempt failed: ${event.error}`);
+      }
+    });
 
     // Wire the digi-setu:// deep-link handler. Auth + billing
     // callbacks from the system browser come through here.

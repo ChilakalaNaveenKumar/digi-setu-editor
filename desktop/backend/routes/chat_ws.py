@@ -1085,6 +1085,21 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
             # bridge handles 4410 by reconnecting automatically (see
             # ws/chat-bridge.ts) so the user can keep chatting without
             # an extra click.
+            # Client heartbeat. The SPA's chat-bridge sends
+            # `{type:"ping", t:<ms>}` every 25s; missing pong = the
+            # bridge force-closes and reconnects with backoff. We
+            # answer immediately so the wake-from-sleep path works
+            # (see desktop/frontend/src/ws/chat-bridge.ts for the
+            # full rationale; this matches web/backend/routes/chat_ws.py).
+            if command.get("type") == "ping":
+                try:
+                    await ws.send_json(
+                        {"type": "pong", "t": command.get("t")}
+                    )
+                except Exception:
+                    pass
+                continue
+
             if command.get("type") == "abort":
                 aborted["flag"] = True
                 # User-initiated stop is not really an error — log it

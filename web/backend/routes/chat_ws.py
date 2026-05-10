@@ -1073,6 +1073,23 @@ async def run_session_loop(
             # bridge handles 4410 by reconnecting automatically (see
             # ws/chat-bridge.ts) so the user can keep chatting without
             # an extra click.
+            # Client heartbeat. The SPA's chat-bridge sends
+            # `{type:"ping", t:<ms>}` every 25s and treats a missing
+            # pong as "socket is dead" -> auto-reconnect. We reply
+            # immediately so the wake-from-sleep / NAT-rebind path
+            # works correctly (see desktop/frontend/src/ws/chat-
+            # bridge.ts for the full rationale on why browser-side
+            # pings are necessary even though RFC 6455 leaves it to
+            # the server). No-op if the SPA never sends one.
+            if command.get("type") == "ping":
+                try:
+                    await ws.send_json(
+                        {"type": "pong", "t": command.get("t")}
+                    )
+                except Exception:
+                    pass
+                continue
+
             if command.get("type") == "abort":
                 aborted["flag"] = True
                 log_error(

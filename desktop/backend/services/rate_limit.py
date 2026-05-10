@@ -57,18 +57,63 @@ def _int_env(name: str, default: int) -> int:
 # Capacity is the burst the user can do back-to-back; refill_per_second
 # is the steady-state allowance once the burst is spent.
 #
-# Defaults err on the generous side for the early users — we'd rather
-# be too lax than scare off a legitimate power user. Crank them down
-# if abuse shows up in /api/usage.
+# Why connection-shaped buckets (ws.connect / pi.spawn) are NOT
+# rate-limited on desktop — and even on web are very generous:
+#
+#   The user doesn't choose to "reconnect", the SYSTEM does:
+#     * laptop sleep/wake breaks the TCP socket → bridge reconnects
+#     * NAT idle timeout drops the socket   → bridge reconnects
+#     * our own sidecar watchdog respawns   → bridge reconnects
+#     * the user closes their laptop lid for an hour → reconnects
+#   None of those are actions the user can throttle. Charging a
+#   token bucket against them just turns a transient network
+#   condition into a "you're connecting too fast" error wall the
+#   user has no way to clear without waiting out a refill window.
+#
+#   The right place to rate-limit is the ACTUAL user action:
+#   sending a prompt (`chat.message`). That bucket stays tight.
+#
+# Defaults are set so a real user never hits ``ws.connect`` /
+# ``pi.spawn`` in the course of normal use, even with hourly sleep
+# cycles or our own respawn loop. Operators worried about abuse
+# can crank them down via env. Setting capacity=0 disables a
+# bucket entirely (already-supported in `_bucket()`).
+def _is_desktop_mode() -> bool:
+    return os.environ.get("PI_MODE", "web").strip().lower() == "desktop"
+
+
+# WS upgrades. Each reconnect (sleep/wake, watchdog respawn) costs
+# one token, so capacity must comfortably cover the worst-case
+# reconnect storm. On desktop the limit is effectively off (1000
+# capacity, 60/sec refill) — desktop is single-user so there's
+# nothing to abuse. On web we keep a healthy ceiling (200 burst,
+# 60/min refill) so a panicking SPA can't DoS the upgrade path.
+_WS_CONNECT_DEFAULT_CAP = 1000 if _is_desktop_mode() else 200
+_WS_CONNECT_DEFAULT_RATE = 60 if _is_desktop_mode() else 60  # per minute
+
+# Pi subprocess spawn — was the real culprit behind "you're
+# connecting too fast" loops. Each reconnect spawns one fresh pi.
+# Old default was 10 cap / 1 per minute refill — a user with a
+# laggy network or a sleeping laptop blew through that in a few
+# cycles. Bump WAY up. On desktop, effectively disabled. On web,
+# 200 burst / 60 per minute refill (3.3/sec) — pi spawn really
+# is more expensive than a WS open so we keep SOMETHING in place
+# to bound damage from a malicious tight loop on the public
+# endpoint, but the real-user reconnect path never trips it.
+_PI_SPAWN_DEFAULT_CAP = 1000 if _is_desktop_mode() else 200
+_PI_SPAWN_DEFAULT_RATE = 60 if _is_desktop_mode() else 60  # per minute
+
 _BUCKETS: dict[str, tuple[int, float]] = {
-    # WebSocket upgrades (one per chat tab open)
-    "ws.connect":  (_int_env("RL_WS_CONNECT_CAPACITY", 30),
-                    _int_env("RL_WS_CONNECT_PER_MIN", 60) / 60.0),
-    # New pi subprocess spawn — far costlier than a WS open (forks
-    # node + loads the model client + warms up MCP servers).
-    "pi.spawn":    (_int_env("RL_PI_SPAWN_CAPACITY", 10),
-                    _int_env("RL_PI_SPAWN_PER_HOUR", 60) / 3600.0),
-    # User prompts within a session.
+    # WebSocket upgrades. See the long comment above for rationale —
+    # this is a connection mechanic, not a user action.
+    "ws.connect":  (_int_env("RL_WS_CONNECT_CAPACITY", _WS_CONNECT_DEFAULT_CAP),
+                    _int_env("RL_WS_CONNECT_PER_MIN", _WS_CONNECT_DEFAULT_RATE) / 60.0),
+    # Pi subprocess spawn — see comment above. Was the choke point
+    # producing 4429 close codes on otherwise-healthy reconnects.
+    "pi.spawn":    (_int_env("RL_PI_SPAWN_CAPACITY", _PI_SPAWN_DEFAULT_CAP),
+                    _int_env("RL_PI_SPAWN_PER_MIN", _PI_SPAWN_DEFAULT_RATE) / 60.0),
+    # User prompts within a session — THIS is the real "user action"
+    # bucket. Stays as-is (20 burst, 30/min refill).
     "chat.message": (_int_env("RL_CHAT_MSG_CAPACITY", 20),
                      _int_env("RL_CHAT_MSG_PER_MIN", 30) / 60.0),
     # Feedback submissions (anti-spam).

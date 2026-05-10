@@ -126,27 +126,86 @@ class Registry:
 
     # ── persistence ────────────────────────────────────────────────────────
     def _load(self) -> dict[str, Any]:
+        """Load registry.json with defence-in-depth against corruption.
+
+        Failure modes we handle:
+          * file missing            → start empty (first launch).
+          * unreadable file         → quarantine + start empty.
+          * malformed JSON          → quarantine + start empty.
+          * valid JSON, wrong shape → quarantine + start empty.
+
+        Quarantine: the original file is renamed to
+        ``registry.json.corrupt-<utc-iso>.bak`` next to the canonical
+        path. We DON'T silently delete it — a user with an unrecoverable
+        file is going to want to inspect what went wrong, and "where
+        did all my chats go" is the kind of escalation that needs a
+        forensics trail. We never auto-restore from the .bak; that's
+        a manual operation by the user (or by us via support).
+
+        Why this matters for self-heal: without the quarantine step,
+        a corrupt registry would crash the sidecar on every boot —
+        the watchdog would respawn it into the same crash, the user
+        would see an endless "Lost connection" loop, and there'd be
+        no obvious way out. With the quarantine, the sidecar boots
+        cleanly into an empty registry; the user signs in again and
+        the app is functional. They can manually copy data back from
+        the .bak if they need to.
+        """
         if not REGISTRY_PATH.exists():
             return {"workspaces": {}, "sessions": {}}
         try:
             with REGISTRY_PATH.open("r", encoding="utf-8") as f:
                 raw = json.load(f)
         except (OSError, json.JSONDecodeError) as exc:
-            print(
-                f"[registry] WARN: registry.json unreadable ({exc}); starting empty",
-                file=sys.stderr,
+            self._quarantine_registry(exc)
+            return {"workspaces": {}, "sessions": {}}
+        if not isinstance(raw, dict):
+            self._quarantine_registry(
+                ValueError(f"top-level JSON is {type(raw).__name__}, expected object")
             )
             return {"workspaces": {}, "sessions": {}}
         raw.setdefault("workspaces", {})
         raw.setdefault("sessions", {})
+        # Defence-in-depth: each top-level slot must be a dict. A
+        # corrupt registry where workspaces is a list (we've seen this
+        # from manual edits) would otherwise blow up the first time
+        # someone does `raw["workspaces"][wsid] = …`.
+        if not isinstance(raw["workspaces"], dict):
+            raw["workspaces"] = {}
+        if not isinstance(raw["sessions"], dict):
+            raw["sessions"] = {}
         # Backfill owner_user_id on any pre-auth workspace records. Without
         # this every existing dev workspace would 404 after the auth wiring
         # lands. Stamping with DEV_USER_ID keeps the dev loop seamless and
         # is harmless in prod (a fresh prod registry has no rows to migrate).
         for rec in raw["workspaces"].values():
-            if not rec.get("owner_user_id"):
+            if isinstance(rec, dict) and not rec.get("owner_user_id"):
                 rec["owner_user_id"] = DEV_USER_ID
         return raw
+
+    @staticmethod
+    def _quarantine_registry(reason: BaseException) -> None:
+        """Rename ``REGISTRY_PATH`` out of the way so the next boot
+        starts fresh. ``reason`` is logged but never raised — boot
+        must succeed even if quarantine itself fails."""
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        backup = REGISTRY_PATH.with_suffix(f".json.corrupt-{ts}.bak")
+        try:
+            REGISTRY_PATH.rename(backup)
+            print(
+                f"[registry] WARN: registry.json was corrupt ({reason}); "
+                f"quarantined to {backup.name} and starting empty. "
+                f"Manual recovery is possible by inspecting the .bak.",
+                file=sys.stderr,
+            )
+        except OSError as move_exc:
+            print(
+                f"[registry] ERROR: registry.json was corrupt ({reason}) "
+                f"AND could not be quarantined ({move_exc}); proceeding "
+                f"with an in-memory empty registry only. The next "
+                f"successful write will overwrite the bad file.",
+                file=sys.stderr,
+            )
 
     def _flush(self) -> None:
         """Atomic write: temp file + rename. Caller must hold _sync_lock."""

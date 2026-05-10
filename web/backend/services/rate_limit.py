@@ -57,17 +57,38 @@ def _int_env(name: str, default: int) -> int:
 # Capacity is the burst the user can do back-to-back; refill_per_second
 # is the steady-state allowance once the burst is spent.
 #
-# Defaults err on the generous side for the early users — we'd rather
-# be too lax than scare off a legitimate power user. Crank them down
-# if abuse shows up in /api/usage.
+# A note on connection-shaped buckets vs user-action buckets:
+#
+#   ws.connect / pi.spawn fire on EVERY socket reconnect — laptop
+#   sleep/wake, NAT idle timeout, network blip, our own watchdog
+#   respawn on the desktop, etc. None of those are user actions and
+#   none of them are something the user can throttle by "trying
+#   again later". Charging a tight token bucket against them just
+#   converts a transient network blip into a "you're connecting too
+#   fast" error wall.
+#
+#   The right place to shape user behaviour is the bucket the user
+#   actually drives: chat.message (sending a prompt). That stays at
+#   20 burst / 30 per minute.
+#
+# Web is multi-tenant so we keep these buckets in place as a DoS
+# brake (a malicious script could open WS upgrades in a tight loop
+# from a public endpoint), but the ceilings are now high enough that
+# real reconnect storms — even from a tab-hoarder coming back from
+# overnight sleep — never trip them.
 _BUCKETS: dict[str, tuple[int, float]] = {
-    # WebSocket upgrades (one per chat tab open)
-    "ws.connect":  (_int_env("RL_WS_CONNECT_CAPACITY", 30),
+    # WebSocket upgrades. Bumped from 30 cap / 1 per sec refill to
+    # 200 / 1 per sec — comfortably absorbs a 50-tab user reconnecting
+    # all at once, while still bounding a malicious open/close loop.
+    "ws.connect":  (_int_env("RL_WS_CONNECT_CAPACITY", 200),
                     _int_env("RL_WS_CONNECT_PER_MIN", 60) / 60.0),
-    # New pi subprocess spawn — far costlier than a WS open (forks
-    # node + loads the model client + warms up MCP servers).
-    "pi.spawn":    (_int_env("RL_PI_SPAWN_CAPACITY", 10),
-                    _int_env("RL_PI_SPAWN_PER_HOUR", 60) / 3600.0),
+    # New pi subprocess spawn. The OLD limit (10 cap / 1 per minute
+    # refill) was the actual cause of the "you're connecting too fast"
+    # close codes users saw after a few sleep/wake cycles. Bumped to
+    # 200 cap / 1 per sec refill — still enough to make a deliberate
+    # spawn-flood expensive, but invisible to real users.
+    "pi.spawn":    (_int_env("RL_PI_SPAWN_CAPACITY", 200),
+                    _int_env("RL_PI_SPAWN_PER_MIN", 60) / 60.0),
     # User prompts within a session.
     "chat.message": (_int_env("RL_CHAT_MSG_CAPACITY", 20),
                      _int_env("RL_CHAT_MSG_PER_MIN", 30) / 60.0),

@@ -171,3 +171,83 @@ export async function waitForBackend(): Promise<number | null> {
     return null;
   }
 }
+
+/** Lifecycle event for the sidecar watchdog. */
+export type BackendLifecycleEvent =
+  | { kind: "restarting"; previousExitCode: number }
+  | { kind: "restarted"; port: number }
+  | { kind: "restartFailed"; error: string };
+
+export type BackendLifecycleHandler = (event: BackendLifecycleEvent) => void;
+
+/**
+ * Subscribe to sidecar lifecycle events emitted by the Tauri-side
+ * watchdog (see `desktop/src-tauri/src/sidecar.rs#watchdog_loop`).
+ *
+ * The watchdog runs continuously after boot and respawns the
+ * FastAPI sidecar if it exits unexpectedly (panic, OOM, OS-killed,
+ * stuck event loop). Each respawn cycle fires three events in
+ * order:
+ *
+ *   - `restarting`     — sidecar exited, respawn attempt starting.
+ *                        The SPA should show "Backend restarting…".
+ *   - `restarted`      — new sidecar is up on `port`. The SPA must
+ *                        rebind its API base AND force-reconnect every
+ *                        active WebSocket bridge against the new port.
+ *   - `restartFailed`  — a single respawn attempt failed (e.g. port
+ *                        couldn't be allocated). The watchdog will
+ *                        keep trying with backoff; this event is
+ *                        informational so the SPA can surface "still
+ *                        trying…" if the recovery is slow.
+ *
+ * In web mode this is a no-op (web has no sidecar).
+ */
+export async function onBackendLifecycle(
+  handler: BackendLifecycleHandler,
+): Promise<() => void> {
+  if (!isDesktop()) return () => {};
+  try {
+    const { listen } = await import("@tauri-apps/api/event");
+    const off1 = await listen<number>("backend-restarting", (event) => {
+      handler({ kind: "restarting", previousExitCode: event.payload });
+    });
+    const off2 = await listen<number>("backend-restarted", (event) => {
+      handler({ kind: "restarted", port: event.payload });
+    });
+    const off3 = await listen<string>("backend-restart-failed", (event) => {
+      handler({ kind: "restartFailed", error: event.payload });
+    });
+    return () => {
+      off1();
+      off2();
+      off3();
+    };
+  } catch (err) {
+    console.error("onBackendLifecycle subscribe failed:", err);
+    return () => {};
+  }
+}
+
+/**
+ * Force-restart the sidecar. The frontend calls this only as a
+ * last resort, after the chat WS bridge gave up its own reconnect
+ * loop AND a direct `GET /healthz` probe also timed out.
+ *
+ * Returns the (still-old) port the sidecar is currently running on,
+ * which becomes invalid the moment the watchdog fires its respawn.
+ * Callers should NOT use the return value to make API calls — wait
+ * for the `backend-restarted` lifecycle event and read the new port
+ * from there.
+ *
+ * In web mode this is a no-op (no sidecar to restart).
+ */
+export async function restartSidecar(): Promise<number | null> {
+  if (!isDesktop()) return null;
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    return await invoke<number>("restart_sidecar");
+  } catch (err) {
+    console.error("restartSidecar failed:", err);
+    return null;
+  }
+}
