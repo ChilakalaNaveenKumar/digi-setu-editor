@@ -3,7 +3,7 @@
  * accept `wsid` first; callers pass the active workspace from the store.
  */
 
-import { apiDelete, apiJson, apiPost, getApiBase } from "./client";
+import { apiDelete, apiJson, apiPost, authBlobUrl, downloadAuthed, getApiBase } from "./client";
 import type { FileContent, FileEntry } from "./types";
 
 const _ws = (wsid: string, suffix: string) =>
@@ -38,6 +38,47 @@ export function readFile(wsid: string, path: string): Promise<FileContent> {
  */
 export function rawFileUrl(wsid: string, path: string): string {
   return `${getApiBase()}${_ws(wsid, `/files/raw?path=${encodeURIComponent(path)}`)}`;
+}
+
+/**
+ * Auth-aware preview URL. Fetches `/files/raw` with the Bearer token,
+ * wraps the response Blob in `URL.createObjectURL()`. Used for elements
+ * that can't carry custom headers (`<iframe>`, `<audio>`, `<video>`).
+ *
+ * In desktop mode the sidecar is on a localhost port without strict auth
+ * (Clerk is bypassed when CLERK_SECRET_KEY is unset), so this still
+ * works there even if the auth header is empty — the relative path goes
+ * through `_request()` which `_absolutize`s it to the sidecar.
+ *
+ * Caller MUST `URL.revokeObjectURL()` when the preview unmounts.
+ */
+export function rawFileBlobUrl(wsid: string, path: string): Promise<string> {
+  return authBlobUrl(_ws(wsid, `/files/raw?path=${encodeURIComponent(path)}`));
+}
+
+/**
+ * Trigger a browser download of a workspace file with auth. Same behaviour
+ * as the web edition; on desktop the Save-As dialog is rendered by the
+ * Tauri webview which forwards to the OS file picker.
+ */
+export function downloadFile(wsid: string, path: string): Promise<void> {
+  return downloadAuthed(
+    _ws(wsid, `/files/raw?path=${encodeURIComponent(path)}&download=1`),
+    path.split("/").pop() || "file"
+  );
+}
+
+/**
+ * Markdown preview for office documents (docx/xlsx/pptx/csv/eml/...).
+ * Backend runs Microsoft's markitdown server-side and returns the
+ * markdown string for the frontend to render with the chat-message
+ * markdown renderer.
+ */
+export function previewMarkdown(
+  wsid: string,
+  path: string
+): Promise<{ path: string; markdown: string | null; error: string | null; cached: boolean }> {
+  return apiJson(_ws(wsid, `/files/preview-md?path=${encodeURIComponent(path)}`));
 }
 
 export function writeFile(

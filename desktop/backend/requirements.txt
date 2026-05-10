@@ -33,5 +33,14 @@ google-auth==2.42.1
 # proxy.
 httpx==0.28.1
 
+# Office / PDF → Markdown extraction for the editor preview pane and the
+# pi-coding-agent read-binary tool. We pin a narrow set of extras to keep
+# the PyInstaller bundle manageable: ~30 MB without audio-transcription
+# or youtube extras. The desktop sidecar's PyInstaller spec must add the
+# `markitdown` hidden imports — see desktop/sidecar/build_sidecar.py.
+# Soft-imported in services/binary_extract.py so old desktop builds that
+# pre-date this dependency keep working (just without office preview).
+markitdown[pdf,docx,pptx,xlsx,xls,outlook]==0.1.5
+
 # Test runner. Only needed for `pytest`; not pulled into the prod image.
 pytest==9.0.3

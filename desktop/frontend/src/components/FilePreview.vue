@@ -1,6 +1,7 @@
 <!--
   FilePreview — non-text file viewer used by EditorPane when the open file
-  is an image, PDF, SVG, audio or video.
+  is an image, PDF, SVG, audio, video, or office document (docx / xlsx /
+  pptx / csv / etc., previewed as Markdown via markitdown).
 
   Image / SVG → wrapped in a `panzoom` instance (anvaka/panzoom):
                   · Trackpad pinch-zoom (Mac touchpad gestures)
@@ -15,18 +16,23 @@
   PDF        → <iframe> using the browser's built-in PDF.js viewer. Native
                 pinch-to-zoom and Ctrl/⌘+wheel zoom inside the iframe work
                 via the browser's PDF UI — no custom code can do better.
-  Audio      → <audio controls>
-  Video      → <video controls>
-
-  All previews fetch via /api/workspaces/{wsid}/files/raw which streams with
-  the right Content-Type — nothing is read into JS memory. The store builds
-  the URL via `rawFileUrl()` so the active workspace id stays implicit.
+                The src is a `blob:` URL produced by `rawFileBlobUrl()`
+                because <iframe> can't carry an Authorization header and
+                the backend's /files/raw is auth-gated; without the blob
+                detour the user sees "refused to connect".
+  Audio      → <audio controls> using a blob: URL (same rationale).
+  Video      → <video controls> using a blob: URL.
+  Office     → fetched as Markdown via `/files/preview-md`, rendered with
+                the same markdown-it pipeline as chat messages.
 -->
+
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { Icon } from "@iconify/vue";
 import panzoom, { type PanZoom } from "panzoom";
 
+import { downloadFile, previewMarkdown, rawFileBlobUrl } from "../api/files";
+import { renderMarkdown } from "../lib/markdown";
 import { useUiStore } from "../stores/ui";
 import { useWorkspaceStore } from "../stores/workspace";
 
@@ -34,7 +40,7 @@ import AnnotateOverlay from "./AnnotateOverlay.vue";
 
 const props = defineProps<{
   path: string;
-  kind: "image" | "pdf" | "svg" | "audio" | "video";
+  kind: "image" | "pdf" | "svg" | "audio" | "video" | "office";
   /** For SVG: when true we're showing source code, not the image. */
   showAsCode?: boolean;
 }>();
@@ -53,7 +59,104 @@ watch(
   () => props.path,
   () => (bust.value = Date.now()),
 );
+// Plain (relative) URL — used by `<img>` for image / svg previews. Images
+// inherit the page's auth context (cookie or Clerk same-origin), and we
+// already pass through any errors via the panzoom error handler. The
+// iframe / audio / video paths use blobUrl below instead because they
+// can't carry custom headers.
 const rawUrl = computed(() => `${workspace.rawFileUrl(props.path)}&t=${bust.value}`);
+
+// ── Auth'd blob URL for iframe / audio / video ────────────────────────
+//
+// Why this exists:
+//   <iframe>, <audio>, <video> set their `src` directly and the browser
+//   issues a plain GET for that URL. We can't attach an Authorization
+//   header that way, so the backend's `/files/raw` endpoint (which is
+//   auth-gated) returns 401 — and the browser surfaces that as
+//   "digi-setu.com refused to connect" or a blank PDF area.
+//
+// Fix:
+//   For these three kinds, fetch the bytes via the auth'd `apiJson`
+//   pipeline, wrap the response Blob in `URL.createObjectURL()`, and
+//   feed the resulting `blob:` URL into the element's src. That URL
+//   only exists in this tab's memory, doesn't leak the token, and the
+//   browser can render it natively.
+//
+// Lifecycle:
+//   We `URL.revokeObjectURL()` the previous blob whenever the file path
+//   changes, when toggling between SVG-as-code and SVG-rendered, and
+//   on component unmount, so the underlying Blob can be GC'd.
+const blobUrl = ref<string | null>(null);
+const blobLoading = ref(false);
+const blobError = ref<string | null>(null);
+let _activeBlobUrl: string | null = null;
+
+function _revokeActiveBlob(): void {
+  if (_activeBlobUrl) {
+    URL.revokeObjectURL(_activeBlobUrl);
+    _activeBlobUrl = null;
+  }
+}
+
+async function _refreshBlobUrl(): Promise<void> {
+  if (!workspace.activeId) return;
+  // Only PDF / audio / video need the blob route; image and SVG render
+  // fine via the relative URL because <img> isn't picky about CORS/auth
+  // when same-origin.
+  if (props.kind !== "pdf" && props.kind !== "audio" && props.kind !== "video") {
+    _revokeActiveBlob();
+    blobUrl.value = null;
+    return;
+  }
+  blobLoading.value = true;
+  blobError.value = null;
+  try {
+    const url = await rawFileBlobUrl(workspace.activeId, props.path);
+    _revokeActiveBlob();
+    _activeBlobUrl = url;
+    blobUrl.value = url;
+  } catch (exc) {
+    blobError.value = exc instanceof Error ? exc.message : String(exc);
+    blobUrl.value = null;
+  } finally {
+    blobLoading.value = false;
+  }
+}
+
+// ── Office: server-side markitdown → Markdown → render with chat MD lib ─
+const officeMarkdown = ref<string | null>(null);
+const officeError = ref<string | null>(null);
+const officeLoading = ref(false);
+const officeFromCache = ref(false);
+const officeRenderedHtml = computed(() =>
+  officeMarkdown.value ? renderMarkdown(officeMarkdown.value) : ""
+);
+
+async function _refreshOffice(): Promise<void> {
+  if (props.kind !== "office") {
+    officeMarkdown.value = null;
+    officeError.value = null;
+    return;
+  }
+  if (!workspace.activeId) return;
+  officeLoading.value = true;
+  officeError.value = null;
+  officeMarkdown.value = null;
+  officeFromCache.value = false;
+  try {
+    const res = await previewMarkdown(workspace.activeId, props.path);
+    if (res.error) {
+      officeError.value = res.error;
+    } else {
+      officeMarkdown.value = res.markdown;
+      officeFromCache.value = res.cached;
+    }
+  } catch (exc) {
+    officeError.value = exc instanceof Error ? exc.message : String(exc);
+  } finally {
+    officeLoading.value = false;
+  }
+}
 
 // PDF viewer URL fragment.
 //   navpanes=0    → collapse the thumbnail sidebar by default.
@@ -66,9 +169,25 @@ const rawUrl = computed(() => `${workspace.rawFileUrl(props.path)}&t=${bust.valu
 //                   margins on either side.
 //   statusbar/messages off → declutter.
 // All four are RFC 8118-ish hash params; Chrome/Edge/Firefox honour them.
-const pdfUrl = computed(
-  () => `${rawUrl.value}#zoom=page-width&navpanes=0&toolbar=1&statusbar=0&messages=0`,
+const pdfUrl = computed(() =>
+  blobUrl.value
+    ? `${blobUrl.value}#zoom=page-width&navpanes=0&toolbar=1&statusbar=0&messages=0`
+    : "",
 );
+
+// ── Download button — same auth'd-blob pipeline as the iframe ─────────
+const downloading = ref(false);
+async function downloadCurrent(): Promise<void> {
+  if (!workspace.activeId) return;
+  downloading.value = true;
+  try {
+    await downloadFile(workspace.activeId, props.path);
+  } catch (exc) {
+    ui.toastError("Download", exc instanceof Error ? exc : new Error(String(exc)));
+  } finally {
+    downloading.value = false;
+  }
+}
 
 // ── panzoom for image / SVG ────────────────────────────────────────────
 const stage = ref<HTMLDivElement | null>(null); // viewport (clips)
@@ -168,15 +287,25 @@ async function setupPanzoom(): Promise<void> {
   }
 }
 
-onMounted(setupPanzoom);
-onBeforeUnmount(destroyPanzoom);
+onMounted(() => {
+  setupPanzoom();
+  void _refreshBlobUrl();
+  void _refreshOffice();
+});
+onBeforeUnmount(() => {
+  destroyPanzoom();
+  _revokeActiveBlob();
+});
 
 // Whenever the file changes OR we toggle SVG code/image mode, rebuild
-// the panzoom instance against the new <img> element.
+// the panzoom instance against the new <img> element AND refresh the
+// auth'd blob URL / office markdown to match the new file.
 watch(
   () => [props.path, props.kind, props.showAsCode] as const,
   () => {
     setupPanzoom();
+    void _refreshBlobUrl();
+    void _refreshOffice();
   },
 );
 
@@ -301,14 +430,63 @@ function onAnnotateCancel(): void {
         <span>PDF preview</span>
         <span class="text-caption opacity-60">· toolbar inside viewer · Ctrl/⌘ + scroll to zoom</span>
       </div>
+      <div class="flex items-center gap-1">
+        <button
+          type="button"
+          class="flex items-center gap-1 rounded border border-border bg-background px-2 py-0.5 text-caption font-medium hover:border-primary/40 hover:bg-primary/10 hover:text-primary disabled:cursor-not-allowed disabled:opacity-50"
+          :disabled="downloading"
+          title="Download this PDF"
+          @click="downloadCurrent"
+        >
+          <Icon
+            :icon="downloading ? 'codicon:loading' : 'codicon:cloud-download'"
+            :class="downloading && 'animate-spin'"
+            class="h-3.5 w-3.5"
+          />
+          Download
+        </button>
+        <button
+          type="button"
+          class="flex items-center gap-1 rounded border border-border bg-background px-2 py-0.5 text-caption font-medium hover:border-warning/40 hover:bg-warning/10 hover:text-warning"
+          title="Mark up any page of this PDF and attach to your next message"
+          @click="startAnnotate"
+        >
+          <Icon icon="codicon:edit" class="h-3.5 w-3.5" />
+          Annotate
+        </button>
+      </div>
+    </div>
+
+    <!-- Office info bar — docx / xlsx / pptx / csv / eml etc., previewed
+         as Markdown via server-side markitdown. We surface a download
+         button (always works, even if extraction fails) and a refresh
+         button (re-extracts ignoring the cache, useful when the user
+         saves a new revision in another window). -->
+    <div
+      v-if="kind === 'office'"
+      class="flex items-center justify-between border-b border-border bg-card/40 px-3 py-1 text-body text-muted-foreground"
+    >
+      <div class="flex items-center gap-2 font-mono">
+        <Icon icon="material-icon-theme:document" class="h-[14px] w-[14px]" />
+        <span>Office preview</span>
+        <span class="text-caption opacity-60">
+          · converted to Markdown for inline reading
+          <span v-if="officeFromCache" class="ml-1 rounded bg-success/10 px-1 text-success">cached</span>
+        </span>
+      </div>
       <button
         type="button"
-        class="flex items-center gap-1 rounded border border-border bg-background px-2 py-0.5 text-caption font-medium hover:border-warning/40 hover:bg-warning/10 hover:text-warning"
-        title="Mark up any page of this PDF and attach to your next message"
-        @click="startAnnotate"
+        class="flex items-center gap-1 rounded border border-border bg-background px-2 py-0.5 text-caption font-medium hover:border-primary/40 hover:bg-primary/10 hover:text-primary disabled:cursor-not-allowed disabled:opacity-50"
+        :disabled="downloading"
+        title="Download the original file (preserves all formatting)"
+        @click="downloadCurrent"
       >
-        <Icon icon="codicon:edit" class="h-3.5 w-3.5" />
-        Annotate
+        <Icon
+          :icon="downloading ? 'codicon:loading' : 'codicon:cloud-download'"
+          :class="downloading && 'animate-spin'"
+          class="h-3.5 w-3.5"
+        />
+        Download
       </button>
     </div>
 
@@ -326,6 +504,20 @@ function onAnnotateCancel(): void {
         <span class="text-caption opacity-60">· scroll = zoom · drag = pan · 0/F = reset</span>
       </div>
       <div class="flex items-center gap-0.5">
+        <button
+          type="button"
+          class="mr-2 flex items-center gap-1 rounded-sm border border-border bg-background px-1.5 py-0.5 text-caption font-medium hover:border-primary/40 hover:bg-primary/10 hover:text-primary disabled:cursor-not-allowed disabled:opacity-50"
+          :disabled="downloading"
+          title="Download this file"
+          @click="downloadCurrent"
+        >
+          <Icon
+            :icon="downloading ? 'codicon:loading' : 'codicon:cloud-download'"
+            :class="downloading && 'animate-spin'"
+            class="h-3 w-3"
+          />
+          Download
+        </button>
         <button
           v-if="canAnnotate"
           type="button"
@@ -381,11 +573,43 @@ function onAnnotateCancel(): void {
       </div>
     </div>
 
+    <!-- Audio / video info bar — these have no zoom UI of their own,
+         but users still need a download button. Shown above the body. -->
+    <div
+      v-if="kind === 'audio' || kind === 'video'"
+      class="flex items-center justify-between border-b border-border bg-card/40 px-3 py-1 text-body text-muted-foreground"
+    >
+      <div class="flex items-center gap-2 font-mono">
+        <Icon
+          :icon="kind === 'audio' ? 'material-icon-theme:audio' : 'material-icon-theme:video'"
+          class="h-[14px] w-[14px]"
+        />
+        <span>{{ kind === "audio" ? "Audio preview" : "Video preview" }}</span>
+      </div>
+      <button
+        type="button"
+        class="flex items-center gap-1 rounded border border-border bg-background px-2 py-0.5 text-caption font-medium hover:border-primary/40 hover:bg-primary/10 hover:text-primary disabled:cursor-not-allowed disabled:opacity-50"
+        :disabled="downloading"
+        title="Download this file"
+        @click="downloadCurrent"
+      >
+        <Icon
+          :icon="downloading ? 'codicon:loading' : 'codicon:cloud-download'"
+          :class="downloading && 'animate-spin'"
+          class="h-3.5 w-3.5"
+        />
+        Download
+      </button>
+    </div>
+
     <!-- BODY -->
     <div
       ref="stage"
-      class="preview-stage relative flex min-h-0 flex-1 items-center justify-center overflow-hidden bg-[color-mix(in_oklab,var(--editor-bg)_90%,#000)]"
-      :class="{ 'is-pannable': isPannable }"
+      class="preview-stage relative flex min-h-0 flex-1 overflow-hidden bg-[color-mix(in_oklab,var(--editor-bg)_90%,#000)]"
+      :class="[
+        kind === 'office' ? 'items-stretch justify-stretch' : 'items-center justify-center',
+        { 'is-pannable': isPannable },
+      ]"
     >
       <!-- Image (also SVG when not showing as code).
            panzoom transforms the <img> inside the absolutely-positioned
@@ -400,30 +624,89 @@ function onAnnotateCancel(): void {
         class="preview-img"
       />
 
-      <!-- PDF — browser's built-in PDF viewer.
+      <!-- PDF — browser's built-in PDF viewer, fed via the auth'd blob: URL.
            Native trackpad pinch and Ctrl/⌘+wheel zoom work inside the iframe. -->
-      <iframe
-        v-else-if="kind === 'pdf'"
-        :src="pdfUrl"
-        class="h-full w-full border-0"
-        :title="path"
-      ></iframe>
+      <template v-else-if="kind === 'pdf'">
+        <div
+          v-if="blobLoading"
+          class="flex flex-col items-center gap-2 text-body text-muted-foreground"
+        >
+          <Icon icon="codicon:loading" class="h-5 w-5 animate-spin" />
+          <span>Loading PDF…</span>
+        </div>
+        <div
+          v-else-if="blobError"
+          class="max-w-md text-center text-body text-destructive"
+        >
+          <Icon icon="codicon:error" class="mb-1 h-6 w-6" />
+          <p>Couldn't load PDF: {{ blobError }}</p>
+        </div>
+        <iframe
+          v-else-if="pdfUrl"
+          :src="pdfUrl"
+          class="h-full w-full border-0"
+          :title="path"
+        ></iframe>
+      </template>
 
-      <!-- Audio -->
-      <audio
-        v-else-if="kind === 'audio'"
-        :src="rawUrl"
-        controls
-        class="w-full max-w-2xl"
-      ></audio>
+      <!-- Audio — blob: URL so the auth header isn't required. -->
+      <template v-else-if="kind === 'audio'">
+        <Icon
+          v-if="blobLoading"
+          icon="codicon:loading"
+          class="h-5 w-5 animate-spin text-muted-foreground"
+        />
+        <audio
+          v-else-if="blobUrl"
+          :src="blobUrl"
+          controls
+          class="w-full max-w-2xl"
+        ></audio>
+      </template>
 
-      <!-- Video -->
-      <video
-        v-else-if="kind === 'video'"
-        :src="rawUrl"
-        controls
-        class="max-h-full max-w-full"
-      ></video>
+      <!-- Video — same blob trick. -->
+      <template v-else-if="kind === 'video'">
+        <Icon
+          v-if="blobLoading"
+          icon="codicon:loading"
+          class="h-5 w-5 animate-spin text-muted-foreground"
+        />
+        <video
+          v-else-if="blobUrl"
+          :src="blobUrl"
+          controls
+          class="max-h-full max-w-full"
+        ></video>
+      </template>
+
+      <!-- Office (docx / xlsx / pptx / csv / eml / …) — server-side
+           markitdown produces Markdown and we render it with the same
+           markdown-it pipeline used for chat messages. -->
+      <template v-else-if="kind === 'office'">
+        <div
+          v-if="officeLoading"
+          class="flex flex-col items-center gap-2 text-body text-muted-foreground"
+        >
+          <Icon icon="codicon:loading" class="h-5 w-5 animate-spin" />
+          <span>Converting document…</span>
+        </div>
+        <div
+          v-else-if="officeError"
+          class="m-6 max-w-prose rounded-md border border-destructive/30 bg-destructive/5 p-4 text-body text-destructive"
+        >
+          <p class="mb-2 font-semibold">Couldn't render this document inline</p>
+          <p class="font-mono text-caption">{{ officeError }}</p>
+          <p class="mt-2 text-muted-foreground">
+            You can still <button class="underline" @click="downloadCurrent">download the original</button>
+            and open it in a desktop app.
+          </p>
+        </div>
+        <div
+          v-else-if="officeMarkdown !== null"
+          class="markdown-body office-preview min-h-0 w-full flex-1 overflow-auto bg-background px-6 py-6 text-foreground"
+          v-html="officeRenderedHtml"
+        />
+      </template>
     </div>
 
     <!-- Annotation overlay (modal). Only rendered when active so the

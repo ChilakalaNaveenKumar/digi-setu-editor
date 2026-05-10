@@ -112,6 +112,43 @@ export async function apiPostForm<T>(path: string, form: FormData): Promise<T> {
 }
 
 /**
+ * Fetch `path` with auth headers and return a `blob:` URL pointing at the
+ * response body. Used by `<iframe>` / `<audio>` / `<video>` previews and
+ * for download triggers — none of which can carry an `Authorization`
+ * header on their own.
+ *
+ * The caller is responsible for `URL.revokeObjectURL()` when done.
+ */
+export async function authBlobUrl(path: string): Promise<string> {
+  const res = await _request(path);
+  const blob = await res.blob();
+  return URL.createObjectURL(blob);
+}
+
+/**
+ * Trigger a browser download of `path` with auth, suggesting `filename`
+ * to the Save-As dialog. The blob URL is revoked immediately after the
+ * synthetic click so we don't leak memory across many downloads.
+ */
+export async function downloadAuthed(path: string, filename: string): Promise<void> {
+  const url = await authBlobUrl(path);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  // The anchor must be in the DOM for some browsers (Firefox); style it
+  // out of the layout so it never flashes.
+  a.style.display = "none";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  // Revoke on the next macrotask so the click handler has finished
+  // dispatching the download. setTimeout 0 is the standard idiom for
+  // "after current task settles" without bringing in queueMicrotask
+  // ordering surprises.
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+/**
  * Build a WebSocket URL with the Clerk token in the query string.
  *
  * Browsers don't allow custom headers on the WebSocket constructor, so

@@ -32,6 +32,8 @@ import { Icon } from "@iconify/vue";
 import { useFilesStore } from "../stores/files";
 import { useSnapshotsStore } from "../stores/snapshots";
 import { useUiStore } from "../stores/ui";
+import { useWorkspaceStore } from "../stores/workspace";
+import { downloadFile as apiDownloadFile } from "../api/files";
 import { highlightLines, langForPath } from "../lib/highlighter";
 import DiffView from "./tools/DiffView.vue";
 import CodeEditor from "./CodeEditor.vue";
@@ -41,6 +43,7 @@ import FilePreview from "./FilePreview.vue";
 const files = useFilesStore();
 const snapshots = useSnapshotsStore();
 const ui = useUiStore();
+const workspace = useWorkspaceStore();
 const { currentFile } = storeToRefs(files);
 const { editorReview } = storeToRefs(snapshots);
 
@@ -64,12 +67,12 @@ const isEditableMode = computed(() => {
 const svgShowAsCode = ref(false);
 
 /** Which preview component (if any) should render this file. */
-const previewKind = computed<"image" | "pdf" | "svg" | "audio" | "video" | null>(() => {
+const previewKind = computed<"image" | "pdf" | "svg" | "audio" | "video" | "office" | null>(() => {
   const f = currentFile.value;
   if (!f) return null;
   if (inReview.value) return null;
   const k = f.kind;
-  if (k === "image" || k === "pdf" || k === "audio" || k === "video") return k;
+  if (k === "image" || k === "pdf" || k === "audio" || k === "video" || k === "office") return k;
   if (k === "svg" && !svgShowAsCode.value) return "svg";
   return null;
 });
@@ -163,6 +166,26 @@ async function deleteOpenFile(): Promise<void> {
   });
   if (!ok) return;
   await files.deletePath(f.path);
+}
+
+// Download — works for any kind (text, image, pdf, audio, video, office,
+// binary). For text files this saves the on-disk version (same bytes the
+// agent reads), not the in-editor dirty buffer; users who want their
+// unsaved edits should ⌘/Ctrl+S first. We deliberately use the auth'd
+// blob path instead of a direct <a href> so the download Just Works in
+// authenticated prod web mode (where /files/raw is gated by Clerk).
+const downloading = ref(false);
+async function downloadOpenFile(): Promise<void> {
+  const f = currentFile.value;
+  if (!f?.path || !workspace.activeId) return;
+  downloading.value = true;
+  try {
+    await apiDownloadFile(workspace.activeId, f.path);
+  } catch (exc) {
+    ui.toastError("Download", exc instanceof Error ? exc : new Error(String(exc)));
+  } finally {
+    downloading.value = false;
+  }
 }
 
 /** Esc to exit review mode — matches Cursor's keymap. */
@@ -474,6 +497,19 @@ watch(
           >
             <Icon
               :icon="copyFlash === 'path' ? 'codicon:check' : 'codicon:link'"
+              class="h-[14px] w-[14px]"
+            />
+          </button>
+          <button
+            type="button"
+            class="flex h-6 w-6 items-center justify-center rounded-sm text-muted-foreground hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+            :disabled="downloading"
+            title="Download this file"
+            @click="downloadOpenFile"
+          >
+            <Icon
+              :icon="downloading ? 'codicon:loading' : 'codicon:cloud-download'"
+              :class="downloading && 'animate-spin'"
               class="h-[14px] w-[14px]"
             />
           </button>

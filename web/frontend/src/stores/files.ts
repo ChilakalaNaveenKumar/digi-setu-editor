@@ -16,7 +16,7 @@ import type { FileEntry, FsChangeEvent } from "../api/types";
 import { useUiStore } from "./ui";
 import { useWorkspaceStore } from "./workspace";
 
-export type FileKind = "text" | "image" | "pdf" | "svg" | "audio" | "video" | "binary";
+export type FileKind = "text" | "image" | "pdf" | "svg" | "audio" | "video" | "office" | "binary";
 
 export interface CurrentFile {
   source: "live" | "static";

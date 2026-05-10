@@ -104,6 +104,15 @@ _PDF_EXTS = {"pdf"}
 _SVG_EXTS = {"svg"}
 _AUDIO_EXTS = {"mp3", "wav", "ogg", "flac", "m4a", "aac", "opus"}
 _VIDEO_EXTS = {"mp4", "mov", "webm", "mkv", "avi", "m4v"}
+# "office" = anything we route through markitdown for in-browser preview.
+# These have no native browser viewer, so we convert to markdown server-side
+# and render that in the editor pane (see services/binary_extract.py).
+_OFFICE_EXTS = {
+    "docx", "doc", "odt", "rtf",
+    "xlsx", "xls", "ods", "csv", "tsv",
+    "pptx", "ppt", "odp",
+    "epub", "msg", "eml",
+}
 
 
 def classify_extension(name: str) -> str:
@@ -119,6 +128,8 @@ def classify_extension(name: str) -> str:
         return "audio"
     if ext in _VIDEO_EXTS:
         return "video"
+    if ext in _OFFICE_EXTS:
+        return "office"
     return "unknown"
 
 

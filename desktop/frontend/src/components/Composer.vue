@@ -352,7 +352,12 @@ const inputDisabled = computed(() => connState.value !== "open");
       <!-- Toolbar row. Mode + model + settings on the left, attach +
            send/stop on the right. Same width as the textarea so
            everything reads as one card. -->
-      <div class="flex items-center gap-2 border-t border-border px-2 py-1.5">
+      <!-- flex-wrap is critical for narrow windows (11-inch laptops, mobile,
+           any time the chat pane is shrunk). Without it the toolbar
+           overflows horizontally and the send/queue button gets cut off. -->
+      <div
+        class="composer-toolbar flex flex-wrap items-center gap-y-1.5 gap-x-2 border-t border-border px-2 py-1.5"
+      >
         <!-- Connection dot — replaces the standalone status row in the
              chat header. Tooltip carries the verbose label. -->
         <span
@@ -420,8 +425,7 @@ const inputDisabled = computed(() => connState.value !== "open");
           @change="onPickerChange"
         />
 
-        <!-- Send / queue / stop cluster. Same square footprint regardless
-             of streaming state so the row width never jitters. -->
+        <!-- Send button — fired when pi is idle. -->
         <button
           v-if="!chat.isStreaming"
           type="button"
@@ -437,6 +441,9 @@ const inputDisabled = computed(() => connState.value !== "open");
           <Icon icon="codicon:send" class="h-3.5 w-3.5" />
         </button>
 
+        <!-- Queue button — visually distinct from Send (different icon,
+             explicit "Queue" label, count badge) so users notice that
+             ⌘/Ctrl+Enter while pi is streaming enqueues rather than sends. -->
         <button
           v-else
           type="button"
@@ -445,11 +452,14 @@ const inputDisabled = computed(() => connState.value !== "open");
             inputDisabled ||
             isUploading
           "
-          class="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-primary/60 bg-primary/15 text-primary transition-colors hover:bg-primary/25 disabled:cursor-not-allowed disabled:opacity-30"
-          :title="`Queue (⌘/Ctrl + ↵) — pi will run this after the current turn. ${queuedMessages.length} queued.`"
+          class="flex h-7 min-w-[3.5rem] shrink-0 items-center justify-center gap-1 rounded-md border border-primary/60 bg-primary/25 px-2 text-primary transition-colors hover:bg-primary/35 disabled:cursor-not-allowed disabled:opacity-30"
+          :title="`Queue (⌘/Ctrl + ↵) — pi will run this after the current turn. ${queuedMessages.length} already queued.`"
           @click="submit"
         >
-          <Icon icon="codicon:add" class="h-3.5 w-3.5" />
+          <Icon icon="mdi:playlist-plus" class="h-4 w-4" />
+          <span class="text-caption font-semibold">
+            Queue<span v-if="queuedMessages.length > 0">+{{ queuedMessages.length }}</span>
+          </span>
         </button>
       </div>
     </div>

@@ -22,8 +22,9 @@
   else would link them to a portal that 404s.
 -->
 <script setup lang="ts">
-import { computed } from "vue";
-import { RouterLink } from "vue-router";
+import { computed, onBeforeUnmount, ref, watch } from "vue";
+import { RouterLink, useRoute } from "vue-router";
+import { Icon } from "@iconify/vue";
 // `@clerk/vue` v2.2.0 doesn't ship the React-style <SignedIn>/<SignedOut>
 // wrapper components — it ships a single <Show :when="'signed-in'">
 // (or "signed-out") with the same semantics. We use it below to gate
@@ -93,6 +94,38 @@ async function onCancelPlan(): Promise<void> {
 }
 
 const isCompact = computed(() => props.variant === "compact");
+
+// ── Mobile drawer ────────────────────────────────────────────────────
+//
+// The default top bar lays out NAV + Feedback + Account inline. On
+// screens narrower than the Tailwind `md` breakpoint (~768px) the
+// inline strip overflows or wraps under the wordmark. On a real phone
+// (320–428px) it's visually broken.
+//
+// We solve that by rendering all the NAV items inside a slide-down
+// drawer that opens from a hamburger button when `<md`. The drawer
+// auto-closes on route change (so picking "Home" doesn't leave the
+// drawer hanging open) and on Escape.
+//
+// On `>=md` the drawer is hidden entirely and the inline nav strip
+// stays exactly as before — this is purely additive markup.
+const mobileOpen = ref(false);
+const route = useRoute();
+function toggleMobile(): void {
+  mobileOpen.value = !mobileOpen.value;
+}
+function closeMobile(): void {
+  mobileOpen.value = false;
+}
+watch(() => route.fullPath, closeMobile);
+
+function onKeydown(ev: KeyboardEvent): void {
+  if (ev.key === "Escape" && mobileOpen.value) closeMobile();
+}
+if (typeof window !== "undefined") {
+  window.addEventListener("keydown", onKeydown);
+  onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
+}
 const padding = computed(() =>
   isCompact.value ? "px-4 py-2" : "px-6 py-3 md:px-8 md:py-3.5",
 );
@@ -136,10 +169,9 @@ const wordmarkClass = computed(() =>
     </div>
     <div v-if="!$slots.default" class="hidden flex-1 md:block" />
 
-    <!-- Trailing actions: nav links → feedback → account.
-         Links use foreground/75 (not muted-foreground) so they're
-         readable at a glance — the earlier muted variant looked dead. -->
-    <nav class="flex items-center gap-1 text-body">
+    <!-- Inline trailing nav — only visible on >=md screens. On smaller
+         screens the same items live inside the mobile drawer below. -->
+    <nav class="hidden items-center gap-1 text-body md:flex">
       <RouterLink
         v-for="link in NAV"
         :key="link.to"
@@ -154,11 +186,7 @@ const wordmarkClass = computed(() =>
         class="ml-1 rounded-md border border-border bg-card px-3 py-1.5 text-body-lg font-medium text-foreground transition-colors hover:border-primary/50"
       >{{ $t("nav.feedback") }}</RouterLink>
 
-      <!-- Account surface. In auth_required=false dev mode we hide
-           the entire cluster (there's no real user to show). When
-           auth IS required, we render Clerk's <UserButton> for
-           signed-in users (avatar, open account portal, sign out)
-           and a primary "Sign in" CTA otherwise. -->
+      <!-- Account surface. Same gating logic as before. -->
       <template v-if="showAccount && cfg.authRequired">
         <ClerkShow :when="'signed-out'">
           <RouterLink
@@ -167,14 +195,6 @@ const wordmarkClass = computed(() =>
           >{{ $t("nav.signIn") }}</RouterLink>
         </ClerkShow>
         <ClerkShow :when="'signed-in'">
-          <!-- Cancel plan — surfaced as a sibling of the Clerk avatar
-               instead of an item INSIDE the Clerk popover (Clerk's
-               UserButton.MenuItems API is not present in @clerk/vue
-               2.2.0). The button is gated on having a paid plan +
-               an active Stripe customer record so it never links
-               to a portal 404. Visible to the right of the avatar
-               so users searching for "cancel" see it without
-               opening any menu. -->
           <button
             v-if="showCancelPlan"
             type="button"
@@ -186,5 +206,83 @@ const wordmarkClass = computed(() =>
         </ClerkShow>
       </template>
     </nav>
+
+    <!-- Mobile cluster — hamburger + (when signed in) avatar so the
+         user can still open their account without first opening the
+         drawer. Hidden on >=md. -->
+    <div class="ml-auto flex items-center gap-2 md:hidden">
+      <template v-if="showAccount && cfg.authRequired">
+        <ClerkShow :when="'signed-in'">
+          <UserButton :after-sign-out-url="'/login'" />
+        </ClerkShow>
+      </template>
+      <button
+        type="button"
+        class="inline-flex h-9 w-9 items-center justify-center rounded-md border border-border bg-card text-foreground transition-colors hover:bg-muted"
+        :aria-expanded="mobileOpen"
+        aria-label="Open menu"
+        @click="toggleMobile"
+      >
+        <Icon :icon="mobileOpen ? 'mdi:close' : 'mdi:menu'" class="h-5 w-5" />
+      </button>
+    </div>
   </header>
+
+  <!-- Mobile drawer — slides down beneath the sticky header. Pure CSS
+       transition (no third-party modal lib) so it's cheap and matches
+       the marketing theme. Tap a link → drawer auto-closes via the
+       route watcher. Tap the backdrop → also closes. -->
+  <Transition
+    enter-active-class="transition-all duration-150 ease-out"
+    leave-active-class="transition-all duration-100 ease-in"
+    enter-from-class="opacity-0 -translate-y-2"
+    leave-to-class="opacity-0 -translate-y-2"
+  >
+    <div
+      v-if="mobileOpen"
+      class="fixed inset-x-0 top-0 z-20 md:hidden"
+      role="dialog"
+      aria-modal="true"
+    >
+      <!-- Spacer matches the sticky header so the drawer slides BENEATH it. -->
+      <div class="h-14"></div>
+      <nav class="border-b border-border bg-background shadow-lg">
+        <div class="flex flex-col py-2">
+          <RouterLink
+            v-for="link in NAV"
+            :key="link.to"
+            :to="link.to"
+            class="px-5 py-3 text-body-lg font-medium text-foreground/85 transition-colors hover:bg-muted active:bg-muted"
+            active-class="bg-muted text-foreground"
+          >{{ link.label }}</RouterLink>
+          <RouterLink
+            v-if="showFeedback"
+            to="/feedback"
+            class="mx-4 mt-2 rounded-md border border-border bg-card px-4 py-2 text-center text-body-lg font-medium text-foreground transition-colors hover:border-primary/50"
+          >{{ $t("nav.feedback") }}</RouterLink>
+          <template v-if="showAccount && cfg.authRequired">
+            <ClerkShow :when="'signed-out'">
+              <RouterLink
+                to="/login"
+                class="mx-4 mt-2 inline-flex items-center justify-center rounded-md bg-primary px-4 py-2 text-body-lg font-semibold text-primary-foreground shadow-sm transition-opacity hover:opacity-90"
+              >{{ $t("nav.signIn") }}</RouterLink>
+            </ClerkShow>
+            <ClerkShow :when="'signed-in'">
+              <button
+                v-if="showCancelPlan"
+                type="button"
+                class="mx-4 mt-2 rounded-md border border-border bg-card px-4 py-2 text-body font-medium text-muted-foreground transition-colors hover:border-destructive/50 hover:text-destructive"
+                @click="onCancelPlan"
+              >Cancel plan</button>
+            </ClerkShow>
+          </template>
+        </div>
+      </nav>
+      <!-- Click-outside backdrop. Sized to fill the rest of the viewport. -->
+      <div
+        class="absolute inset-x-0 bottom-0 top-full -z-10 h-screen bg-background/40 backdrop-blur-[1px]"
+        @click="closeMobile"
+      ></div>
+    </div>
+  </Transition>
 </template>

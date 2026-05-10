@@ -30,5 +30,14 @@ google-auth==2.42.1
 # break the LLM relay.
 httpx==0.28.1
 
+# Office / PDF → Markdown extraction for the editor preview pane and the
+# pi-coding-agent read-binary tool. Microsoft's `markitdown` is a pure-
+# Python wrapper over format-specific parsers (pdfminer, python-docx,
+# openpyxl, python-pptx, …). We pin a narrow set of extras to keep image
+# size manageable: ~30 MB total without audio-transcription/youtube extras.
+# Soft-imported in services/binary_extract.py so this dependency is
+# optional in dev.
+markitdown[pdf,docx,pptx,xlsx,xls,outlook]==0.1.5
+
 # Test runner. Only needed for `pytest`; not pulled into the prod image.
 pytest==9.0.3

@@ -88,6 +88,49 @@ hiddenimports += collect_submodules("svix")
 hiddenimports += collect_submodules("cryptography")
 hiddenimports += collect_submodules("google.auth")
 
+# markitdown + format-specific parser deps for the office-preview / read-
+# binary path in services/binary_extract.py. markitdown does dynamic
+# imports at convert time depending on the file's extension, so we have
+# to enumerate every parser ourselves; PyInstaller's static analysis
+# misses them and the frozen binary falls back to "library not installed"
+# placeholders for that file type. Wrapped in try/except because not
+# every parser is present in every dev environment.
+for _md_pkg in (
+    "markitdown",
+    "pdfminer",
+    "pdfminer.six",
+    "pypdf",
+    "docx",                    # python-docx
+    "openpyxl",
+    "xlrd",
+    "pptx",                    # python-pptx
+    "mammoth",
+    "olefile",
+    "pandas",                  # markitdown uses pandas for some xlsx paths
+    "beautifulsoup4",
+    "bs4",
+    "lxml",
+    "markdownify",
+    "magika",                  # mime sniffing
+    "charset_normalizer",
+    "extract_msg",             # outlook .msg
+    "pydub",                   # tolerated even without audio extra
+):
+    try:
+        hiddenimports += collect_submodules(_md_pkg)
+    except Exception:
+        pass
+
+# markitdown ships a converter registry as data files (extension → parser
+# class plug-in points). collect_data_files makes sure those land in the
+# bundle alongside the python code.
+for _data_pkg in ("markitdown", "pdfminer", "pypdf"):
+    try:
+        from PyInstaller.utils.hooks import collect_data_files
+        datas += collect_data_files(_data_pkg)
+    except Exception:
+        pass
+
 
 # ── data files (templates, configs, etc) ──────────────────────────────
 # `web/backend/fonts` is a static asset directory the routes/files.py

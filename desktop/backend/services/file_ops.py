@@ -71,7 +71,7 @@ def read_file(workspace_path: Path, rel_path: str, max_bytes: int = 2 * 1024 * 1
     size = abs_path.stat().st_size
     kind = classify_extension(abs_path.name)
 
-    if kind in ("image", "pdf", "audio", "video"):
+    if kind in ("image", "pdf", "audio", "video", "office"):
         return {
             "path": rel_path,
             "size": size,

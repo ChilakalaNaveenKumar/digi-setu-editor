@@ -335,8 +335,18 @@ const inputDisabled = computed(() => connState.value !== "open");
 
       <!-- Toolbar row. Mode + model + settings on the left, attach +
            send/stop on the right. Same width as the textarea so
-           everything reads as one card. -->
-      <div class="flex items-center gap-2 border-t border-border px-2 py-1.5">
+           everything reads as one card.
+
+           `flex-wrap` is critical: on narrow widths (mobile, 11-inch
+           laptops with the chat pane shrunk) the row would otherwise
+           overflow horizontally and chop off the send button. With
+           `wrap`, the right cluster (settings / attach / send) drops
+           cleanly to a second line — still entirely usable. The
+           container query below hides verbose labels on narrow widths
+           so the wrap kicks in only when truly needed. -->
+      <div
+        class="composer-toolbar flex flex-wrap items-center gap-y-1.5 gap-x-2 border-t border-border px-2 py-1.5"
+      >
         <!-- Connection dot — replaces the standalone status row in the
              chat header. Tooltip carries the verbose label. -->
         <span
@@ -405,8 +415,7 @@ const inputDisabled = computed(() => connState.value !== "open");
           @change="onPickerChange"
         />
 
-        <!-- Send / queue / stop cluster. Same square footprint regardless
-             of streaming state so the row width never jitters. -->
+        <!-- Send button — fired when pi is idle. -->
         <button
           v-if="!chat.isStreaming"
           type="button"
@@ -422,6 +431,20 @@ const inputDisabled = computed(() => connState.value !== "open");
           <Icon icon="codicon:send" class="h-3.5 w-3.5" />
         </button>
 
+        <!-- Queue button — visually distinct from Send so users notice
+             that hitting ⌘/Ctrl+Enter while pi is mid-turn enqueues
+             rather than sends.
+
+             Three deliberate visual cues vs. the prior `+` icon:
+               1. `mdi:playlist-plus` is the standard "add to queue" glyph;
+                  users recognise it from media players.
+               2. The button stays the same height as Send but expands
+                  width to fit a "Queue" label + a numeric count badge.
+                  Width is `min-w-[3.5rem]` so the layout doesn't jump
+                  when the queue grows from 0 → 9+.
+               3. Slightly bolder accent colour (primary at 25% bg vs
+                  15% on the old version) so it pops against the
+                  toolbar at a glance. -->
         <button
           v-else
           type="button"
@@ -430,11 +453,14 @@ const inputDisabled = computed(() => connState.value !== "open");
             inputDisabled ||
             isUploading
           "
-          class="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-primary/60 bg-primary/15 text-primary transition-colors hover:bg-primary/25 disabled:cursor-not-allowed disabled:opacity-30"
-          :title="`Queue (⌘/Ctrl + ↵) — pi will run this after the current turn. ${queuedMessages.length} queued.`"
+          class="flex h-7 min-w-[3.5rem] shrink-0 items-center justify-center gap-1 rounded-md border border-primary/60 bg-primary/25 px-2 text-primary transition-colors hover:bg-primary/35 disabled:cursor-not-allowed disabled:opacity-30"
+          :title="`Queue (⌘/Ctrl + ↵) — pi will run this after the current turn. ${queuedMessages.length} already queued.`"
           @click="submit"
         >
-          <Icon icon="codicon:add" class="h-3.5 w-3.5" />
+          <Icon icon="mdi:playlist-plus" class="h-4 w-4" />
+          <span class="text-caption font-semibold">
+            Queue<span v-if="queuedMessages.length > 0">+{{ queuedMessages.length }}</span>
+          </span>
         </button>
       </div>
     </div>
