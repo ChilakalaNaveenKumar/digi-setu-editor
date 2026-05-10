@@ -182,15 +182,28 @@ definitions:
           - curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
           - apt-get install -y --no-install-recommends nodejs
           # Reuse cached rustup if present (saves ~60s); otherwise install fresh.
+          # If the cache contains a partial install (dir exists but binary
+          # missing), wipe it first — the rustup-init script bails on a
+          # non-empty CARGO_HOME just like gcloud does on a non-empty
+          # install dir.
           - >
             if [ ! -x "$HOME/.cargo/bin/rustup" ]; then
+              [ -d "$HOME/.cargo" ] && rm -rf "$HOME/.cargo" "$HOME/.rustup";
               curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain stable;
             fi
           - source $HOME/.cargo/env
           - rustup target add x86_64-unknown-linux-gnu
           # Reuse cached gcloud SDK if present (saves ~30s).
+          # The Bitbucket cache restores /opt/google-cloud-sdk on every run.
+          # If the previous run was killed mid-install (Bitbucket runner
+          # cancellation or step timeout), the dir exists but bin/gcloud
+          # doesn't — and Google's installer refuses to write to a non-empty
+          # dir. So if the binary check fails, nuke the half-baked dir
+          # before re-installing. Without this, the cache becomes a poison
+          # pill that breaks every subsequent linux-release step.
           - >
             if [ ! -x "/opt/google-cloud-sdk/bin/gcloud" ]; then
+              rm -rf /opt/google-cloud-sdk;
               curl -fsSL https://sdk.cloud.google.com | bash -s -- --disable-prompts --install-dir=/opt;
             fi
           - export PATH="/opt/google-cloud-sdk/bin:$PATH"
