@@ -149,7 +149,14 @@ const macIntelAvailable = true;
 const linuxDebAvailable = true;
 const linuxAppImageAvailable = false;
 const linuxAvailable = linuxDebAvailable || linuxAppImageAvailable;
-const windowsAvailable = false;     // Pending GHA build (PyInstaller bootstrap fix landing in next pipeline run)
+// Windows: produced by GHA's `windows` job (.github/workflows/release.yml).
+// Both the .exe (NSIS, end-user-friendly) and the .msi (IT/MDM
+// deployment via Group Policy / Intune) come from the same job — flip
+// this flag once the artefacts land in /srv/pi/downloads/. Trusted
+// Signing is wired up in build-windows.ps1; the page banner above
+// already explains the SmartScreen warning users may still see while
+// reputation accumulates with Microsoft.
+const windowsAvailable = true;
 </script>
 
 <template>

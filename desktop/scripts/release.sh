@@ -346,24 +346,66 @@ build_dmg() {
     banner "macOS · build DMG (create-dmg)"
     rm -f "${DMG_OUT}"
 
-    # macos-15-intel GHA runners occasionally hang in `hdiutil detach`
-    # at the end of create-dmg (DiskArbitration timeout). The rw image
-    # is fully written by that point, so we retry, force-detaching any
-    # leftover dmg.* mounts between attempts and salvaging the rw
-    # image on the final retry.
+    # macos-15-intel GHA runners occasionally hang in `hdiutil` calls
+    # (DiskArbitration deadlocks — manifest as "Creating disk image..."
+    # never returning, or the closing `hdiutil detach` blocking
+    # forever). On Apple Silicon runners these typically finish in
+    # 60–120 s; we cap each attempt at 8 minutes so a hung run can't
+    # eat the entire 6-hour GitHub Actions budget.
+    #
+    # Strategy:
+    #   1. Run create-dmg in the background with a wall-clock timeout.
+    #   2. If it succeeds → done.
+    #   3. If it fails or times out → force-detach orphan mounts,
+    #      salvage the rw image if create-dmg got that far, retry.
+    #   4. After 3 failures, bypass create-dmg entirely and build a
+    #      no-frills DMG with `hdiutil create -srcfolder`. Loses the
+    #      drag-to-Applications layout but gives users a usable
+    #      installer instead of failing the whole release.
     local _attempt
+    local _attempt_timeout=480   # 8 minutes per create-dmg attempt
     for _attempt in 1 2 3; do
-        if create-dmg \
-            --volname "Digi Setu" \
-            --window-pos 200 120 \
-            --window-size 640 400 \
-            --icon-size 128 \
-            --icon "Digi Setu.app" 180 200 \
-            --hide-extension "Digi Setu.app" \
-            --app-drop-link 460 200 \
-            --no-internet-enable \
-            "${DMG_OUT}" \
-            "${APP_PATH}"; then
+        log "create-dmg attempt ${_attempt}/3 (timeout ${_attempt_timeout}s)"
+        # Spawn create-dmg as a background job and watch the wall clock.
+        # `create-dmg` doesn't accept a --timeout flag, and `gtimeout`
+        # isn't on stock GHA runners, so we manage the timer ourselves
+        # — and we pgrep-kill the orphaned `hdiutil` children that
+        # create-dmg leaves running when we SIGTERM it (otherwise the
+        # next attempt races against a leftover mount).
+        (
+            create-dmg \
+                --volname "Digi Setu" \
+                --window-pos 200 120 \
+                --window-size 640 400 \
+                --icon-size 128 \
+                --icon "Digi Setu.app" 180 200 \
+                --hide-extension "Digi Setu.app" \
+                --app-drop-link 460 200 \
+                --no-internet-enable \
+                "${DMG_OUT}" \
+                "${APP_PATH}"
+        ) &
+        local _pid=$!
+        local _waited=0
+        local _ok=0
+        while [[ ${_waited} -lt ${_attempt_timeout} ]]; do
+            if ! kill -0 "${_pid}" 2>/dev/null; then
+                wait "${_pid}" && _ok=1 || _ok=0
+                break
+            fi
+            sleep 5
+            _waited=$((_waited + 5))
+        done
+        if kill -0 "${_pid}" 2>/dev/null; then
+            log "create-dmg attempt ${_attempt} timed out at ${_waited}s; killing"
+            kill -TERM "${_pid}" 2>/dev/null || true
+            sleep 2
+            kill -KILL "${_pid}" 2>/dev/null || true
+            # create-dmg shells out to hdiutil; chase those down too.
+            pkill -f "hdiutil" 2>/dev/null || true
+            wait "${_pid}" 2>/dev/null || true
+        fi
+        if [[ ${_ok} -eq 1 && -f "${DMG_OUT}" ]]; then
             log "DMG: ${DMG_OUT} ($(du -h "${DMG_OUT}" | cut -f1))"
             return 0
         fi
@@ -379,21 +421,47 @@ build_dmg() {
             [[ -d "${_vol}" ]] && hdiutil detach "${_vol}" -force 2>/dev/null || true
         done
 
-        # On the last retry, salvage: convert the rw image (which IS a
-        # valid DMG, it just never got the read-only compression pass).
+        # On the last create-dmg retry, salvage: convert the rw image
+        # (which IS a valid DMG, it just never got the read-only
+        # compression pass) into a final UDZO image.
         if [[ ${_attempt} -eq 3 ]]; then
             local _rw_img
             _rw_img=$(ls -t /tmp/rw.*."${DMG_NAME}" 2>/dev/null | head -1)
             if [[ -n "${_rw_img}" && -f "${_rw_img}" ]]; then
                 log "salvaging rw DMG: ${_rw_img}"
-                hdiutil convert "${_rw_img}" -format UDZO -o "${DMG_OUT}" -ov
-                log "DMG: ${DMG_OUT} ($(du -h "${DMG_OUT}" | cut -f1)) [salvaged]"
-                return 0
+                if hdiutil convert "${_rw_img}" -format UDZO -o "${DMG_OUT}" -ov; then
+                    log "DMG: ${DMG_OUT} ($(du -h "${DMG_OUT}" | cut -f1)) [salvaged]"
+                    return 0
+                fi
+                log "salvage convert failed; falling through to plain hdiutil path"
             fi
         fi
         sleep 5
     done
-    printf '[release] create-dmg failed after 3 attempts\n' >&2
+
+    # Plain fallback. `hdiutil create -srcfolder` skips the AppleScript
+    # window-layout step that's most likely to hang, at the cost of the
+    # drag-to-Applications visual. The user gets a working DMG; we'll
+    # rerun the release with a fresh runner if we want the pretty one.
+    log "create-dmg unrecoverable; building plain DMG with hdiutil"
+    local _stage
+    _stage=$(mktemp -d -t digi-setu-dmg.XXXXXX)
+    cp -R "${APP_PATH}" "${_stage}/"
+    ln -s /Applications "${_stage}/Applications" 2>/dev/null || true
+    rm -f "${DMG_OUT}"
+    if hdiutil create \
+        -volname "Digi Setu" \
+        -srcfolder "${_stage}" \
+        -ov \
+        -format UDZO \
+        -fs HFS+ \
+        "${DMG_OUT}"; then
+        rm -rf "${_stage}"
+        log "DMG: ${DMG_OUT} ($(du -h "${DMG_OUT}" | cut -f1)) [plain hdiutil]"
+        return 0
+    fi
+    rm -rf "${_stage}"
+    printf '[release] DMG build failed after create-dmg retries AND hdiutil fallback\n' >&2
     exit 1
 }
 

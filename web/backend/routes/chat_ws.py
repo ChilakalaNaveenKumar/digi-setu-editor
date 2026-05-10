@@ -52,6 +52,7 @@ from services.models_registry import (
 )
 from services.audit import record as audit_record
 from services.error_codes import bridge_error, log_error
+from services.partial_turn import PartialTurnTracker
 from services.pi_session import PiSession
 from services.policy import check_bash, scrub_secrets
 from services.sandbox_layout import stamp_sandbox_dir
@@ -521,6 +522,17 @@ async def run_session_loop(
     timed_out: dict[str, bool] = {"flag": False}
     aborted: dict[str, bool] = {"flag": False}
 
+    # Mirror text/thinking deltas of the in-flight assistant turn so we
+    # can persist a synthetic JSONL line when the user clicks Stop —
+    # otherwise pi gets killed before `message_end` and `load_history`
+    # finds nothing for that turn on the next reconnect, making the
+    # half-finished response (which the user already saw streaming)
+    # disappear from chat history. See services/partial_turn.py for
+    # the full design notes.
+    partial_turn = PartialTurnTracker(
+        chats_dir=chats_dir, session_id=session_id
+    )
+
     # Background title-generation state. We only ever fire this once per
     # session (the first time we see a non-empty user prompt). Storing
     # the task handle lets us a) avoid double-firing on subsequent
@@ -935,8 +947,92 @@ async def run_session_loop(
             "mode": payload.get("mode"),
         }
 
+    # ── Bounded drain for the in-flight turn after the WS dropped ───
+    #
+    # Why: pi only persists a turn to its session JSONL on `message_end`.
+    # Up to that point the turn is "live" — text is streaming, tools are
+    # running, billing hasn't fired. If we kill pi the moment the WS
+    # closes (browser tab closed, user clicked another chat in the
+    # sidebar, network blip), the turn vanishes from history AND from
+    # the credit ledger. The fix is to KEEP pi alive long enough to let
+    # it finish the turn it's already running, run all the same per-event
+    # handlers we'd have run with a live WS (snapshot, billing, audit,
+    # bg processes), then close pi cleanly. The next time the user opens
+    # this chat, `load_history` finds pi's own `message_end` JSONL line
+    # — exactly as if they'd never navigated away.
+    #
+    # Bounded at BG_DRAIN_TIMEOUT_S so a runaway tool loop can't keep pi
+    # running indefinitely after the user is gone. On timeout we fall
+    # back to the partial-turn snapshot so the user at least sees what
+    # was streamed.
+    BG_DRAIN_TIMEOUT_S = 180
+
+    async def _bg_drain_to_message_end() -> None:
+        """Consume pi.events() in the background until message_end fires
+        or the timeout expires, running the same handler chain pi_to_ws
+        runs (minus the WS send + permission interception, since there's
+        no live SPA to talk to). Owns pi.close() at the end.
+
+        IMPORTANT: this task runs AFTER the WS handler has returned and
+        all the WS pumps have been cancelled. It still has access to the
+        closed-over PiSession, billing helpers, watcher refcount holder,
+        etc. — but NOT to the WebSocket itself."""
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + BG_DRAIN_TIMEOUT_S
+        try:
+            async for evt in pi.events():
+                partial_turn.observe(evt)
+                # Same per-event accounting we'd have done in pi_to_ws.
+                # Skip permission-interception + WS send (no SPA).
+                try:
+                    await _maybe_snapshot(evt)
+                except Exception as exc:
+                    print(
+                        f"[ws {session_id}] bg snapshot raised: {exc!r}",
+                        file=sys.stderr,
+                    )
+                _maybe_track_bg_process(evt)
+                _maybe_charge_usage(evt)
+                _maybe_charge_tool_sub_llm(evt)
+                _maybe_audit_tool_lifecycle(evt)
+                if evt.get("type") == "message_end":
+                    # Turn finished naturally; pi is now idle waiting
+                    # for the next prompt that won't come. Tear down.
+                    return
+                if loop.time() >= deadline:
+                    print(
+                        f"[ws {session_id}] bg drain timed out at "
+                        f"{BG_DRAIN_TIMEOUT_S}s; persisting partial",
+                        file=sys.stderr,
+                    )
+                    partial_turn.persist_if_in_flight(reason="bg_timeout")
+                    return
+        except Exception as exc:
+            print(
+                f"[ws {session_id}] bg drain raised: {exc!r}",
+                file=sys.stderr,
+            )
+            partial_turn.persist_if_in_flight(reason="bg_error")
+
+    async def _close_pi_after_drain() -> None:
+        """Wrapper task started from the WS cleanup path. Drains pi to
+        message_end (or timeout), then closes pi. Owns both legs so the
+        WS handler doesn't have to await anything — it can return as
+        soon as we kick this task off."""
+        try:
+            await _bg_drain_to_message_end()
+        finally:
+            try:
+                await pi.close()
+            except Exception as exc:
+                print(
+                    f"[ws {session_id}] pi.close after drain raised: {exc!r}",
+                    file=sys.stderr,
+                )
+
     async def pi_to_ws() -> None:
         async for evt in pi.events():
+            partial_turn.observe(evt)
             _remember_tool_args(evt)
 
             permission_override = _intercept_permission_request(evt)
@@ -1031,6 +1127,10 @@ async def run_session_loop(
                     elapsed_seconds=int(elapsed),
                     limit_seconds=PROMPT_TIMEOUT_SECONDS,
                 )
+                # Same rationale as the user-abort branch: persist what
+                # pi has already streamed so the user doesn't see an
+                # empty bubble after the timeout banner.
+                partial_turn.persist_if_in_flight(reason="timeout")
                 try:
                     await ws.send_json(bridge_error("timeout"))
                 except Exception:
@@ -1098,6 +1198,12 @@ async def run_session_loop(
                     user_id=user_id,
                     where="user_abort",
                 )
+                # Snapshot the in-flight assistant turn to disk BEFORE
+                # we terminate pi — otherwise the partial response the
+                # user already saw streaming would vanish from history
+                # on the next reconnect (pi only writes message_end on
+                # the happy path).
+                partial_turn.persist_if_in_flight(reason="user_stop")
                 try:
                     await ws.send_json(bridge_error("aborted"))
                 except Exception:
@@ -1315,7 +1421,43 @@ async def run_session_loop(
     fs_watcher.unsubscribe(fs_queue)
     bg_registry.unsubscribe(bg_queue)
     await WatcherRegistry.instance().release(workspace_path)
-    await pi.close()
+
+    # Decide whether to close pi NOW or detach it to finish the turn
+    # in the background. Detaching is the right choice when:
+    #   * a turn is currently in flight (turn_started_at is set), AND
+    #   * the user didn't explicitly Stop (aborted), AND
+    #   * the prompt watchdog didn't kill the turn (timed_out), AND
+    #   * we still own the session lock (a newer tab claiming it would
+    #     spawn its own pi — keeping the old one alive would race on
+    #     the workspace + shadow-git).
+    # Detaching means pi keeps streaming to disk via its own JSONL
+    # writer, so by the time the user reopens this chat the answer is
+    # already saved as a normal completed turn. Without this, every
+    # "switch chat", "close tab", or "reload page" mid-stream would
+    # truncate the running answer.
+    in_flight = (
+        turn_started_at.get("ts") is not None
+        and not aborted["flag"]
+        and not timed_out["flag"]
+    )
+    still_owner = locks.owner(session_id) is ws
+    if in_flight and still_owner:
+        print(
+            f"[ws {session_id}] WS dropped mid-turn; detaching pi for "
+            f"background completion (max {BG_DRAIN_TIMEOUT_S}s)",
+            file=sys.stderr,
+        )
+        # Fire-and-forget — the task owns pi.close() now and will run
+        # for at most BG_DRAIN_TIMEOUT_S after this handler returns.
+        asyncio.create_task(
+            _close_pi_after_drain(),
+            name=f"pi_bg_drain[{session_id}]",
+        )
+    else:
+        # Synchronous path: snapshot anything streamed (idempotent if
+        # an abort/timeout handler already persisted), then close pi.
+        partial_turn.persist_if_in_flight(reason="disconnect")
+        await pi.close()
     # Release the multi-tab guard. Idempotent — if a newer tab took
     # ownership while we were winding down, this is a no-op.
     await locks.release(session_id, ws)

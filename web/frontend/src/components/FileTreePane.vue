@@ -197,10 +197,18 @@ const menu = ref<{
 
 function openContextMenu(payload: { x: number; y: number; node: TreeNode }): void {
   // Clamp menu inside the viewport so it never gets clipped.
-  const menuW = 180;
-  const menuH = 240;
-  const x = Math.min(payload.x, window.innerWidth - menuW - 8);
-  const y = Math.min(payload.y, window.innerHeight - menuH - 8);
+  //
+  // Item count (max — file with non-empty clipboard):
+  //   Open, New File…, New Folder…, ─, Cut, Copy, Paste, Duplicate,
+  //   ─, Rename, Copy Path, Copy Relative Path, ─, Delete
+  // = 11 buttons (~30 px) + 3 separators (~1 px) + ~16 px padding
+  // ≈ 350 px. Bumped to 440 to leave headroom for higher-DPI fonts
+  // and the lower 8 px viewport gutter. The container also gets a
+  // CSS max-h + overflow-y-auto safety net for very small windows.
+  const menuW = 220;
+  const menuH = 440;
+  const x = Math.max(8, Math.min(payload.x, window.innerWidth - menuW - 8));
+  const y = Math.max(8, Math.min(payload.y, window.innerHeight - menuH - 8));
   menu.value = { open: true, x, y, node: payload.node };
 }
 
@@ -275,8 +283,25 @@ async function ctxCopyAbsolutePath(): Promise<void> {
   const n = menu.value.node;
   closeContextMenu();
   if (!n) return;
-  const cwd = (session.value?.cwd ?? "").replace(/\/+$/, "");
-  const text = cwd ? `${cwd}/${n.path}` : n.path;
+  // Resolution order for the workspace root:
+  //   1. workspace.active.path  ← always set when the file tree is
+  //      rendered (the route guard for /workspaces/:id sets activeId
+  //      before this view mounts), so this is the preferred source.
+  //   2. session.value.cwd      ← chat-session's cwd. Only populated
+  //      AFTER the chat WS finishes its session handshake. On web
+  //      this almost always wins anyway because the WS handshake is
+  //      fast, but right-clicking during the initial reconnect
+  //      window would otherwise silently fall back to relative.
+  // The web workspace.active.path is the SERVER's absolute path
+  // (e.g. /srv/pi/workspaces/<wsid>) — same value chat_ws emits in
+  // its session event, so users who relied on session.cwd see no
+  // behaviour change here, just better availability.
+  const root = (
+    workspace.active?.path ??
+    session.value?.cwd ??
+    ""
+  ).replace(/\/+$/, "");
+  const text = root ? `${root}/${n.path}` : n.path;
   try {
     await navigator.clipboard.writeText(text);
     ui.toast({ message: "Path copied to clipboard", kind: "success", ttl: 1500 });
@@ -494,9 +519,16 @@ const canPaste = computed(() => fsClipboard.value !== null);
     </div>
 
     <!-- ── Floating context menu ─────────────────────────────────────── -->
+    <!--
+         max-h + overflow-y-auto guarantees that on tiny windows (the
+         11" laptop case where the user hit this bug first) the menu
+         stays clickable even if our positional clamp wasn't enough —
+         worst case the user scrolls inside the menu instead of seeing
+         items disappear off the bottom of the viewport.
+    -->
     <div
       v-if="menu.open && menu.node"
-      class="fixed z-50 min-w-[180px] overflow-hidden rounded-md border border-border bg-card shadow-lg"
+      class="fixed z-50 min-w-[220px] max-h-[calc(100vh-16px)] overflow-y-auto overflow-x-hidden rounded-md border border-border bg-card shadow-lg"
       :style="{ left: `${menu.x}px`, top: `${menu.y}px` }"
       @click.stop
       @contextmenu.prevent
