@@ -951,6 +951,176 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	// ── read_doc ───────────────────────────────────────────────────────────
+	//
+	// pi's built-in `read` tool calls fs.readFile + Buffer.toString("utf-8"),
+	// which is correct for source code and produces UTF-8 garbage for any
+	// real binary format (PDF / DOCX / XLSX / PPTX / EPUB / MSG …).
+	// `read_doc` POSTs the absolute path to the backend's
+	// /api/internal/extract-md endpoint, which delegates to Microsoft's
+	// `markitdown` library and returns proper Markdown text.
+	//
+	// Auth: env-injected per-process bearer token. The backend mints it on
+	// startup (services/internal_auth.get_internal_token) and pi_session.py
+	// passes it through as PI_INTERNAL_TOKEN. PI_SIDECAR_URL points at the
+	// loopback FastAPI bind (e.g. http://127.0.0.1:8000). When either env
+	// var is missing the tool returns a clear "not available in this mode"
+	// message instead of registering and failing silently — keeps the
+	// system prompt's "use read_doc for binaries" advice honest.
+	pi.registerTool({
+		name: "read_doc",
+		label: "Read document (markitdown)",
+		description: [
+			"Read a binary document (PDF, DOCX, XLSX, PPTX, EPUB, MSG, EML, ODT, ODS, ODP, RTF) and return its content as Markdown via Microsoft's markitdown library.",
+			"",
+			"USE THIS instead of `read` for any non-text, non-image file. The builtin `read` does Buffer.toString('utf-8') which produces garbage for binary formats. `read_doc` runs the file through format-aware parsers (pdfminer, python-docx, openpyxl, python-pptx, mammoth, …) and gives you readable Markdown back.",
+			"",
+			"Embedded images (DOCX / PPTX): NOT auto-attached. They're decoded to disk under `./digi-setu/extracts/<doc-stem>-<hash>/image-N.png` (workspace-relative) and the markdown you receive contains `![alt](./digi-setu/.../image-N.png)` references. If a particular image matters for your answer (a chart, a screenshot, a diagram), follow up with `read('./digi-setu/.../image-N.png')` to load JUST that one as a vision attachment. Skipping unimportant images keeps your context spend sane — auto-attaching every photo a 30-page DOCX contains would burn 50k+ tokens per image for content the user often doesn't care about.",
+			"",
+			"Output cap: 200 KB. A 1M-row XLSX is hard-capped with a truncation marker — for sheets that big, use `bash` + `xlsx2csv` / `csvkit` / `pandas` against the original file instead of asking for the full markdown extraction.",
+			"",
+			"Cached server-side by (path, mtime, size, extract_dir) so repeated calls on the same file revision are sub-millisecond and re-use the same on-disk image dir (no duplicate writes).",
+			"",
+			"For PURE TEXT (markdown, source code, config files): keep using `read`.",
+			"For IMAGES (jpg / png / gif / webp / svg-as-image): keep using `read` — those get inlined as vision attachments.",
+			"For everything else (office docs, ebooks, email, RTF): use `read_doc`.",
+		].join("\n"),
+		promptSnippet:
+			"read_doc(path) — extract binary doc (PDF/DOCX/XLSX/PPTX/EPUB/MSG/EML/…) to Markdown via markitdown. Embedded images dumped to ./digi-setu/extracts/<stem>-<hash>/ and referenced as paths — call read() on the path to load any image you actually need to see.",
+		parameters: Type.Object({
+			path: Type.String({
+				description:
+					"Path to the document. Either absolute, or relative to the workspace cwd (we resolve the same way `read` does).",
+			}),
+		}),
+		execute: async (_id, params, signal) => {
+			type DocDetails = {
+				ok: boolean;
+				path?: string;
+				bytes?: number;
+				cached?: boolean;
+				elapsedMs?: number;
+				error?: string;
+				imagesExtracted?: number;
+				extractDirRel?: string | null;
+			};
+			const sidecar = (process.env.PI_SIDECAR_URL ?? "").replace(/\/+$/, "");
+			const token = process.env.PI_INTERNAL_TOKEN ?? "";
+			if (!sidecar || !token) {
+				const msg =
+					"read_doc is unavailable in this runtime (no PI_SIDECAR_URL / PI_INTERNAL_TOKEN). Use bash + a format-specific CLI, or copy the file out and re-attach it.";
+				return {
+					content: [{ type: "text" as const, text: msg }],
+					details: { ok: false, error: "no sidecar route" } as DocDetails,
+					isError: true,
+				};
+			}
+
+			// Resolve relative paths against pi's cwd, same as the
+			// builtin `read`. Absolute paths pass through unchanged.
+			const rawPath = params.path;
+			const absolute = path.isAbsolute(rawPath) ? rawPath : path.resolve(cwd, rawPath);
+
+			const t0 = Date.now();
+			const ac = new AbortController();
+			const onParentAbort = () => ac.abort(signal?.reason);
+			signal?.addEventListener?.("abort", onParentAbort);
+			let resp: Response;
+			try {
+				// `workspace_cwd` is what unlocks server-side image
+				// extraction. The backend writes images under
+				// <cwd>/digi-setu/extracts/<stem>-<hash>/ and the
+				// returned markdown references them via workspace-
+				// relative paths the agent's `read` tool can resolve
+				// directly. Without this field the backend falls back
+				// to one-line stripped placeholders.
+				resp = await fetch(`${sidecar}/api/internal/extract-md`, {
+					method: "POST",
+					signal: ac.signal,
+					headers: {
+						"Content-Type": "application/json",
+						Authorization: `Bearer ${token}`,
+					},
+					body: JSON.stringify({
+						abs_path: absolute,
+						workspace_cwd: cwd,
+					}),
+				});
+			} catch (err: unknown) {
+				signal?.removeEventListener?.("abort", onParentAbort);
+				const msg = err instanceof Error ? err.message : String(err);
+				return {
+					content: [{
+						type: "text" as const,
+						text: `read_doc: failed to reach sidecar at ${sidecar}: ${msg}`,
+					}],
+					details: { ok: false, error: msg, path: absolute } as DocDetails,
+					isError: true,
+				};
+			}
+			signal?.removeEventListener?.("abort", onParentAbort);
+
+			if (!resp.ok) {
+				const bodyText = await resp.text().catch(() => "");
+				const msg = `HTTP ${resp.status}: ${bodyText.slice(0, 500)}`;
+				return {
+					content: [{
+						type: "text" as const,
+						text: `read_doc: extract-md endpoint returned ${msg}`,
+					}],
+					details: { ok: false, error: msg, path: absolute } as DocDetails,
+					isError: true,
+				};
+			}
+			const data = (await resp.json()) as {
+				markdown: string | null;
+				error: string | null;
+				cached: boolean;
+				images_extracted?: number;
+				extract_dir_rel?: string | null;
+			};
+			const elapsed = Date.now() - t0;
+
+			if (data.error) {
+				return {
+					content: [{
+						type: "text" as const,
+						text: `read_doc: ${data.error} (${path.basename(absolute)})`,
+					}],
+					details: { ok: false, error: data.error, path: absolute, elapsedMs: elapsed } as DocDetails,
+					isError: true,
+				};
+			}
+			const md = data.markdown ?? "";
+			const imagesN = data.images_extracted ?? 0;
+			const extractDir = data.extract_dir_rel ?? null;
+			// Inline image-extraction status into the response header so
+			// the agent SEES at a glance how many images live on disk
+			// and where — this is the cue to call `read('./digi-setu/...')`
+			// on a specific image only when the question actually
+			// requires looking at it.
+			const imageNote =
+				imagesN > 0 && extractDir
+					? ` · ${imagesN} image${imagesN === 1 ? "" : "s"} → \`./${extractDir}/image-N.*\``
+					: "";
+			const header =
+				`# ${path.basename(absolute)}\n` +
+				`_${md.length.toLocaleString()} chars · ${elapsed}ms${data.cached ? " · cached" : ""}${imageNote}_\n\n`;
+			return {
+				content: [{ type: "text" as const, text: header + md }],
+				details: {
+					ok: true,
+					path: absolute,
+					bytes: md.length,
+					cached: data.cached,
+					elapsedMs: elapsed,
+					imagesExtracted: imagesN,
+					extractDirRel: extractDir,
+				} as DocDetails,
+			};
+		},
+	});
+
 	// ── list_packages ──────────────────────────────────────────────────────
 	pi.registerTool({
 		name: "list_packages",

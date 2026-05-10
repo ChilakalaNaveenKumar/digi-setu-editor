@@ -106,7 +106,7 @@ def stub_upstream(monkeypatch):
     """Replace the Vertex callers with deterministic canned tuples."""
     import routes.typst_docs as typst
 
-    async def _fake_google(*, model_id, persona, query, package, corpus_text):
+    async def _fake_google(*, model_id, persona, query, package, corpus_text, full_corpus=None):
         return (
             "Here is your answer.\n\nguides/cetz/sample-0.md mentions stuff.\n",
             {"input": 200000, "output": 100, "cacheRead": 199500, "cacheWrite": 0},

@@ -147,9 +147,17 @@ async function _refreshOffice(): Promise<void> {
     const res = await previewMarkdown(workspace.activeId, props.path);
     if (res.error) {
       officeError.value = res.error;
-    } else {
+    } else if (res.markdown !== null && res.markdown !== undefined) {
+      // markitdown produced an empty string for some files (e.g. blank
+      // .docx). That's fine — render it as an empty doc, not as "Failed".
       officeMarkdown.value = res.markdown;
       officeFromCache.value = res.cached;
+    } else {
+      // Defensive: backend gave us neither markdown nor error. This
+      // shouldn't happen but if the schema ever drifts we don't want a
+      // silently blank preview pane.
+      officeError.value =
+        "Preview returned no content. The file may be empty or unsupported by markitdown.";
     }
   } catch (exc) {
     officeError.value = exc instanceof Error ? exc.message : String(exc);

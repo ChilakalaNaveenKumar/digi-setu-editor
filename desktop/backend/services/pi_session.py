@@ -772,6 +772,35 @@ class PiSession:
         if self._permission_mode_file_host:
             env["PI_PERMISSION_MODE_FILE"] = str(self._permission_mode_file_host)
 
+        # ── Internal HTTP back-channel for the read_doc tool ────────────
+        #
+        # The pi child needs to call /api/internal/extract-md (markitdown
+        # extraction for binary docs). Stuff PI_SIDECAR_URL +
+        # PI_INTERNAL_TOKEN into the spawn env so the JS extension knows
+        # where to POST. The token is minted by services/internal_auth
+        # on first call and pinned to os.environ; we forward it
+        # explicitly so a clean spawn env (the docker path elsewhere
+        # in this file deliberately doesn't inherit os.environ) still
+        # gets it.
+        try:
+            from services.internal_auth import get_backend_base_url, get_internal_token
+
+            env["PI_SIDECAR_URL"] = get_backend_base_url()
+            env["PI_INTERNAL_TOKEN"] = get_internal_token()
+        except Exception as _exc:  # noqa: BLE001
+            # If the auth helper failed to mint a token (filesystem
+            # weirdness, monkey-patched secrets, …) the read_doc tool
+            # will skip its remote path and the AI falls back to the
+            # builtin `read` — degraded but not broken. Log so it shows
+            # up in support tickets.
+            import sys as _sys
+
+            print(
+                f"[pi_session] WARN: internal-auth wiring failed ({_exc}); "
+                "read_doc tool disabled for this session",
+                file=_sys.stderr,
+            )
+
         # ── Desktop runtime override ─────────────────────────────────
         # When the Tauri shell launches the backend it sets two env
         # vars pointing at the bundled Node + pi-coding-agent install

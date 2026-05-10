@@ -68,6 +68,7 @@ from routes import (
     files,
     fs,
     health,
+    internal,
     llm_relay,
     models as models_route,
     typst_docs,
@@ -115,10 +116,81 @@ async def _lifespan(app: FastAPI):
 
     egress_proxy.start_egress_proxy()
 
+    # ── Pre-warm the Gemini explicit context cache for search_docs ──
+    # Per-package caches expire on a 24 h TTL; doing this in the
+    # background here means the FIRST real user request finds them
+    # already warm. Failures are logged inside the helper and never
+    # propagate — startup must not block on a Vertex hiccup.
+    import asyncio as _asyncio
+    _asyncio.create_task(_prewarm_typst_cache())
+
     try:
         yield
     finally:
         egress_proxy.stop_egress_proxy()
+
+
+async def _prewarm_typst_cache() -> None:
+    """Build all 7 search_docs caches in lockstep at startup. Pulled out
+    of the lifespan body so we can ``create_task`` it without the
+    nested-function closure ceremony."""
+    import sys as _sys
+
+    try:
+        from routes.llm_relay import (  # type: ignore
+            _adc_token,
+            _gcp_project,
+            _resolve_google_location,
+            _vertex_host,
+        )
+        from routes.typst_docs import (  # type: ignore
+            _RULES,
+            _ensure_corpus,
+            _persona_for,
+            _router_model,
+        )
+        from services import gemini_cache
+    except ImportError as exc:
+        print(f"[lifespan] typst-cache prewarm import failed: {exc}", file=_sys.stderr)
+        return
+
+    if gemini_cache.is_disabled():
+        print("[lifespan] explicit cache disabled — skipping prewarm", file=_sys.stderr)
+        return
+
+    try:
+        corpus = await _ensure_corpus()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[lifespan] corpus load failed: {exc}", file=_sys.stderr)
+        return
+
+    project = _gcp_project()
+    if not project:
+        # Most likely a local dev env without GCP wired up — that's
+        # fine, the search_docs route returns a clear 503 in that
+        # case and there's nothing to cache anyway.
+        print("[lifespan] GOOGLE_CLOUD_PROJECT unset; skipping cache prewarm", file=_sys.stderr)
+        return
+
+    model_id = _router_model()
+    location = _resolve_google_location(model_id)
+    host = _vertex_host(location)
+
+    print(
+        f"[lifespan] pre-warming typst-docs cache for {len(corpus)} package(s) "
+        f"(model={model_id}, location={location})",
+        file=_sys.stderr,
+    )
+    await gemini_cache.prewarm_caches(
+        corpus=corpus,
+        persona_for=_persona_for,
+        rules=_RULES,
+        model_id=model_id,
+        project=project,
+        location=location,
+        host=host,
+        token_provider=_adc_token,
+    )
 
 
 def create_app() -> FastAPI:
@@ -139,6 +211,10 @@ def create_app() -> FastAPI:
     # Order doesn't matter functionally; grouped by concern for readability.
     app.include_router(health.router)
     app.include_router(config_route.router)
+    # Loopback-only routes consumed by the spawned pi child (read_doc
+    # → markitdown). NOT proxied by Caddy — see routes/internal.py for
+    # the full threat model + auth.
+    app.include_router(internal.router)
 
     app.include_router(workspaces.router)
     app.include_router(sessions.router)

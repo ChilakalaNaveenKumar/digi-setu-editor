@@ -26,12 +26,24 @@ if [[ ! -d "$VENV" ]]; then
     # shellcheck disable=SC1091
     source "$VENV/bin/activate"
     python -m pip install --upgrade pip
-    python -m pip install -r "$BACKEND_DIR/requirements.txt"
     deactivate || true
 fi
 
 # shellcheck disable=SC1091
 source "$VENV/bin/activate"
+
+# Always sync requirements.txt — pip is idempotent, so this is a no-op
+# (~1 s of metadata fetches) when the venv is already up-to-date but it
+# saves us from "I built a sidecar yesterday before we added markitdown,
+# the spec lists it as a hidden import, but the import itself errors at
+# runtime because the package isn't actually in this venv". The
+# end-user symptom of THAT bug is the read_doc tool returning the
+# "install markitdown" placeholder from the frozen sidecar — same
+# placeholder a fresh local dev pre-pip-install would see, but the
+# end-user has no venv to fix.
+echo "[build] Syncing $BACKEND_DIR/requirements.txt into venv…"
+python -m pip install --quiet --disable-pip-version-check \
+    -r "$BACKEND_DIR/requirements.txt"
 
 # Make sure PyInstaller is installed in the venv. We do this lazily so
 # we don't bloat the prod requirements.txt with a build-time dep.

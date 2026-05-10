@@ -82,12 +82,23 @@ async def get_preview_markdown(
     browser's native viewer (richer fidelity); they only hit this endpoint
     when the user clicks "Read as text" for a scanned/searchable PDF.
 
+    Embedded images: for DOCX/PPTX, markitdown emits inline base64 photos
+    by default. We extract those to a workspace sidecar dir
+    (``digi-setu/extracts/<stem>-<hash>/``) and rewrite the markdown to
+    reference them via workspace-relative paths. The frontend's markdown
+    renderer resolves those paths through the same authed
+    ``/files/raw?path=…`` plumbing it uses everywhere else, so the human
+    sees the photos inline AND the AI's read_doc tool sees the exact
+    same paths it can hand to its `read` tool. One source of truth.
+
     Returns:
         {
             "path": "...",
-            "markdown": "...",     # only if extraction succeeded
-            "error":    "...",     # only if it failed (mutually exclusive)
-            "cached":   true/false # whether served from in-process cache
+            "markdown": "...",          # only if extraction succeeded
+            "error":    "...",          # only if it failed
+            "cached":   true/false,
+            "imagesExtracted": int,     # 0 when no images found
+            "extractDirRel":   "..."    # workspace-relative; null if 0 images
         }
     """
     ws = workspace_path_for_user_or_404(wsid, user_id)
@@ -99,10 +110,44 @@ async def get_preview_markdown(
         raise HTTPException(status_code=404, detail=f"file not found: {path}")
     if not abs_path.is_file():
         raise HTTPException(status_code=400, detail=f"not a regular file: {path}")
-    res = extract_to_markdown(abs_path)
+
+    # Build a deterministic per-revision extract dir under the workspace.
+    # Same hash scheme the internal AI route uses, so a DOCX previewed
+    # by the human and read_doc'd by the AI hits the same dir → same
+    # image paths → no duplication on disk.
+    import hashlib as _hashlib
+    import re as _re
+
+    stat = abs_path.stat()
+    digest = _hashlib.sha1(
+        f"{abs_path.resolve()}:{stat.st_mtime_ns}:{stat.st_size}".encode("utf-8"),
+    ).hexdigest()[:8]
+    stem_slug = _re.sub(r"[^a-zA-Z0-9._-]+", "-", abs_path.stem).strip("-") or "doc"
+    extract_dir_rel = f"digi-setu/extracts/{stem_slug}-{digest}"
+    extract_dir = ws / extract_dir_rel
+    rel_prefix: str | None
+    try:
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        # Workspace-relative (no leading "./") so the markdown
+        # renderer's URL resolver sees a path it can hand straight to
+        # the /files/raw endpoint without any cleanup.
+        rel_prefix = extract_dir_rel
+    except OSError:
+        # Filesystem RO or no perms — fall back to no-extract mode
+        # rather than 500ing. The user still gets the text.
+        extract_dir = None  # type: ignore[assignment]
+        rel_prefix = None
+
+    res = extract_to_markdown(
+        abs_path,
+        extract_dir=extract_dir,
+        rel_prefix=rel_prefix,
+    )
     return {
         "path": path,
         "markdown": res.markdown,
         "error": res.error,
         "cached": res.cached,
+        "imagesExtracted": res.images_extracted,
+        "extractDirRel": rel_prefix if res.images_extracted > 0 else None,
     }

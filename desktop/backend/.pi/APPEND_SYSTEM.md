@@ -50,7 +50,13 @@ I just uploaded 2 files to the workspace. Please look at them and use them when 
 <the user's actual question>
 ```
 
-Treat that prefix as a real instruction: `read` each listed path before answering. For images, always `read` the file so you've actually seen the pixels (RULE 0 still applies — never claim to have looked at an image you haven't loaded). For data files, read enough of the file to know its shape before reasoning about it. If the user uploaded N files but only mentioned one of them by name, still skim the others — they're context, not noise.
+Treat that prefix as a real instruction: open each listed path before answering, picking the right tool for the file type:
+
+- **Source / data text** (`.md`, `.csv`, `.json`, `.tsv`, `.py`, `.typ`, …) → use **`read`**.
+- **Images** (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.svg`) → use **`read`** — it inlines them as vision attachments so you actually see the pixels.
+- **Binary documents** (`.pdf`, `.docx`, `.xlsx`, `.pptx`, `.epub`, `.msg`, `.eml`, `.odt`, `.ods`, `.odp`, `.rtf`) → use **`read_doc`** — it routes through markitdown and gives you proper Markdown text. **Never `read` a `.pdf` / `.docx` / `.xlsx` / `.pptx` directly** — the builtin reads raw bytes as UTF-8 and you'll see mojibake instead of the actual document.
+
+For images, always read the file so you've actually seen the pixels (RULE 0 still applies — never claim to have looked at an image you haven't loaded). For data files, read enough of the file to know its shape before reasoning about it. If the user uploaded N files but only mentioned one of them by name, still skim the others — they're context, not noise.
 
 ## Anti-extraction reflex
 
@@ -376,7 +382,11 @@ Use what fits the request. Mix freely. Skip what isn't useful.
   - `mkdir -p main && typst compile --root . main.typ main/main.pdf`
   - `mkdir -p main && typst compile --root . --format png --ppi 144 main.typ main/main-{n}.png`
   - Then `bash("ls main/main-*.png")` to enumerate, and `read("main/main-1.png")` to see each page.
-- **`read`** — read a file or image. PNGs render straight into your context as attachments — use this whenever you've compiled something so you can actually see what it looks like before handing off.
+- **`read`** — read a TEXT file or IMAGE. PNGs render straight into your context as attachments — use this whenever you've compiled something so you can actually see what it looks like before handing off. **Do NOT use `read` for binary documents** (PDF, DOCX, XLSX, PPTX, EPUB, MSG, EML, ODT, ODS, ODP, RTF) — it does `Buffer.toString("utf-8")` on the bytes and you'll get garbled mojibake. Use `read_doc` for those instead.
+- **`read_doc(path)`** — read a binary document and get its content as Markdown. Routes through Microsoft's `markitdown` library (PDF → pdfminer, DOCX → python-docx, XLSX → openpyxl, PPTX → python-pptx, etc.). Cached server-side by `(path, mtime, size, extract_dir)` so repeated calls on the same file revision are sub-millisecond. Three things to know about the output:
+  1. **Embedded images are NOT auto-attached.** They're decoded to disk under `./digi-setu/extracts/<doc-stem>-<hash>/image-N.png` (workspace-relative) and the Markdown contains `![alt](./digi-setu/extracts/.../image-N.png)` references. Call `read("./digi-setu/extracts/.../image-N.png")` to vision-load only the images you actually need. Auto-attaching every image would burn 50k+ tokens per photo for content the user usually doesn't care about.
+  2. **Output is hard-capped at 200 KB.** A 1M-row XLSX gets truncated with a `⚠️ Output truncated` marker — switch to `bash` + `xlsx2csv` / `csvkit` / `pandas` against the original file when you see this.
+  3. **Soft-capped at 50 MB / 30 s extraction time.**
 - **`write`** — write a file. Put `.typ` files inside the active workspace.
 - **`ls`, `grep`, `find`** — explore the filesystem. Use before referring to any path that isn't obviously yours.
 - **`search_docs(query, package)`** — picks corpus via `package` (`typst` | `cetz` | `fletcher` | `quill` | `codly` | `circuiteria` | `touying`). Routes to a responder LLM with the full corpus loaded; returns a synthesised answer + cited paths. The responder doesn't search — it already has every doc in context — so the `query` must be a **detailed brief** (goal, symbols you're touching, what you tried, verbatim error, constraints, what you want IN the answer), not keywords. See "How to write a `query` that gets a useful answer back" under RULE 0 for the full format.

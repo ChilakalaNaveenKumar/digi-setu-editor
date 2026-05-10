@@ -265,12 +265,36 @@ async function ctxDelete(): Promise<void> {
   await files.deletePath(n.path);
 }
 
-async function ctxCopyPath(): Promise<void> {
+// VS Code parity:
+//   "Copy Path"           → ABSOLUTE path on disk (cwd + relative).
+//                            Most useful for shell tools, IDE search,
+//                            paste-into-Finder.
+//   "Copy Relative Path"  → workspace-relative (matches what the AI's
+//                            tools and our own routes accept).
+async function ctxCopyAbsolutePath(): Promise<void> {
+  const n = menu.value.node;
+  closeContextMenu();
+  if (!n) return;
+  const cwd = (session.value?.cwd ?? "").replace(/\/+$/, "");
+  // Fall back gracefully if we somehow don't have a cwd (anonymous web
+  // mode) — copying the workspace-relative path is a strict superset
+  // of "no copy at all".
+  const text = cwd ? `${cwd}/${n.path}` : n.path;
+  try {
+    await navigator.clipboard.writeText(text);
+    ui.toast({ message: "Path copied to clipboard", kind: "success", ttl: 1500 });
+  } catch {
+    /* ignore */
+  }
+}
+
+async function ctxCopyRelativePath(): Promise<void> {
   const n = menu.value.node;
   closeContextMenu();
   if (!n) return;
   try {
     await navigator.clipboard.writeText(n.path);
+    ui.toast({ message: "Relative path copied", kind: "success", ttl: 1500 });
   } catch {
     /* ignore */
   }
@@ -559,10 +583,22 @@ const canPaste = computed(() => fsClipboard.value !== null);
       <button
         type="button"
         class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-body hover:bg-accent"
-        @click="ctxCopyPath"
+        title="Copy the absolute filesystem path (good for terminal, Finder, external editors)"
+        @click="ctxCopyAbsolutePath"
       >
         <Icon icon="codicon:copy" class="h-[14px] w-[14px] text-muted-foreground" />
         Copy Path
+        <span class="ml-auto font-mono text-caption text-muted-foreground">⌥⌘C</span>
+      </button>
+      <button
+        type="button"
+        class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-body hover:bg-accent"
+        title="Copy the path relative to this workspace (good for AI prompts and our APIs)"
+        @click="ctxCopyRelativePath"
+      >
+        <Icon icon="codicon:references" class="h-[14px] w-[14px] text-muted-foreground" />
+        Copy Relative Path
+        <span class="ml-auto font-mono text-caption text-muted-foreground">⌥⇧⌘C</span>
       </button>
       <div class="border-t border-border"></div>
       <button

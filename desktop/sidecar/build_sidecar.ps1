@@ -20,11 +20,24 @@ if (-not (Test-Path $Venv)) {
     Write-Host "[build] backend venv missing at $Venv - creating it now..."
     & python -m venv $Venv
     & (Join-Path $Venv "Scripts\python.exe") -m pip install --upgrade pip
-    & (Join-Path $Venv "Scripts\python.exe") -m pip install -r (Join-Path $BackendDir "requirements.txt")
 }
 
 # Activate the venv for this script's lifetime.
 . (Join-Path $Venv "Scripts\Activate.ps1")
+
+# Always sync requirements.txt against the venv. pip is idempotent so
+# this is a no-op when nothing has changed, but it saves us from the
+# "venv was created two PRs ago, requirements have grown since, the
+# spec file still lists the new packages as hidden imports, frozen
+# binary import-errors at runtime" failure mode. Symptom for the
+# end-user: read_doc returns the markitdown-not-installed placeholder
+# even though everything was supposed to be bundled.
+Write-Host "[build] Syncing $BackendDir\requirements.txt into venv..."
+& python -m pip install --quiet --disable-pip-version-check `
+    -r (Join-Path $BackendDir "requirements.txt")
+if ($LASTEXITCODE -ne 0) {
+    throw "pip install -r requirements.txt failed (exit $LASTEXITCODE)"
+}
 
 # Lazy-install PyInstaller — keeps it out of the prod requirements.txt.
 #

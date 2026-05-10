@@ -39,6 +39,7 @@ import DiffView from "./tools/DiffView.vue";
 import CodeEditor from "./CodeEditor.vue";
 import EditorTabs from "./EditorTabs.vue";
 import FilePreview from "./FilePreview.vue";
+import { useEditorPrefsStore, type AutoSaveMode } from "../stores/editor-prefs";
 
 const files = useFilesStore();
 const snapshots = useSnapshotsStore();
@@ -88,6 +89,39 @@ const dirty = ref(false);
 const saving = ref(false);
 const saveError = ref<string | null>(null);
 const codeEditorRef = ref<InstanceType<typeof CodeEditor> | null>(null);
+
+// ── Auto-save UI ───────────────────────────────────────────────────────
+//
+// The actual auto-save logic lives in CodeEditor.vue; this component
+// just exposes the toggle so the user can switch modes without leaving
+// the editor view. The popover stays minimal (three radios + a delay
+// input) — anything richer would belong in a real settings panel.
+const editorPrefs = useEditorPrefsStore();
+const { autoSave, autoSaveDelayMs } = storeToRefs(editorPrefs);
+const showAutoSaveMenu = ref(false);
+
+const autoSaveLabel = computed(() => {
+  switch (autoSave.value) {
+    case "afterDelay":
+      return `auto · ${(autoSaveDelayMs.value / 1000).toFixed(autoSaveDelayMs.value % 1000 === 0 ? 0 : 1)}s`;
+    case "onBlur":
+      return "auto · on blur";
+    default:
+      return "manual";
+  }
+});
+
+function setAutoSaveMode(mode: AutoSaveMode): void {
+  editorPrefs.setAutoSave(mode);
+}
+
+function toggleAutoSaveMenu(): void {
+  showAutoSaveMenu.value = !showAutoSaveMenu.value;
+}
+
+function closeAutoSaveMenu(): void {
+  showAutoSaveMenu.value = false;
+}
 
 function onDirty(next: boolean): void {
   dirty.value = next;
@@ -188,14 +222,34 @@ async function downloadOpenFile(): Promise<void> {
   }
 }
 
-/** Esc to exit review mode — matches Cursor's keymap. */
+/** Esc to exit review mode — matches Cursor's keymap. Also closes the
+ *  auto-save popover so it never strands open. */
 function onKeydown(e: KeyboardEvent): void {
-  if (e.key === "Escape" && inReview.value) {
-    snapshots.exitReviewMode();
+  if (e.key === "Escape") {
+    if (showAutoSaveMenu.value) {
+      showAutoSaveMenu.value = false;
+      return;
+    }
+    if (inReview.value) {
+      snapshots.exitReviewMode();
+    }
   }
 }
-onMounted(() => window.addEventListener("keydown", onKeydown));
-onUnmounted(() => window.removeEventListener("keydown", onKeydown));
+function onClickOutsideAutoSave(e: MouseEvent): void {
+  if (!showAutoSaveMenu.value) return;
+  const target = e.target as HTMLElement | null;
+  if (!target?.closest?.(".editor-header")) {
+    showAutoSaveMenu.value = false;
+  }
+}
+onMounted(() => {
+  window.addEventListener("keydown", onKeydown);
+  window.addEventListener("click", onClickOutsideAutoSave);
+});
+onUnmounted(() => {
+  window.removeEventListener("keydown", onKeydown);
+  window.removeEventListener("click", onClickOutsideAutoSave);
+});
 
 const scroller = ref<HTMLDivElement | null>(null);
 const stickToBottom = ref(true);
@@ -468,6 +522,77 @@ watch(
           {{ saving ? "saving…" : dirty ? "● save" : "saved" }}
         </button>
 
+        <!-- Auto-save mode popover. VS Code parity: lets the user pick
+             "off" (Cmd/S only), "afterDelay" (debounced auto-save) or
+             "onBlur" (save on focus loss). Pref persists in localStorage
+             via useEditorPrefsStore. -->
+        <div v-if="isEditableMode" class="relative">
+          <button
+            type="button"
+            class="flex items-center gap-1 rounded-sm border border-border bg-background px-1.5 py-0.5 font-mono text-caption text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+            :title="`Auto-save: ${autoSaveLabel}. Click to change.`"
+            @click="toggleAutoSaveMenu"
+          >
+            <Icon
+              :icon="autoSave === 'off' ? 'codicon:circle-large-outline' : 'codicon:save'"
+              class="h-3 w-3"
+            />
+            <span class="hide-on-narrow">{{ autoSaveLabel }}</span>
+            <Icon icon="codicon:chevron-down" class="h-3 w-3 opacity-60" />
+          </button>
+          <Transition
+            enter-active-class="transition duration-100 ease-out"
+            enter-from-class="opacity-0 -translate-y-1"
+            leave-active-class="transition duration-75 ease-in"
+            leave-to-class="opacity-0 -translate-y-1"
+          >
+            <div
+              v-if="showAutoSaveMenu"
+              class="absolute right-0 top-full z-30 mt-1 w-56 rounded-md border border-border bg-popover py-1 text-popover-foreground shadow-lg"
+              @click.stop
+            >
+              <div class="px-3 py-1.5 text-caption uppercase tracking-wide text-muted-foreground">
+                Auto-save
+              </div>
+              <button
+                v-for="opt in [
+                  { id: 'off', label: 'Off (manual ⌘/Ctrl+S)', hint: 'Default. You decide when to save.' },
+                  { id: 'afterDelay', label: `After delay (${(autoSaveDelayMs / 1000).toFixed(autoSaveDelayMs % 1000 === 0 ? 0 : 1)}s)`, hint: 'Save 1s after you stop typing.' },
+                  { id: 'onBlur', label: 'On focus change', hint: 'Save when you click away.' },
+                ]"
+                :key="opt.id"
+                type="button"
+                class="flex w-full items-start gap-2 px-3 py-2 text-left text-body hover:bg-accent"
+                :class="autoSave === opt.id && 'bg-accent/50'"
+                @click="setAutoSaveMode(opt.id as AutoSaveMode); closeAutoSaveMenu()"
+              >
+                <Icon
+                  :icon="autoSave === opt.id ? 'codicon:check' : 'codicon:blank'"
+                  class="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary"
+                />
+                <span class="flex flex-col">
+                  <span class="text-foreground">{{ opt.label }}</span>
+                  <span class="text-caption text-muted-foreground">{{ opt.hint }}</span>
+                </span>
+              </button>
+              <div v-if="autoSave === 'afterDelay'" class="border-t border-border px-3 py-2">
+                <label class="flex items-center justify-between gap-2 text-caption text-muted-foreground">
+                  <span>Delay (ms)</span>
+                  <input
+                    type="number"
+                    min="200"
+                    max="30000"
+                    step="100"
+                    :value="autoSaveDelayMs"
+                    class="w-24 rounded-sm border border-input bg-background px-1.5 py-0.5 text-right font-mono text-body text-foreground"
+                    @change="(e) => editorPrefs.setAutoSaveDelay(Number((e.target as HTMLInputElement).value))"
+                  />
+                </label>
+              </div>
+            </div>
+          </Transition>
+        </div>
+
         <span v-if="currentFile" class="hide-on-narrow font-mono uppercase tracking-wide">
           {{ langLabel }}
         </span>
@@ -578,15 +703,34 @@ watch(
       />
     </div>
 
+    <!--
+      Unviewable fallback — true binaries we can't even hand to markitdown
+      (.exe, .bin, large arbitrary archives, …). We still let the user pull
+      the file out via the same auth'd-blob download path used everywhere
+      else, so nothing is ever truly "stuck inside" the workspace.
+    -->
     <div
       v-else-if="isUnviewable"
-      class="flex flex-1 flex-col items-center justify-center text-center text-lead text-muted-foreground"
+      class="flex flex-1 flex-col items-center justify-center gap-3 text-center text-lead text-muted-foreground"
     >
-      <div class="mb-2 text-h1 opacity-30">⊘</div>
-      <p class="mb-1 text-foreground">Can't show this file</p>
+      <div class="text-h1 opacity-30">⊘</div>
+      <p class="text-foreground">Can't show this file</p>
       <p class="max-w-xs text-body">
         {{ currentFile.reason ?? "Binary content not displayed." }}
       </p>
+      <button
+        type="button"
+        class="mt-2 inline-flex items-center gap-1.5 rounded-md border border-border bg-card px-3 py-1.5 text-body text-foreground transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-40"
+        :disabled="downloading"
+        @click="downloadOpenFile"
+      >
+        <Icon
+          :icon="downloading ? 'codicon:loading' : 'codicon:cloud-download'"
+          :class="downloading && 'animate-spin'"
+          class="h-4 w-4"
+        />
+        Download file
+      </button>
     </div>
 
     <!--

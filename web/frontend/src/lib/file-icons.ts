@@ -241,11 +241,26 @@ const EXT_ICONS: Record<string, string> = {
   rst: "material-icon-theme:document",
   txt: "material-icon-theme:document",
   pdf: "material-icon-theme:pdf",
+  // ── Office documents — all routed to the markitdown preview pane.
+  // The matching set on the backend lives in services/paths.py
+  // _OFFICE_EXTS; keep the two in sync when adding a new format.
   doc: "material-icon-theme:word",
   docx: "material-icon-theme:word",
+  odt: "material-icon-theme:document",
+  rtf: "material-icon-theme:document",
   xls: "material-icon-theme:table",
   xlsx: "material-icon-theme:table",
+  ods: "material-icon-theme:table",
   csv: "material-icon-theme:table",
+  tsv: "material-icon-theme:table",
+  ppt: "material-icon-theme:powerpoint",
+  pptx: "material-icon-theme:powerpoint",
+  odp: "material-icon-theme:powerpoint",
+  // EPUB → use the dedicated book glyph so it stands apart from PDFs.
+  epub: "material-icon-theme:book",
+  // Outlook / generic email — same envelope icon for both.
+  msg: "material-icon-theme:email",
+  eml: "material-icon-theme:email",
   // ── images ──────────────────────────────────────────────────────────
   png: "material-icon-theme:image",
   jpg: "material-icon-theme:image",

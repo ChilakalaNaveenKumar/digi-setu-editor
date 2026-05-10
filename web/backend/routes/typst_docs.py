@@ -38,6 +38,25 @@ model is operator-pinned: the user can't pick it, so there's nothing
 to gate. We DO however cost-record the usage against the user's
 ledger — a search_docs call is real spend.
 
+Caching
+-------
+For Gemini models we use **explicit** Vertex context caching
+(``services/gemini_cache.py``) with a 24 h TTL. One ``cachedContents``
+resource per package holds the persona + rules + corpus block; the
+:generateContent call ships only the user's query and references the
+cache by name. This drops wire-time per call from ~1-2 MB to ~5 KB
+and locks billing at 25 % of the standard input rate.
+
+When ANY package's cache is missing or about to expire (10-min grace
+window), all seven refresh together — single source of truth for
+"is the search_docs cache layer warm?". Operators can disable the
+explicit layer with ``PI_TYPST_DISABLE_EXPLICIT_CACHE=1`` to fall
+back to Vertex's free-but-best-effort *implicit* prefix cache.
+
+Anthropic-on-Vertex models keep the existing
+``cache_control: ephemeral`` pattern in :func:`_call_anthropic_vertex`
+— different mechanism, same outcome.
+
 Endpoint
 --------
 - POST /v1/typst/search_docs
@@ -122,6 +141,11 @@ _PACKAGES = {
 # as the extension's `EXCLUDE_VENDORED_PATTERN`.
 _VENDORED_PATTERN = re.compile(r"^guides/[^/]+-\d+\.\d+\.\d+(-[A-Za-z0-9.+-]+)?/")
 
+# Captures the version off a vendored guide folder: ``guides/<pkg>-<semver>/...``.
+# Only ever called against paths the corpus loader has classified as
+# ``guides/<pkg>-…`` — we don't try to be clever about prerelease tags.
+_VENDORED_VERSION_RE = re.compile(r"^guides/(?P<pkg>[^/]+?)-(?P<ver>\d+\.\d+\.\d+(?:-[A-Za-z0-9.+-]+)?)/")
+
 
 def _guides_root() -> Path:
     """Where the corpus lives in the deployed image. Overridable for
@@ -140,6 +164,41 @@ def _guides_root() -> Path:
 
 _CORPUS_CACHE: Optional[dict[str, str]] = None
 _CORPUS_LOCK = asyncio.Lock()
+
+# Cached map of {package_key → vendored semver string on disk}, populated
+# alongside the corpus on first request. We surface this in the
+# validate-footer below so the AI knows which directory under
+# ``guides/`` actually contains source for the package version that
+# generated the answer (RULE 0.5: "validate the hypothesis").
+_VENDORED_VERSIONS: dict[str, str] = {}
+
+
+def _scan_vendored_versions(root: Path) -> dict[str, str]:
+    """Walk one level deep and pick out ``<pkg>-<semver>`` directories.
+
+    If multiple semver dirs exist for the same package we keep the
+    highest one (lexical ``str`` compare on the version string is good
+    enough for the small set we ship; nothing here ships pre-release
+    bumps that would reorder).
+    """
+    found: dict[str, str] = {}
+    if not root.exists():
+        return found
+    valid_keys = set(_PACKAGES.keys()) | {"typst"}
+    for child in root.iterdir():
+        if not child.is_dir():
+            continue
+        m = _VENDORED_VERSION_RE.match(f"guides/{child.name}/")
+        if not m:
+            continue
+        pkg = m.group("pkg")
+        ver = m.group("ver")
+        if pkg not in valid_keys:
+            continue
+        prev = found.get(pkg)
+        if prev is None or ver > prev:
+            found[pkg] = ver
+    return found
 
 
 def _bucket_for(rel: str) -> str:
@@ -199,7 +258,7 @@ def _load_corpus_sync(root: Path) -> dict[str, str]:
 async def _ensure_corpus() -> dict[str, str]:
     """Lazy-load the corpus on first request. Subsequent calls return
     the cached dict (cheap)."""
-    global _CORPUS_CACHE
+    global _CORPUS_CACHE, _VENDORED_VERSIONS
     if _CORPUS_CACHE is not None:
         return _CORPUS_CACHE
     async with _CORPUS_LOCK:
@@ -211,6 +270,10 @@ async def _ensure_corpus() -> dict[str, str]:
         # disk; cold read can take 100–300 ms on a busy VM).
         loop = asyncio.get_event_loop()
         _CORPUS_CACHE = await loop.run_in_executor(None, _load_corpus_sync, root)
+        # Same walk surfaces the on-disk versions we cite in the
+        # validate-against-source footer below. Cheap (one readdir)
+        # so we just do it inline rather than a separate executor hop.
+        _VENDORED_VERSIONS = _scan_vendored_versions(root)
         return _CORPUS_CACHE
 
 
@@ -378,13 +441,34 @@ async def _call_anthropic_vertex(
 
 async def _call_google_vertex(
     *, model_id: str, persona: str, query: str, package: str, corpus_text: str,
+    full_corpus: dict[str, str] | None = None,
 ) -> tuple[str, dict[str, int]]:
     """POST to Vertex's :generateContent for a Gemini model.
 
-    No explicit ``cache_control`` — Vertex's implicit prefix cache fires
-    automatically when ≥ ~32 input tokens are byte-identical across
-    requests, which is true of the persona+rules+corpus prefix every
-    user shares from THIS VM. Cache hit-rate ≈ 100 % after warm-up.
+    Three caching layers, in priority order:
+
+    1. **Explicit context cache** (``services/gemini_cache``). When
+       enabled — default on, kill-switch ``PI_TYPST_DISABLE_EXPLICIT_CACHE``
+       — we look up a per-package ``cachedContents`` resource that
+       holds the persona + rules + corpus block. The call body
+       carries only the user's query (~100 bytes) and references the
+       cache by name. Cached input is billed at 25 % of the standard
+       input rate, and the wire payload drops from ~1-2 MB to ~5 KB.
+
+    2. **Implicit prefix cache** (free, automatic). Used as the
+       fallback when explicit caching is disabled or the package's
+       cache create failed. Vertex matches byte-identical prefixes
+       across requests and discounts the input ~90 %, but only after
+       a warm-up call.
+
+    3. **No cache**. If both above fail (rare; disabled + bug) the
+       call still works at full input rate.
+
+    ``full_corpus`` is passed through so the cache layer can lockstep-
+    refresh ALL packages when any one is stale (per product policy:
+    "one doc type triggers, all docs line up"). When the caller
+    doesn't have the corpus map handy it can pass ``None`` and we'll
+    skip explicit caching for this call.
     """
     project = _gcp_project()
     if not project:
@@ -406,18 +490,59 @@ async def _call_google_vertex(
         f"https://{host}/v1/projects/{project}/locations/{location}"
         f"/publishers/google/models/{model_id}:generateContent"
     )
-    prompt = (
-        f"{persona}\n\n{_RULES}\n\nThe user's brief:\n{query}\n\n"
-        f"The full corpus follows. Read what you need, ignore the rest.\n\n"
-        f"{corpus_text}"
-    )
-    body = {
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.2,
-            "maxOutputTokens": 30000,
-        },
-    }
+
+    # ── Explicit cache lookup ─────────────────────────────────────
+    # Only attempted when the caller threaded through ``full_corpus``
+    # so the cache layer can lockstep-refresh siblings if needed.
+    cached_resource: str | None = None
+    if full_corpus is not None:
+        try:
+            from services import gemini_cache  # local import to avoid cycle
+
+            cached_resource = await gemini_cache.get_or_refresh(
+                package=package,
+                corpus=full_corpus,
+                persona_for=_persona_for,
+                rules=_RULES,
+                model_id=model_id,
+                project=project,
+                location=location,
+                host=host,
+                token_provider=_adc_token,
+            )
+        except Exception as exc:  # noqa: BLE001 - never let a cache bug 502 the route
+            print(
+                f"[typst-docs] gemini_cache lookup failed ({exc}); "
+                "falling back to inline-corpus path",
+                file=sys.stderr,
+            )
+            cached_resource = None
+
+    if cached_resource:
+        # Tiny body: cached prefix already holds persona+rules+corpus.
+        body = {
+            "cachedContent": cached_resource,
+            "contents": [
+                {"role": "user", "parts": [{"text": f"The user's brief:\n{query}"}]},
+            ],
+            "generationConfig": {
+                "temperature": 0.2,
+                "maxOutputTokens": 30000,
+            },
+        }
+    else:
+        prompt = (
+            f"{persona}\n\n{_RULES}\n\nThe user's brief:\n{query}\n\n"
+            f"The full corpus follows. Read what you need, ignore the rest.\n\n"
+            f"{corpus_text}"
+        )
+        body = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.2,
+                "maxOutputTokens": 30000,
+            },
+        }
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
@@ -526,6 +651,7 @@ async def search_docs(
             text, usage = await _call_google_vertex(
                 model_id=model_id, persona=persona, query=query,
                 package=package, corpus_text=corpus_text,
+                full_corpus=corpus,
             )
     except HTTPException:
         raise
@@ -540,6 +666,7 @@ async def search_docs(
 
     elapsed_ms = int((time.monotonic() - started) * 1000)
     answer, cited = _split_answer_and_sources(text)
+    answer = _append_validate_footer(answer, package=package)
 
     _record_cost(
         user_id=principal.user_id,
@@ -557,15 +684,66 @@ async def search_docs(
     }
 
 
+# ── Validate-against-source footer ────────────────────────────────────
+#
+# Pinned to the bottom of every search_docs answer so the calling agent
+# is RE-prompted with RULE 0.5 at the exact moment it's reading the
+# response — much harder to ignore than a system-prompt directive
+# loaded once 50 turns ago. The wording mirrors RULE 0.5 in
+# .pi/APPEND_SYSTEM.md; keep both aligned.
+def _validate_footer_for(package: str) -> str:
+    pkg_label = _PACKAGES.get(package, (package, ""))[0]
+    ver = _VENDORED_VERSIONS.get(package)
+    if ver:
+        loc = f"`guides/{package}-{ver}/`"
+        ver_note = f" (pinned at **{ver}** on this server)"
+    else:
+        loc = f"`guides/{package}/` and any vendored upstream package source"
+        ver_note = ""
+    return (
+        "\n\n---\n\n"
+        f"**⚠ Validate this against {pkg_label} source{ver_note}.** "
+        "The answer above is a hypothesis from a side-LLM that synthesises "
+        "from the docs corpus — it can be confidently wrong, especially on "
+        "parameter names, default values, and \"is there a built-in for X?\" "
+        "questions. Before you ship it:\n\n"
+        f"1. `grep -r` the symbols/keywords claimed above in {loc} and confirm "
+        "the API actually exists with the names + signatures the answer used.\n"
+        "2. If the answer cited a specific function or parameter, open its "
+        "definition file under that path and read it — not the docs ABOUT it.\n"
+        "3. If the symbol isn't there, the answer is wrong. Don't assume the "
+        "user is on a different version; this server pins the version for you."
+    )
+
+
+def _append_validate_footer(answer: str, *, package: str) -> str:
+    """Idempotent: bail if the responder LLM already produced something
+    that looks like our footer (rare but possible — Anthropic models
+    sometimes echo back the rules)."""
+    stripped = answer.rstrip()
+    if "Validate this against" in stripped[-1500:]:
+        return stripped
+    return stripped + _validate_footer_for(package)
+
+
 # ── Health / introspection probe ──────────────────────────────────────
 @router.get("/_health")
 async def typst_docs_health():
     """Public probe — reports which packages have a non-empty corpus on
-    disk. Useful when the deploy went through but the COPY guides/
-    line was missing or the volume mount failed."""
+    disk and the live state of the explicit-cache layer. Useful when
+    the deploy went through but the COPY guides/ line was missing,
+    the volume mount failed, or Vertex caching is silently broken."""
+    from services import gemini_cache  # local import to avoid cycle
+
     corpus = await _ensure_corpus()
     return {
         "guides_root": str(_guides_root()),
         "router_model": _router_model(),
         "packages": {k: len(v) for k, v in corpus.items()},
+        "vendored_versions": dict(_VENDORED_VERSIONS),
+        "explicit_cache": {
+            "disabled": gemini_cache.is_disabled(),
+            "ttl_seconds": gemini_cache._ttl_seconds(),
+            "entries": gemini_cache.snapshot(),
+        },
     }

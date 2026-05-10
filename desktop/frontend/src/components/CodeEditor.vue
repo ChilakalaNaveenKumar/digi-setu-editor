@@ -23,6 +23,8 @@
 -->
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { storeToRefs } from "pinia";
+import { useEditorPrefsStore } from "../stores/editor-prefs";
 import { EditorState, type Extension } from "@codemirror/state";
 import {
   EditorView,
@@ -126,10 +128,63 @@ let view: EditorView | null = null;
 let lastSaved = props.initialContent;
 const isDirty = ref(false);
 
+// ── Auto-save plumbing ─────────────────────────────────────────────────
+//
+// Three modes (matches VS Code's `files.autoSave`):
+//   "off"          — manual Cmd/Ctrl-S only.
+//   "afterDelay"   — debounce N ms after the user stops typing, then
+//                    emit("save"). Same model as VS Code; safe with the
+//                    AI write streaming path because we early-return when
+//                    the editor is read-only or the document content
+//                    matches `lastSaved` (no diff = no save).
+//   "onBlur"       — save when the editor loses focus (clicked away,
+//                    switched tab, opened another file). Matches
+//                    JetBrains' "Save on focus change".
+const editorPrefs = useEditorPrefsStore();
+const { autoSave, autoSaveDelayMs } = storeToRefs(editorPrefs);
+let autoSaveTimer: number | null = null;
+
+function clearAutoSaveTimer(): void {
+  if (autoSaveTimer !== null) {
+    window.clearTimeout(autoSaveTimer);
+    autoSaveTimer = null;
+  }
+}
+
+function flushAutoSave(): void {
+  // Only emit when there's actually something to save AND the editor
+  // is still mounted with a writable view. The dirty flag is the
+  // single source of truth — stale timers that fire after a manual
+  // save (which already set isDirty=false) become no-ops.
+  if (!view || !isDirty.value || props.readonly) return;
+  const content = view.state.doc.toString();
+  if (content === lastSaved) {
+    setDirty(false);
+    return;
+  }
+  lastSaved = content;
+  setDirty(false);
+  emit("save", content);
+}
+
+function scheduleAutoSave(): void {
+  clearAutoSaveTimer();
+  if (autoSave.value !== "afterDelay" || props.readonly) return;
+  autoSaveTimer = window.setTimeout(flushAutoSave, autoSaveDelayMs.value);
+}
+
 function setDirty(next: boolean): void {
   if (isDirty.value === next) return;
   isDirty.value = next;
   emit("update:dirty", next);
+  // When the document just went dirty AND the user opted into delayed
+  // auto-save, start the countdown. Going clean (isDirty=false) clears
+  // any pending timer because there's nothing left to save.
+  if (next) {
+    scheduleAutoSave();
+  } else {
+    clearAutoSaveTimer();
+  }
 }
 
 /** Map an extension or full filename to a CodeMirror language extension.
@@ -423,8 +478,29 @@ function buildExtensions(): Extension[] {
     EditorView.updateListener.of((update) => {
       if (update.docChanged && view) {
         const cur = view.state.doc.toString();
-        setDirty(cur !== lastSaved);
+        const dirtyNext = cur !== lastSaved;
+        setDirty(dirtyNext);
+        // setDirty schedules the timer ONLY on the dirty edge (clean →
+        // dirty). For continuous typing we also want to extend the
+        // debounce on every keystroke so saves don't fire mid-word.
+        if (dirtyNext && autoSave.value === "afterDelay") {
+          scheduleAutoSave();
+        }
       }
+    }),
+    // Save-on-blur: CM6's domEventHandlers gives us a blur on the
+    // editor's content DOM node. We only flush if the user opted into
+    // onBlur AND there are unsaved edits. Other modes ignore this.
+    EditorView.domEventHandlers({
+      blur: () => {
+        if (autoSave.value === "onBlur") {
+          // Defer one tick so re-renders driven by the same blur event
+          // (e.g. clicking a different tab) finish first — saving in the
+          // middle of a tab swap can race with the parent's path watch.
+          queueMicrotask(flushAutoSave);
+        }
+        return false;
+      },
     }),
     EditorView.theme({
       "&": {
@@ -465,21 +541,40 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  // Flush any pending auto-save BEFORE we tear down — losing the timer
+  // otherwise loses a save the user already "committed" to (they
+  // stopped typing, the debounce was about to fire, but they switched
+  // tabs / closed the file fast). Manual Cmd/S users see no diff.
+  flushAutoSave();
+  clearAutoSaveTimer();
   view?.destroy();
   view = null;
 });
 
 // Re-create the editor when the file path changes (different file = fresh
-// state, history reset, language pack swap).
+// state, history reset, language pack swap). Flush first so a stale
+// timer for the OLD file doesn't write the new file's path.
 watch(
   () => props.path,
   () => {
     if (!view) return;
+    flushAutoSave();
+    clearAutoSaveTimer();
     view.setState(makeState(props.initialContent));
     lastSaved = props.initialContent;
     setDirty(false);
   },
 );
+
+// React to live changes of the auto-save mode (settings panel toggle):
+// switching FROM afterDelay cancels the in-flight timer; switching INTO
+// it on a dirty doc starts a fresh countdown immediately.
+watch(autoSave, (mode) => {
+  clearAutoSaveTimer();
+  if (mode === "afterDelay" && isDirty.value) {
+    scheduleAutoSave();
+  }
+});
 
 // External content updates (e.g. agent rewrote the file while the user
 // hadn't touched it). Only swap if the user has NO local edits — otherwise

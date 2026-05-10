@@ -74,6 +74,11 @@ async def get_preview_markdown(
     Convert an office / PDF / etc. document to Markdown via markitdown.
     Frontend renders the returned `markdown` with the same renderer
     used for chat messages.
+
+    Embedded images (DOCX / PPTX) are extracted to a workspace sidecar
+    dir ``digi-setu/extracts/<stem>-<hash>/`` and referenced via
+    workspace-relative paths so the same dir is shared with the AI's
+    read_doc tool — no duplicate disk usage.
     """
     ws = workspace_path_for_user_or_404(wsid, user_id)
     try:
@@ -84,10 +89,37 @@ async def get_preview_markdown(
         raise HTTPException(status_code=404, detail=f"file not found: {path}")
     if not abs_path.is_file():
         raise HTTPException(status_code=400, detail=f"not a regular file: {path}")
-    res = extract_to_markdown(abs_path)
+
+    # Same hash scheme as routes/internal.py so human-preview and AI
+    # read_doc converge on a single extract dir per (file, revision).
+    import hashlib as _hashlib
+    import re as _re
+
+    stat = abs_path.stat()
+    digest = _hashlib.sha1(
+        f"{abs_path.resolve()}:{stat.st_mtime_ns}:{stat.st_size}".encode("utf-8"),
+    ).hexdigest()[:8]
+    stem_slug = _re.sub(r"[^a-zA-Z0-9._-]+", "-", abs_path.stem).strip("-") or "doc"
+    extract_dir_rel = f"digi-setu/extracts/{stem_slug}-{digest}"
+    extract_dir = ws / extract_dir_rel
+    rel_prefix: str | None
+    try:
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        rel_prefix = extract_dir_rel
+    except OSError:
+        extract_dir = None  # type: ignore[assignment]
+        rel_prefix = None
+
+    res = extract_to_markdown(
+        abs_path,
+        extract_dir=extract_dir,
+        rel_prefix=rel_prefix,
+    )
     return {
         "path": path,
         "markdown": res.markdown,
         "error": res.error,
         "cached": res.cached,
+        "imagesExtracted": res.images_extracted,
+        "extractDirRel": rel_prefix if res.images_extracted > 0 else None,
     }

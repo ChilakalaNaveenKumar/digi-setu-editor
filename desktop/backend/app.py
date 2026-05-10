@@ -67,6 +67,7 @@ from routes import (
     files,
     fs,
     health,
+    internal,
     llm_proxy,
     models as models_route,
     prefs,
@@ -152,6 +153,10 @@ def create_app() -> FastAPI:
     # Order doesn't matter functionally; grouped by concern for readability.
     app.include_router(health.router)
     app.include_router(config_route.router)
+    # Loopback-only routes consumed by the spawned pi child (read_doc
+    # → markitdown). NOT proxied to the public internet — see
+    # routes/internal.py for the full threat model + auth.
+    app.include_router(internal.router)
 
     app.include_router(workspaces.router)
     app.include_router(sessions.router)

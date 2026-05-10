@@ -121,25 +121,42 @@ for _md_pkg in (
     except Exception:
         pass
 
-# markitdown ships a converter registry as data files (extension → parser
-# class plug-in points). collect_data_files makes sure those land in the
-# bundle alongside the python code.
-for _data_pkg in ("markitdown", "pdfminer", "pypdf"):
-    try:
-        from PyInstaller.utils.hooks import collect_data_files
-        datas += collect_data_files(_data_pkg)
-    except Exception:
-        pass
-
 
 # ── data files (templates, configs, etc) ──────────────────────────────
 # `web/backend/fonts` is a static asset directory the routes/files.py
 # endpoints read on startup. We bundle the whole tree so the frozen
 # binary self-contains its assets.
+#
+# IMPORTANT: this list MUST be initialised before the markitdown
+# `collect_data_files` block below — that block uses ``datas += …`` and
+# until 2026-05 it lived above this line, NameError'ing into a
+# silently-swallowed try/except so markitdown's parser-registry data
+# files never made it into the bundle. Symptom: frozen sidecar
+# imports markitdown OK but fails at convert time on certain formats.
 datas = []
 fonts_dir = os.path.join(BACKEND_DIR, "fonts")
 if os.path.isdir(fonts_dir):
     datas.append((fonts_dir, "fonts"))
+
+# markitdown ships a converter registry as data files (extension → parser
+# class plug-in points). collect_data_files makes sure those land in the
+# bundle alongside the python code. pdfminer + pypdf carry their own
+# resource tables (cmap data, ToUnicode mappings) we MUST bundle for
+# scanned-PDF text extraction to work in the frozen binary.
+from PyInstaller.utils.hooks import collect_data_files as _collect_data_files
+for _data_pkg in (
+    "markitdown",
+    "pdfminer",
+    "pypdf",
+    "docx",
+    "pptx",
+    "openpyxl",
+    "mammoth",
+):
+    try:
+        datas += _collect_data_files(_data_pkg)
+    except Exception:
+        pass
 
 # Ship desktop/backend/.pi/APPEND_SYSTEM.md so pi_session.py can read
 # it at spawn time and pass it via --append-system-prompt. The file
