@@ -67,6 +67,17 @@ definitions:
     cargo-registry: ~/.cargo/registry
     cargo-git: ~/.cargo/git
     cargo-target: desktop/src-tauri/target/x86_64-unknown-linux-gnu
+    # Caches the rustup toolchain (~150 MB: stdlib + linker + std for the
+    # x86_64-unknown-linux-gnu target). Without this, every linux-release
+    # spends ~60 s redownloading the toolchain.
+    rustup-toolchain: ~/.rustup
+    # Caches the gcloud SDK install dir (~80 MB) so subsequent runs skip
+    # the curl|bash bootstrap that adds ~30 s to every step.
+    gcloud-sdk: /opt/google-cloud-sdk
+    # Caches the apt package archive (~250 MB across all the GTK/Tauri
+    # build deps). With it, apt-get install is a 5-second metadata refresh
+    # instead of a 60-second download.
+    apt-archive: /var/cache/apt/archives
 
   services:
     # Bumped from the default 1 GB so the docker container that runs
@@ -136,6 +147,9 @@ definitions:
           - cargo-registry
           - cargo-git
           - cargo-target
+          - rustup-toolchain
+          - gcloud-sdk
+          - apt-archive
           - node
         script:
           # tzdata + a few other apt packages (libssl, dpkg-dev) try to
@@ -147,6 +161,11 @@ definitions:
           - export DEBIAN_FRONTEND=noninteractive
           - export TZ=Etc/UTC
           - ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+          # Keep the apt archive cache populated across runs: turn off
+          # the auto-clean hook that defaults to nuking /var/cache/apt
+          # at the end of every transaction.
+          - rm -f /etc/apt/apt.conf.d/docker-clean
+          - echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/01keep-debs
           - apt-get update -qq
           - >
             apt-get install -y --no-install-recommends
@@ -157,15 +176,23 @@ definitions:
             liblzma-dev libreadline-dev tk-dev libncurses-dev
             desktop-file-utils fakeroot dpkg-dev
             software-properties-common gnupg lsb-release python3
+            openssh-client
           - add-apt-repository -y ppa:deadsnakes/ppa
           - apt-get install -y --no-install-recommends python3.11 python3.11-venv python3.11-dev
           - curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
           - apt-get install -y --no-install-recommends nodejs
-          - curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
+          # Reuse cached rustup if present (saves ~60s); otherwise install fresh.
+          - >
+            if [ ! -x "$HOME/.cargo/bin/rustup" ]; then
+              curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain stable;
+            fi
           - source $HOME/.cargo/env
           - rustup target add x86_64-unknown-linux-gnu
+          # Reuse cached gcloud SDK if present (saves ~30s).
           - >
-            curl -fsSL https://sdk.cloud.google.com | bash -s -- --disable-prompts --install-dir=/opt
+            if [ ! -x "/opt/google-cloud-sdk/bin/gcloud" ]; then
+              curl -fsSL https://sdk.cloud.google.com | bash -s -- --disable-prompts --install-dir=/opt;
+            fi
           - export PATH="/opt/google-cloud-sdk/bin:$PATH"
           - echo "$GCP_SA_KEY_B64" | base64 -d > /tmp/sa.json
           - gcloud auth activate-service-account --key-file=/tmp/sa.json
