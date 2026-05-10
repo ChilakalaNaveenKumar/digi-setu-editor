@@ -110,16 +110,22 @@ jobs:
         if: steps.flags.outputs.has_ts == 'true'
         shell: pwsh
         run: |
-          # The Dlib ships as a NuGet package. Pull it once into a
-          # workspace-local folder so signtool /dlib points at a stable
-          # path that survives the rest of the job. We install via
-          # dotnet so we don't need an Azure CLI dependency at runtime.
-          dotnet tool install --tool-path .dlib `
-            Microsoft.Trusted.Signing.Client.PSCmdlets
-          # Resolve the assembly path; the actual DLL location varies
-          # slightly between versions of the cmdlets package.
+          # Microsoft renamed the package from Microsoft.Trusted.Signing.*
+          # to Microsoft.ArtifactSigning.Client in late 2025. It's a
+          # plain NuGet *library* (not a dotnet tool), so we pull the
+          # nupkg straight from the v3 flat-container, unzip it, and
+          # point signtool /dlib at bin/x64/Azure.CodeSigning.Dlib.dll.
+          $pkgId = "microsoft.artifactsigning.client"
+          $idx = Invoke-RestMethod "https://api.nuget.org/v3-flatcontainer/$pkgId/index.json"
+          $version = $idx.versions[-1]
+          $url = "https://api.nuget.org/v3-flatcontainer/$pkgId/$version/$pkgId.$version.nupkg"
+          Write-Host "Pulling $pkgId $version from $url"
+          New-Item -ItemType Directory -Force -Path .dlib | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile .dlib/pkg.nupkg
+          Expand-Archive -LiteralPath .dlib/pkg.nupkg -DestinationPath .dlib -Force
           $dll = (Get-ChildItem -Recurse -Filter Azure.CodeSigning.Dlib.dll .dlib | Select-Object -First 1).FullName
-          if (-not $dll) { throw "Trusted Signing Dlib install did not produce the expected dll" }
+          if (-not $dll) { throw "Azure.CodeSigning.Dlib.dll not found in $pkgId nupkg" }
+          Write-Host "TRUSTED_SIGNING_DLIB_PATH=$dll"
           "TRUSTED_SIGNING_DLIB_PATH=$dll" >> $env:GITHUB_ENV
 
       - name: Stage build env (Clerk keys come straight from GHA secrets)
@@ -245,7 +251,13 @@ jobs:
       - name: Build (PyInstaller sidecar + frontend + Tauri Linux bundle)
         env:
           TAURI_BUILD_ENV: ${{ github.workspace }}/.release-secrets.tmp.env
+          # build-linux-inside.sh defaults WORKSPACE to /workspace for
+          # the dockerised path; on a hosted runner the repo lives at
+          # $GITHUB_WORKSPACE so we override here.
+          WORKSPACE: ${{ github.workspace }}
         run: |
+          export DEBIAN_FRONTEND=noninteractive
+          export TZ=Etc/UTC
           # Reuse the same in-container script we use locally — runners
           # have all the prereqs the Dockerfile installs, so we skip
           # the Docker layer and execute the steps directly.
@@ -258,13 +270,24 @@ jobs:
           GCP_VM:      ${{ secrets.GCP_VM      || 'digi-setu-live' }}
           GCP_ZONE:    ${{ secrets.GCP_ZONE    || 'us-central1-a' }}
         run: |
-          for f in /tmp/Digi-Setu-${APP_VERSION}-amd64.deb /tmp/Digi-Setu-${APP_VERSION}-amd64.AppImage; do
-            [[ -f "$f" ]] && bash deploy/scripts/upload-installer.sh "$f"
-          done
+          # Tauri writes the .deb under desktop/build-out/linux/deb/ as
+          # `Digi Setu_<version>_amd64.deb` (with a space + underscores).
+          # Pass an explicit remote filename so /downloads/ uses the
+          # dash-normalised form Download.vue links to.
+          DEB=$(ls desktop/build-out/linux/deb/*.deb 2>/dev/null | head -n1 || true)
+          if [[ -n "$DEB" ]]; then
+            bash deploy/scripts/upload-installer.sh "$DEB" "Digi-Setu-${APP_VERSION}-amd64.deb"
+          else
+            echo "::warning::no .deb produced under desktop/build-out/linux/deb/"
+          fi
+          APPIMG=$(ls desktop/build-out/linux/appimage/*.AppImage 2>/dev/null | head -n1 || true)
+          if [[ -n "$APPIMG" ]]; then
+            bash deploy/scripts/upload-installer.sh "$APPIMG" "Digi-Setu-${APP_VERSION}-amd64.AppImage"
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
           name: linux-installers
           path: |
-            /tmp/Digi-Setu-*-amd64.deb
-            /tmp/Digi-Setu-*-amd64.AppImage
+            desktop/build-out/linux/deb/*.deb
+            desktop/build-out/linux/appimage/*.AppImage
