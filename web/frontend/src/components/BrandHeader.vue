@@ -58,11 +58,17 @@ const props = withDefaults(
 // SPA pages (the web fork ships them; the desktop fork bounces them
 // to {CLOUD}/pricing instead). Privacy / Terms move to the footer to
 // keep the top bar focused on actions.
+//
+// Download stays in the top-bar (not just the footer) because it's
+// the highest-intent action for first-time visitors landing on
+// digi-setu.com — the whole product is the desktop app, and we'd
+// rather one extra header item than a hidden conversion path.
 const NAV: NavLink[] = [
   { to: "/", label: "Home" },
   { to: "/sessions", label: "Workspaces" },
   { to: "/pricing", label: "Pricing" },
   { to: "/activity", label: "Activity" },
+  { to: "/download", label: "Download" },
 ];
 
 const cfg = useConfigStore();

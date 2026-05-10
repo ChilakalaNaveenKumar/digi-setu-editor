@@ -25,6 +25,14 @@ import { RouterLink } from "vue-router";
       <span>© 2025 Digi Setu — built for writers, coders &amp; everyone in between.</span>
       <nav class="flex items-center gap-4">
         <RouterLink
+          to="/download"
+          class="hover:text-foreground hover:underline"
+        >Download</RouterLink>
+        <RouterLink
+          to="/pricing"
+          class="hover:text-foreground hover:underline"
+        >Pricing</RouterLink>
+        <RouterLink
           to="/privacy"
           class="hover:text-foreground hover:underline"
         >Privacy</RouterLink>
