@@ -59,7 +59,7 @@ fetch_node() {
         return 0
     fi
 
-    echo "[pi-runtime] fetching Node $NODE_VERSION for $platform…"
+    echo "[pi-runtime] fetching Node $NODE_VERSION for ${platform}..."
     local tmp; tmp="$(mktemp -d)"
     trap 'rm -rf "$tmp"' RETURN
 
