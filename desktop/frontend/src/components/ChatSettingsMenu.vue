@@ -15,7 +15,7 @@
 -->
 <script setup lang="ts">
 import { storeToRefs } from "pinia";
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { Icon } from "@iconify/vue";
 
 import { apiJson, apiPatch } from "../api/client";
@@ -40,7 +40,61 @@ const { mode: deployMode } = storeToRefs(cfg);
 
 const open = ref(false);
 const showUpgrade = ref(false);
-const root = ref<HTMLDivElement | null>(null);
+const triggerRef = ref<HTMLButtonElement | null>(null);
+const popoverRef = ref<HTMLDivElement | null>(null);
+
+// Same fixed-position-via-Teleport trick PermissionModePicker /
+// ModelPicker use, for the same two reasons:
+//   1. The composer toolbar where this gear lives is at the BOTTOM of
+//      the chat pane. Opening downward (the previous absolute top-full
+//      behaviour) pushed the popover off-screen and the user couldn't
+//      reach the credit / upgrade controls.
+//   2. The chat pane has overflow-hidden, so any absolutely-positioned
+//      child that needs to escape the pane's clip box has to be
+//      teleported to <body> with fixed coordinates.
+//
+// Flip rule mirrors the other pickers: prefer up when there's not
+// enough room below AND there's more room above.
+const popoverStyle = ref<Record<string, string>>({});
+function reposition(): void {
+  const t = triggerRef.value;
+  if (!t) return;
+  const rect = t.getBoundingClientRect();
+  const margin = 8;
+  const desiredWidth = 320;
+  // Estimated content height — permissions row + (optional) routing
+  // toggle + credit row + footer hint. The desktop edition can show
+  // the routing toggle (BYOK vs Cloud) which web doesn't, so the
+  // budget is slightly larger than the web version's 360.
+  const desiredHeight = 420;
+  const width = Math.min(desiredWidth, window.innerWidth - margin * 2);
+  let left = rect.right - width;
+  if (left < margin) left = margin;
+  if (left + width > window.innerWidth - margin) {
+    left = window.innerWidth - margin - width;
+  }
+  const spaceBelow = window.innerHeight - rect.bottom - margin;
+  const spaceAbove = rect.top - margin;
+  const flipUp = spaceBelow < desiredHeight && spaceAbove > spaceBelow;
+  if (flipUp) {
+    popoverStyle.value = {
+      position: "fixed",
+      top: "auto",
+      bottom: `${window.innerHeight - rect.top + 4}px`,
+      left: `${left}px`,
+      width: `${width}px`,
+      maxHeight: `${Math.min(desiredHeight, spaceAbove)}px`,
+    };
+    return;
+  }
+  popoverStyle.value = {
+    position: "fixed",
+    top: `${rect.bottom + 4}px`,
+    left: `${left}px`,
+    width: `${width}px`,
+    maxHeight: `${Math.min(desiredHeight, spaceBelow)}px`,
+  };
+}
 
 // ── Routing default (BYOK vs Cloud) ──────────────────────────────────
 // Surfaced ONLY when the backend reports byok_mode = true (i.e. there
@@ -105,16 +159,37 @@ onMounted(() => {
   // and message_end already nudges the ledger live.
   pollHandle = window.setInterval(() => void billing.refreshUsage(), 30_000);
   document.addEventListener("click", onDocClick);
+  // Same capture-phase listeners the other pickers use so we
+  // re-anchor when ANY ancestor scrolls (chat pane scroll, page
+  // scroll on smaller viewports), not just the document.
+  window.addEventListener("resize", reposition);
+  window.addEventListener("scroll", reposition, true);
 });
 
 onUnmounted(() => {
   if (pollHandle !== null) window.clearInterval(pollHandle);
   document.removeEventListener("click", onDocClick);
+  window.removeEventListener("resize", reposition);
+  window.removeEventListener("scroll", reposition, true);
+});
+
+watch(open, async (v) => {
+  if (!v) return;
+  await nextTick();
+  reposition();
 });
 
 function onDocClick(e: MouseEvent): void {
-  if (!root.value) return;
-  if (!root.value.contains(e.target as Node)) open.value = false;
+  // Click outside both the trigger AND the teleported popover closes.
+  // Without checking the popover too, clicking inside the popover
+  // (e.g. the permission-mode buttons) would close the parent menu
+  // out from under the user.
+  const t = triggerRef.value;
+  const p = popoverRef.value;
+  const target = e.target as Node;
+  if (t && t.contains(target)) return;
+  if (p && p.contains(target)) return;
+  open.value = false;
 }
 
 const usageLabel = computed(() => {
@@ -174,8 +249,9 @@ function openUpgrade(): void {
 </script>
 
 <template>
-  <div ref="root" class="relative inline-flex items-center">
+  <div class="relative inline-flex items-center">
     <button
+      ref="triggerRef"
       type="button"
       class="relative flex h-6 w-6 items-center justify-center rounded border border-border bg-background text-muted-foreground hover:bg-muted hover:text-foreground"
       :class="open ? 'text-foreground' : ''"
@@ -191,10 +267,14 @@ function openUpgrade(): void {
       />
     </button>
 
-    <div
-      v-if="open"
-      class="absolute right-0 top-full z-30 mt-1 w-80 rounded border border-border bg-popover shadow-lg"
-    >
+    <Teleport to="body">
+      <div
+        v-if="open"
+        ref="popoverRef"
+        :style="popoverStyle"
+        class="z-[60] flex flex-col overflow-hidden rounded-md border border-border bg-popover shadow-xl ring-1 ring-black/10"
+      >
+        <div class="flex-1 overflow-y-auto">
       <!-- Permission mode -->
       <div class="border-b border-border px-3 py-2.5">
         <div class="mb-1.5 flex items-baseline justify-between">
@@ -302,13 +382,15 @@ function openUpgrade(): void {
         </div>
       </div>
 
-      <!-- Footer hint -->
-      <div class="px-3 py-2 text-caption leading-tight text-muted-foreground">
-        Settings live next to the model picker so you don't lose visual
-        space in the chat. Open this menu any time to change permission
-        or check usage.
+          <!-- Footer hint -->
+          <div class="px-3 py-2 text-caption leading-tight text-muted-foreground">
+            Settings live next to the composer so you don't lose visual
+            space in the chat. Open this menu any time to change
+            permission or check usage.
+          </div>
+        </div>
       </div>
-    </div>
+    </Teleport>
   </div>
 
   <UpgradeModal v-if="showUpgrade" :enabled="enabled" @close="showUpgrade = false" />

@@ -23,34 +23,35 @@
 <script setup lang="ts">
 import { computed, onMounted } from "vue";
 import { storeToRefs } from "pinia";
-import { useRouter } from "vue-router";
+import { useRouter, RouterLink } from "vue-router";
 import { Icon } from "@iconify/vue";
+import { Show as ClerkShow } from "@clerk/vue";
 
-import AppFooter from "../components/AppFooter.vue";
-import { useAuthStore } from "../stores/auth";
 import { useBillingStore } from "../stores/billing";
 import { useConfigStore } from "../stores/config";
 
 const router = useRouter();
 const cfg = useConfigStore();
-const auth = useAuthStore();
 const billing = useBillingStore();
 const { plans } = storeToRefs(billing);
-
-const signedIn = computed<boolean>(() =>
-  cfg.authRequired ? auth.signedIn : true,
-);
 
 onMounted(async () => {
   if (!plans.value.length) await billing.refreshStatus();
 });
 
-function primaryCta(): void {
-  if (signedIn.value) {
-    router.push({ name: "sessions" });
-  } else {
-    router.push({ name: "login" });
-  }
+// In dev mode (auth_required=false) the user is treated as signed-in
+// because the backend resolves every request to the synthetic `dev`
+// user. We use this to decide which CTA to render before Clerk has
+// loaded — auth_required toggles the Clerk gate, the ClerkShow
+// blocks below pick the actual variant when auth IS required.
+const authOff = computed(() => !cfg.authRequired);
+
+function goToSessions(): void {
+  router.push({ name: "sessions" });
+}
+
+function goToLogin(): void {
+  router.push({ name: "login" });
 }
 
 const PILLARS: Array<{ icon: string; title: string; body: string }> = [
@@ -67,13 +68,13 @@ const PILLARS: Array<{ icon: string; title: string; body: string }> = [
   {
     icon: "codicon:shield",
     title: "Bring your own keys",
-    body: "Drop an Anthropic, OpenAI or Google key into ~/.digi-setu/.env and the desktop app routes straight to your provider — billed by them, not us.",
+    body: "Drop an Anthropic, OpenAI or Google key into your account and the app routes straight to your provider — billed by them, not us.",
   },
 ];
 </script>
 
 <template>
-  <div class="flex min-h-screen w-full flex-col bg-background text-foreground">
+  <div class="flex min-h-0 w-full flex-1 flex-col bg-background text-foreground">
     <main class="flex-1">
       <!-- HERO -->
       <section class="mx-auto w-full max-w-5xl px-6 pt-16 pb-20 md:pt-24 md:pb-28">
@@ -101,17 +102,42 @@ const PILLARS: Array<{ icon: string; title: string; body: string }> = [
             actual model + infra cost, or bring your own AI keys.
           </p>
           <div class="mt-8 flex flex-wrap items-center justify-center gap-3">
+            <!-- Auth-off: single CTA goes straight to the picker. -->
             <button
+              v-if="authOff"
               type="button"
               class="inline-flex items-center gap-2 rounded-md bg-primary px-5 py-2.5 text-lead font-semibold text-primary-foreground shadow-md transition-opacity hover:opacity-90"
-              @click="primaryCta"
+              @click="goToSessions"
             >
-              <Icon
-                :icon="signedIn ? 'codicon:arrow-right' : 'codicon:rocket'"
-                class="h-4 w-4"
-              />
-              {{ signedIn ? "Continue to your workspaces" : "Get started — free" }}
+              <Icon icon="codicon:arrow-right" class="h-4 w-4" />
+              Open your workspaces
             </button>
+
+            <!-- Auth-required: pick the CTA based on the signed-in
+                 state from Clerk so the hero adapts in real time. -->
+            <template v-else>
+              <ClerkShow :when="'signed-in'">
+                <button
+                  type="button"
+                  class="inline-flex items-center gap-2 rounded-md bg-primary px-5 py-2.5 text-lead font-semibold text-primary-foreground shadow-md transition-opacity hover:opacity-90"
+                  @click="goToSessions"
+                >
+                  <Icon icon="codicon:arrow-right" class="h-4 w-4" />
+                  Continue to your workspaces
+                </button>
+              </ClerkShow>
+              <ClerkShow :when="'signed-out'">
+                <button
+                  type="button"
+                  class="inline-flex items-center gap-2 rounded-md bg-primary px-5 py-2.5 text-lead font-semibold text-primary-foreground shadow-md transition-opacity hover:opacity-90"
+                  @click="goToLogin"
+                >
+                  <Icon icon="codicon:rocket" class="h-4 w-4" />
+                  Get started — free
+                </button>
+              </ClerkShow>
+            </template>
+
             <RouterLink
               to="/pricing"
               class="inline-flex items-center gap-1.5 rounded-md border border-border bg-card px-4 py-2.5 text-lead font-medium text-foreground transition-colors hover:border-primary/50"
@@ -221,13 +247,36 @@ const PILLARS: Array<{ icon: string; title: string; body: string }> = [
         </p>
         <div class="mt-5 flex flex-wrap items-center justify-center gap-3">
           <button
+            v-if="authOff"
             type="button"
             class="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-lead font-semibold text-primary-foreground shadow-sm hover:opacity-90"
-            @click="primaryCta"
+            @click="goToSessions"
           >
-            {{ signedIn ? "Open your workspaces" : "Start a chat" }}
+            Open your workspaces
             <Icon icon="codicon:arrow-right" class="h-4 w-4" />
           </button>
+          <template v-else>
+            <ClerkShow :when="'signed-in'">
+              <button
+                type="button"
+                class="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-lead font-semibold text-primary-foreground shadow-sm hover:opacity-90"
+                @click="goToSessions"
+              >
+                Open your workspaces
+                <Icon icon="codicon:arrow-right" class="h-4 w-4" />
+              </button>
+            </ClerkShow>
+            <ClerkShow :when="'signed-out'">
+              <button
+                type="button"
+                class="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-lead font-semibold text-primary-foreground shadow-sm hover:opacity-90"
+                @click="goToLogin"
+              >
+                Start a chat
+                <Icon icon="codicon:arrow-right" class="h-4 w-4" />
+              </button>
+            </ClerkShow>
+          </template>
           <RouterLink
             to="/feedback"
             class="inline-flex items-center gap-1 rounded-md border border-border bg-card px-4 py-2 text-lead font-medium text-foreground hover:border-primary/50"
@@ -237,7 +286,5 @@ const PILLARS: Array<{ icon: string; title: string; body: string }> = [
         </div>
       </section>
     </main>
-
-    <AppFooter />
   </div>
 </template>

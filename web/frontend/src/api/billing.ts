@@ -84,21 +84,36 @@ export interface UsageEvent {
 export interface UsageEventsResponse {
   events: UsageEvent[];
   limit: number;
+  /** True when at least `limit` rows came back — i.e. there are
+   *  probably more older entries to load. Drives the "Load older"
+   *  button visibility on the Activity page. */
+  has_more: boolean;
 }
 
 /**
- * Returns the most recent activity events for the signed-in user,
- * newest first. The server keeps a 500-event ring per user; older
- * entries fall off silently. Use `since` (ISO-8601 UTC) to poll
- * incrementally.
+ * Returns activity events for the signed-in user, newest first.
+ *
+ * - `limit`  page size, capped at 500 server-side.
+ * - `since`  ISO-8601 UTC. Returns ONLY events strictly after this
+ *            time. Used by the Activity page to poll for new rows
+ *            without re-shipping the full window every 30s.
+ * - `before` ISO-8601 UTC. Returns ONLY events strictly older than
+ *            this. Cursor for "Load older" — pass the timestamp of
+ *            the oldest visible row to fetch the next page back in
+ *            history.
+ *
+ * The server caps at 500 rows / page; the SPA defaults to 100 so a
+ * normal Activity visit is one small payload, not a 500-row dump.
  */
 export function getUsageEvents(opts: {
   limit?: number;
   since?: string;
+  before?: string;
 } = {}): Promise<UsageEventsResponse> {
   const params = new URLSearchParams();
   if (opts.limit) params.set("limit", String(opts.limit));
   if (opts.since) params.set("since", opts.since);
+  if (opts.before) params.set("before", opts.before);
   const qs = params.toString();
   return apiJson(`/api/usage/events${qs ? "?" + qs : ""}`);
 }
@@ -142,6 +157,7 @@ export interface ByokUsageResponse {
   events: ByokEvent[];
   summary: ByokSummary;
   limit: number;
+  has_more: boolean;
 }
 
 /**
@@ -149,14 +165,21 @@ export interface ByokUsageResponse {
  * response is empty (and `byok_active=false`) in web mode and in
  * desktop installs without any BYOK keys, so callers don't need to
  * branch on deployment shape.
+ *
+ * Pagination mirrors `getUsageEvents`: `since` for incremental
+ * polling of new rows, `before` for "Load older" history. The
+ * `summary` block is always full-history regardless of pagination,
+ * so the rollup numbers don't change as the user pages through.
  */
 export function getByokUsage(opts: {
   limit?: number;
   since?: string;
+  before?: string;
 } = {}): Promise<ByokUsageResponse> {
   const params = new URLSearchParams();
   if (opts.limit) params.set("limit", String(opts.limit));
   if (opts.since) params.set("since", opts.since);
+  if (opts.before) params.set("before", opts.before);
   const qs = params.toString();
   return apiJson(`/api/usage/byok${qs ? "?" + qs : ""}`);
 }

@@ -9,18 +9,25 @@
   receipts, not aggregated analytics. The credit-remaining banner up
   top is the at-a-glance summary; the table is the audit trail.
 
-  Why a server-side ring buffer instead of pulling from pi's JSONL
-  log: a single chat turn produces many events (one per tool call),
-  and the JSONL files split by RPC connection. Aggregating them
-  client-side would be slow on the first paint of a long-running
-  workspace. The ledger already sees every billable event because
-  it's the one charging credit; reusing that source means the table
-  always matches the dollar number on the chip.
+  ─── Data fetching strategy (rewritten 2026-05-09) ──────────────────
+  Original behaviour pulled the entire 500-event ring buffer on every
+  visit AND on every 30s auto-refresh. For a heavy user that's a 100s-
+  of-KB JSON payload landing on the wire every half minute even when
+  nothing changed.
 
-  Pagination: ring buffer is 500 events, surfaced via `?limit=500`.
-  When users start asking for older history we'll persist to SQLite
-  and add a date picker, but everyone who's tested this so far just
-  wants "show me what's happened today".
+  New behaviour:
+    1. Initial load    → GET /api/usage/events?limit=100   (last 100)
+    2. Auto-refresh    → GET …?since=<newest_ts>&limit=100 (PREPEND)
+                         only ships new rows since the last fetch.
+    3. "Load older"    → GET …?before=<oldest_ts>&limit=100 (APPEND)
+                         cursor-based pagination; hides itself when
+                         the server says no more pages.
+
+  Same shape mirrored on the BYOK table.
+
+  We keep the BYOK summary numbers full-history (the backend always
+  computes them over the whole ledger / `since` slice) so the totals
+  card doesn't shift when the user pages through history.
 -->
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
@@ -46,37 +53,136 @@ const billing = useBillingStore();
 // even if the global store hasn't polled yet).
 const { credit: storeCredit } = storeToRefs(billing);
 
+// Page size for both "first page" and "load older". Capped at 500 by
+// the server. 100 is a sweet spot: a typical user has well under 100
+// events per day so the first page covers "today + a bit" without
+// asking the server for a much larger window most users will never
+// scroll through.
+const PAGE_SIZE = 100;
+
+// ── Cloud (subscription) events ────────────────────────────────────
 const events = ref<UsageEvent[]>([]);
-const loading = ref(false);
-const errMsg = ref("");
-const credit = ref<CreditSnapshot | null>(null);
-const lastFetchedAt = ref<string | null>(null);
-// BYOK side: separate fetch so the cloud table loads on web installs
-// without paying for a sidecar round-trip on every refresh.
+const cloudHasMore = ref(false);
+const loadingCloud = ref(false);
+const loadingMoreCloud = ref(false);
+
+// ── BYOK (local key) events ────────────────────────────────────────
 const byokActive = ref(false);
 const byokEvents = ref<ByokEvent[]>([]);
 const byokSummary = ref<ByokSummary>({ total: {}, per_model: [] });
+const byokHasMore = ref(false);
+const loadingByok = ref(false);
+const loadingMoreByok = ref(false);
+
+// ── Top-of-page state ──────────────────────────────────────────────
+const errMsg = ref("");
+const credit = ref<CreditSnapshot | null>(null);
+const lastFetchedAt = ref<string | null>(null);
 let refreshTimer: ReturnType<typeof setInterval> | null = null;
 
+const loading = computed(() => loadingCloud.value || loadingByok.value);
+
+/**
+ * Initial load — pull the most recent PAGE_SIZE rows from each table.
+ * Replaces (does not append to) the local lists, so manually clicking
+ * the Refresh button resets pagination back to "today".
+ */
 async function refresh(): Promise<void> {
-  loading.value = true;
   errMsg.value = "";
+  loadingCloud.value = true;
+  loadingByok.value = true;
   try {
     const [usage, evts, byok] = await Promise.all([
       getUsage(),
-      getUsageEvents({ limit: 500 }),
-      getByokUsage({ limit: 500 }),
+      getUsageEvents({ limit: PAGE_SIZE }),
+      getByokUsage({ limit: PAGE_SIZE }),
     ]);
     credit.value = usage.credit;
     events.value = evts.events;
+    cloudHasMore.value = evts.has_more;
     byokActive.value = byok.byok_active;
     byokEvents.value = byok.events;
     byokSummary.value = byok.summary;
+    byokHasMore.value = byok.has_more;
     lastFetchedAt.value = new Date().toISOString();
   } catch (exc) {
     errMsg.value = exc instanceof Error ? exc.message : String(exc);
   } finally {
-    loading.value = false;
+    loadingCloud.value = false;
+    loadingByok.value = false;
+  }
+}
+
+/**
+ * Polling tick — pull only the rows newer than the newest currently-
+ * shown row and PREPEND them. Skips entirely when there are no rows
+ * yet (the next visible refresh handles that). We bound the poll
+ * payload at PAGE_SIZE — a user actively running 100+ chats inside
+ * 30s is implausible, but if it ever happens they'll see "Refresh"
+ * repopulate properly on the next tick.
+ */
+async function pollNew(): Promise<void> {
+  if (loadingCloud.value || loadingByok.value) return;
+  // Cloud
+  try {
+    const newestCloud = events.value[0]?.ts;
+    if (newestCloud) {
+      const r = await getUsageEvents({ limit: PAGE_SIZE, since: newestCloud });
+      if (r.events.length > 0) events.value = [...r.events, ...events.value];
+    }
+  } catch {
+    /* polling failures are silent — the next manual refresh will surface them */
+  }
+  // BYOK
+  try {
+    if (byokActive.value) {
+      const newestByok = byokEvents.value[0]?.ts;
+      if (newestByok) {
+        const r = await getByokUsage({ limit: PAGE_SIZE, since: newestByok });
+        if (r.events.length > 0) {
+          byokEvents.value = [...r.events, ...byokEvents.value];
+        }
+        // Re-pull the rollup so per-model totals stay accurate.
+        byokSummary.value = r.summary;
+      }
+    }
+  } catch {
+    /* see above */
+  }
+  lastFetchedAt.value = new Date().toISOString();
+}
+
+/**
+ * "Load older" — append the next page back in history using the
+ * oldest visible row's timestamp as the cursor.
+ */
+async function loadOlderCloud(): Promise<void> {
+  const oldest = events.value[events.value.length - 1]?.ts;
+  if (!oldest || loadingMoreCloud.value) return;
+  loadingMoreCloud.value = true;
+  try {
+    const r = await getUsageEvents({ limit: PAGE_SIZE, before: oldest });
+    events.value = [...events.value, ...r.events];
+    cloudHasMore.value = r.has_more;
+  } catch (exc) {
+    errMsg.value = exc instanceof Error ? exc.message : String(exc);
+  } finally {
+    loadingMoreCloud.value = false;
+  }
+}
+
+async function loadOlderByok(): Promise<void> {
+  const oldest = byokEvents.value[byokEvents.value.length - 1]?.ts;
+  if (!oldest || loadingMoreByok.value) return;
+  loadingMoreByok.value = true;
+  try {
+    const r = await getByokUsage({ limit: PAGE_SIZE, before: oldest });
+    byokEvents.value = [...byokEvents.value, ...r.events];
+    byokHasMore.value = r.has_more;
+  } catch (exc) {
+    errMsg.value = exc instanceof Error ? exc.message : String(exc);
+  } finally {
+    loadingMoreByok.value = false;
   }
 }
 
@@ -85,9 +191,11 @@ onMounted(() => {
   // Light auto-refresh while the tab is open so a chat happening in
   // a different tab shows up here without a manual reload. 30 s is
   // a reasonable middle ground — frequent enough to feel live, rare
-  // enough that it doesn't show up in the network panel.
+  // enough that it doesn't show up in the network panel. We poll
+  // INCREMENTALLY (only new rows since the newest visible) instead
+  // of refetching the whole window.
   refreshTimer = setInterval(() => {
-    if (document.visibilityState === "visible") void refresh();
+    if (document.visibilityState === "visible") void pollNew();
   }, 30_000);
 });
 
@@ -186,6 +294,8 @@ const byokTotalTokens = computed(() => {
             Every billable model call from your account, newest first.
             Includes the parent chat turn <em>and</em> any sub-LLM
             calls fired inside tools (e.g. <code class="font-mono text-caption">search_docs</code>).
+            We load the most recent {{ PAGE_SIZE }} rows and fetch older
+            history on demand.
           </p>
         </div>
         <button
@@ -254,19 +364,19 @@ const byokTotalTokens = computed(() => {
 
         <article class="rounded-md border border-border bg-card p-3">
           <p class="font-mono text-caption uppercase tracking-wide text-muted-foreground">
-            Recent events shown
+            Events loaded
           </p>
           <p class="mt-1 text-lead font-semibold">
             {{ events.length }}
           </p>
           <p class="font-mono text-caption text-muted-foreground">
-            ring buffer (last 500)
+            {{ cloudHasMore ? "more available" : "complete" }}
           </p>
         </article>
 
         <article class="rounded-md border border-border bg-card p-3">
           <p class="font-mono text-caption uppercase tracking-wide text-muted-foreground">
-            Tokens (visible window)
+            Tokens (loaded events)
           </p>
           <p class="mt-1 text-lead font-semibold">
             {{ fmtTokens(totalTokens) }}
@@ -280,7 +390,7 @@ const byokTotalTokens = computed(() => {
       <!-- BY-MODEL ROLLUP -->
       <section v-if="summaryByModel.length > 0" class="mb-6">
         <h2 class="mb-2 text-body font-semibold uppercase tracking-wide text-muted-foreground">
-          By model (visible window)
+          By model (loaded events)
         </h2>
         <div class="flex flex-wrap gap-2">
           <span
@@ -391,6 +501,35 @@ const byokTotalTokens = computed(() => {
             As soon as you send a prompt, the call shows up here with
             its tokens and cost.
           </p>
+        </div>
+
+        <!-- Pagination footer for the cloud table. Stays rendered as
+             long as the server reports more pages back in history; the
+             button itself disables while a fetch is in flight so a
+             user can't double-trigger pagination. -->
+        <div
+          v-if="events.length > 0"
+          class="flex items-center justify-between gap-3 border-t border-border bg-muted/10 px-3 py-2"
+        >
+          <span class="font-mono text-caption text-muted-foreground">
+            Showing {{ events.length }}
+            event{{ events.length === 1 ? "" : "s" }}
+            <span v-if="cloudHasMore">· more available</span>
+          </span>
+          <button
+            v-if="cloudHasMore"
+            type="button"
+            class="flex items-center gap-1.5 rounded-md border border-border bg-card px-2.5 py-1 text-body text-foreground transition-colors hover:border-primary/40 disabled:opacity-50"
+            :disabled="loadingMoreCloud"
+            @click="loadOlderCloud"
+          >
+            <Icon
+              :icon="loadingMoreCloud ? 'codicon:loading' : 'codicon:chevron-down'"
+              :class="loadingMoreCloud && 'animate-spin'"
+              class="h-3.5 w-3.5"
+            />
+            {{ loadingMoreCloud ? "Loading…" : `Load older ${PAGE_SIZE}` }}
+          </button>
         </div>
       </section>
 
@@ -544,6 +683,32 @@ const byokTotalTokens = computed(() => {
             <Icon icon="codicon:key" class="h-5 w-5" />
             <p>No local usage yet — pick a BYOK-badged model in the chat to see rows here.</p>
           </div>
+
+          <!-- Pagination footer for the BYOK table. -->
+          <div
+            v-if="byokEvents.length > 0"
+            class="flex items-center justify-between gap-3 border-t border-success/30 bg-success/5 px-3 py-2"
+          >
+            <span class="font-mono text-caption text-muted-foreground">
+              Showing {{ byokEvents.length }}
+              turn{{ byokEvents.length === 1 ? "" : "s" }}
+              <span v-if="byokHasMore">· more available</span>
+            </span>
+            <button
+              v-if="byokHasMore"
+              type="button"
+              class="flex items-center gap-1.5 rounded-md border border-success/40 bg-card px-2.5 py-1 text-body text-foreground transition-colors hover:border-success disabled:opacity-50"
+              :disabled="loadingMoreByok"
+              @click="loadOlderByok"
+            >
+              <Icon
+                :icon="loadingMoreByok ? 'codicon:loading' : 'codicon:chevron-down'"
+                :class="loadingMoreByok && 'animate-spin'"
+                class="h-3.5 w-3.5"
+              />
+              {{ loadingMoreByok ? "Loading…" : `Load older ${PAGE_SIZE}` }}
+            </button>
+          </div>
         </div>
 
         <p class="mt-3 text-caption text-muted-foreground">
@@ -560,10 +725,13 @@ const byokTotalTokens = computed(() => {
         v-if="lastFetchedAt"
         class="mt-3 font-mono text-caption text-muted-foreground"
       >
-        Last refreshed {{ fmtTime(lastFetchedAt) }} · auto-refreshes every 30s
+        Last refreshed {{ fmtTime(lastFetchedAt) }} · auto-refreshes every 30s (new rows only)
       </p>
     </main>
 
+    <!-- Desktop has its own per-view AppFooter (the web fork moved this
+         into App.vue once a global header refactor landed; the desktop
+         shell predates that and still needs it inline). -->
     <AppFooter />
   </div>
 </template>

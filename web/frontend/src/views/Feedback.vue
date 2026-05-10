@@ -22,7 +22,6 @@ import { ref } from "vue";
 import { useRouter } from "vue-router";
 import { Icon } from "@iconify/vue";
 
-import BrandHeader from "../components/BrandHeader.vue";
 import { submitFeedback } from "../api/feedback";
 import { useUiStore } from "../stores/ui";
 
@@ -80,20 +79,7 @@ function backHome(): void {
 </script>
 
 <template>
-  <div class="flex min-h-screen flex-col bg-background text-foreground">
-    <!-- BrandHeader hides its own Feedback button on this route since
-         we already are on the feedback page; the showFeedback prop
-         is left at its default and the link itself simply re-renders
-         the same page (no harm). -->
-    <BrandHeader
-      :links="[
-        { to: '/pricing', label: 'Pricing' },
-        { to: '/privacy', label: 'Privacy' },
-        { to: '/terms', label: 'Terms' },
-      ]"
-      :show-feedback="false"
-    />
-
+  <div class="flex min-h-0 flex-1 flex-col bg-background text-foreground">
     <main class="mx-auto w-full max-w-2xl flex-1 px-6 py-12">
       <header class="mb-8">
         <h1 class="text-h1 font-semibold tracking-tight md:text-h1">
@@ -239,9 +225,5 @@ function backHome(): void {
         </div>
       </form>
     </main>
-
-    <footer class="border-t border-border bg-card/40 px-6 py-4 text-center text-caption text-muted-foreground">
-      © {{ new Date().getFullYear() }} Digi Setu
-    </footer>
   </div>
 </template>

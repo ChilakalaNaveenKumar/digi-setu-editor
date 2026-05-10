@@ -45,6 +45,13 @@ const highlightId = ref<string | null>(null);
 // Computed inline style for the floating dropdown. We anchor to the
 // trigger's right edge (so it grows leftwards into the chat pane) but
 // clamp to the viewport with an 8 px gutter on either side.
+//
+// Flip-up rule: this picker now lives in the composer toolbar at the
+// bottom of the chat pane (it used to live in the header). Opening
+// downward from there leaves it almost no room and clips the catalogue
+// to one or two visible rows. Mirror the heuristic from
+// PermissionModePicker — flip up when there's less than `desiredHeight`
+// below AND more room above than below.
 const popoverStyle = ref<Record<string, string>>({});
 function reposition(): void {
   const t = triggerRef.value;
@@ -52,6 +59,11 @@ function reposition(): void {
   const rect = t.getBoundingClientRect();
   const margin = 8;
   const desiredWidth = 280;
+  // 420 lets us show ~10 model rows + family headers + search + footer
+  // without scrolling, which covers the current catalogue. Larger
+  // catalogues will scroll inside the popover, so this is a soft
+  // preference, not a hard requirement.
+  const desiredHeight = 420;
   const availW = window.innerWidth - margin * 2;
   const width = Math.min(desiredWidth, availW);
   // Align right edge to the trigger's right edge.
@@ -60,15 +72,26 @@ function reposition(): void {
   if (left + width > window.innerWidth - margin) {
     left = window.innerWidth - margin - width;
   }
-  // Below the trigger by 4 px; if it'd run off the bottom, flip above.
-  const top = rect.bottom + 4;
-  const popoverMaxHeight = Math.min(420, window.innerHeight - top - margin);
+  const spaceBelow = window.innerHeight - rect.bottom - margin;
+  const spaceAbove = rect.top - margin;
+  const flipUp = spaceBelow < desiredHeight && spaceAbove > spaceBelow;
+  if (flipUp) {
+    popoverStyle.value = {
+      position: "fixed",
+      top: "auto",
+      bottom: `${window.innerHeight - rect.top + 4}px`,
+      left: `${left}px`,
+      width: `${width}px`,
+      maxHeight: `${Math.min(desiredHeight, spaceAbove)}px`,
+    };
+    return;
+  }
   popoverStyle.value = {
     position: "fixed",
-    top: `${top}px`,
+    top: `${rect.bottom + 4}px`,
     left: `${left}px`,
     width: `${width}px`,
-    maxHeight: `${popoverMaxHeight}px`,
+    maxHeight: `${Math.min(desiredHeight, spaceBelow)}px`,
   };
 }
 

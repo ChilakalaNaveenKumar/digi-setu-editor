@@ -27,7 +27,6 @@ import { computed, onMounted, watch, ref } from "vue";
 import { useRoute, useRouter, RouterLink } from "vue-router";
 import { useClerk, useAuth } from "@clerk/vue";
 
-import BrandHeader from "../components/BrandHeader.vue";
 import { useConfigStore } from "../stores/config";
 
 const route = useRoute();
@@ -101,17 +100,7 @@ watch(
 </script>
 
 <template>
-  <div class="flex min-h-screen flex-col bg-background text-foreground">
-    <BrandHeader
-      :show-account="false"
-      :show-feedback="false"
-      :links="[
-        { to: '/pricing', label: 'Pricing' },
-        { to: '/privacy', label: 'Privacy' },
-        { to: '/terms', label: 'Terms' },
-      ]"
-    />
-
+  <div class="flex min-h-0 flex-1 flex-col bg-background text-foreground">
     <main class="flex flex-1 flex-col items-center justify-center px-6 py-12">
       <div
         v-if="cfg.authRequired"
@@ -164,9 +153,5 @@ watch(
         </RouterLink>
       </div>
     </main>
-
-    <footer class="border-t border-border bg-card/40 px-6 py-4 text-center text-caption text-muted-foreground">
-      © {{ new Date().getFullYear() }} Digi Setu
-    </footer>
   </div>
 </template>

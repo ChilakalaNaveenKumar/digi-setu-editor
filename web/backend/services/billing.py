@@ -789,12 +789,20 @@ class CreditLedger:
         *,
         limit: int = 200,
         since_iso: Optional[str] = None,
+        before_iso: Optional[str] = None,
     ) -> list[dict[str, Any]]:
         """Return up to `limit` most-recent events for `user_id`,
-        newest first. `since_iso` (ISO-8601 UTC string) clips the
-        result to events strictly after that timestamp — used by the
-        SPA to poll for new entries without re-shipping the full
-        log.
+        newest first.
+
+        `since_iso` (ISO-8601 UTC) clips the result to events strictly
+        AFTER that timestamp — used by the SPA to poll incrementally
+        without re-shipping the full log.
+
+        `before_iso` is the cursor for "older page" pagination — pass
+        the timestamp of the OLDEST currently-shown event and the
+        endpoint returns the next `limit` rows older than that. The
+        Activity page uses this for its "Load older" button so we
+        stop pulling the entire ring buffer on every visit.
 
         Reads straight from SQLite (`cost_events` table) so the
         Activity view survives backend restarts. The table is indexed
@@ -811,6 +819,14 @@ class CreditLedger:
         if since_iso:
             sql += " AND ts > ?"
             params.append(since_iso)
+        if before_iso:
+            # Strict `<` so a "load older" with the oldest visible row's
+            # ts as the cursor never re-fetches that row. SQLite text
+            # comparison is fine here because timestamps are zero-padded
+            # ISO-8601 (YYYY-MM-DDTHH:MM:SS…), which sorts lexically
+            # the same as chronologically.
+            sql += " AND ts < ?"
+            params.append(before_iso)
         sql += " ORDER BY id DESC LIMIT ?"
         params.append(clamped)
         try:

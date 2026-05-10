@@ -168,7 +168,7 @@ async def get_usage(user_id: str = Depends(require_user)) -> dict[str, Any]:
 @router.get("/api/usage/events")
 async def get_usage_events(
     user_id: str = Depends(require_user),  # noqa: ARG001 — cloud uses the bearer
-    limit: int = Query(200, ge=1, le=500),
+    limit: int = Query(100, ge=1, le=500),
     since: Optional[str] = Query(
         None,
         description=(
@@ -177,24 +177,56 @@ async def get_usage_events(
             "Activity table can poll incrementally."
         ),
     ),
+    before: Optional[str] = Query(
+        None,
+        description=(
+            "ISO-8601 UTC timestamp. Forwarded to the cloud, which "
+            "returns only events strictly BEFORE this time. Cursor "
+            "for the Activity page's 'Load older' button."
+        ),
+    ),
 ) -> dict[str, Any]:
     """Cloud activity log proxy. Empty list + ``cloud_error`` when
     we can't reach the cloud; the SPA renders a quiet banner rather
-    than treating that as a real "no events" state."""
-    try:
-        cloud = cloud_get_json(
-            "/api/usage/events",
-            params={"limit": limit, "since": since},
-        )
-    except CloudApiAuthError:
-        return {"events": [], "limit": limit, "cloud_error": None, "source": "offline_signed_out"}
-    except CloudApiError as exc:
-        return {"events": [], "limit": limit, "cloud_error": str(exc), "source": "offline"}
+    than treating that as a real "no events" state.
 
-    events = (cloud or {}).get("events") or []
+    `has_more` is propagated from the cloud response so the SPA's
+    "Load older" button hides itself once we hit the back of the log.
+    When the cloud is unreachable we conservatively report
+    ``has_more=false`` — there's no point offering to fetch more pages
+    we can't actually fetch."""
+    params: dict[str, Any] = {"limit": limit}
+    if since:
+        params["since"] = since
+    if before:
+        params["before"] = before
+    try:
+        cloud = cloud_get_json("/api/usage/events", params=params)
+    except CloudApiAuthError:
+        return {
+            "events": [],
+            "limit": limit,
+            "has_more": False,
+            "cloud_error": None,
+            "source": "offline_signed_out",
+        }
+    except CloudApiError as exc:
+        return {
+            "events": [],
+            "limit": limit,
+            "has_more": False,
+            "cloud_error": str(exc),
+            "source": "offline",
+        }
+
+    cloud = cloud or {}
+    events = cloud.get("events") or []
     return {
         "events": events,
         "limit": limit,
+        # Trust the cloud's signal; fall back to "len ≥ limit" if the
+        # cloud is on an older build that hasn't been deployed yet.
+        "has_more": bool(cloud.get("has_more", len(events) >= limit)),
         "cloud_error": None,
         "source": "cloud",
     }
@@ -203,8 +235,16 @@ async def get_usage_events(
 @router.get("/api/usage/byok")
 async def get_byok_usage(
     user_id: str = Depends(require_user),  # noqa: ARG001 — desktop is single-user; require_user gates dev-mode access only
-    limit: int = Query(200, ge=1, le=500),
+    limit: int = Query(100, ge=1, le=500),
     since: Optional[str] = Query(None),
+    before: Optional[str] = Query(
+        None,
+        description=(
+            "ISO-8601 UTC timestamp. Returns rows strictly older than "
+            "this — used by the Activity page's 'Load older' button on "
+            "the BYOK table."
+        ),
+    ),
 ) -> dict[str, Any]:
     """Per-turn rows + rollup summary from the local BYOK ledger
     (SQLite at ~/.digi-setu/usage.sqlite). When called in web mode
@@ -213,17 +253,25 @@ async def get_byok_usage(
     branching on the deployment shape.
 
     No USD figures are returned — the user pays their AI provider
-    directly and we don't know their actual rate."""
+    directly and we don't know their actual rate.
+
+    The `summary` block always reflects the *full* BYOK history (or
+    the `since` slice if provided) — pagination only narrows the
+    `events` list, not the totals, so the rollup numbers don't jump
+    around as the user pages through history."""
     if not BYOK_MODE:
         return {
             "byok_active": False,
             "events": [],
             "summary": {"total": {}, "per_model": []},
             "limit": limit,
+            "has_more": False,
         }
+    events = byok_recent_events(limit=limit, since_iso=since, before_iso=before)
     return {
         "byok_active": True,
-        "events": byok_recent_events(limit=limit, since_iso=since),
+        "events": events,
         "summary": byok_summary(since_iso=since),
         "limit": limit,
+        "has_more": len(events) >= limit,
     }

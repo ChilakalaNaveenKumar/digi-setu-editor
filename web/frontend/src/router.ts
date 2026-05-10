@@ -3,45 +3,59 @@
  *
  * Routes (history mode so the URL shows real paths, not `#`-hashes):
  *
- *   /                  Home — picker (flat list of recent chats).
- *   /sessions          Alias for / — Clerk's hosted sign-in redirects here
- *                      after auth (configured in the Clerk dashboard).
- *   /chat/:sid         Active chat session (the IDE shell). Tabs in the
- *                      chat sidebar switch between chats inside the
- *                      currently-open workspace.
- *   /login             Clerk <SignIn /> mount point
+ *   /                  Home — public marketing landing.
+ *   /sessions          Picker — flat list of recent chats. First
+ *                      authenticated surface; Clerk's hosted sign-in
+ *                      also redirects here post-auth.
+ *   /chat/:sid         Active chat session (the IDE shell).
+ *   /login             Clerk <SignIn /> handoff page.
  *   /pricing           Public plans page (sign-in required to upgrade)
- *   /privacy           Static privacy policy (/privacy-policy is also routed
- *                      here because Clerk's "legal documents" URL field
- *                      points there).
+ *   /privacy           Static privacy policy (/privacy-policy is also
+ *                      routed here because Clerk's "legal documents"
+ *                      URL field points there).
  *   /terms             Static terms / output ownership
  *
- * `/chat/:sid` is the only persistable URL inside the app — bookmark it
- * and it'll resolve the workspace from the session id at boot via the
- * session's wsid.
+ * `/chat/:sid` is the only persistable URL inside the app — bookmark
+ * it and it'll resolve the workspace from the session id at boot.
+ *
+ * Route meta:
+ *   - `header: 'full' | 'compact' | 'none'` — controls the global
+ *     BrandHeader mounted in App.vue. The IDE shell (/chat/:sid) uses
+ *     the compact variant so the chat title fits in the centre slot;
+ *     marketing routes use full.
+ *   - `footer: boolean` — render the shared <AppFooter /> below the
+ *     route. The chat IDE has its own bottom bar so it sets false.
  *
  * Auth guard:
  *   - In dev mode (`auth_required=false`) every route is open and the
- *     guard short-circuits.
- *   - In prod mode the guard waits for Clerk to load, then bounces
- *     unauthenticated users to /login (carrying a `next` param so we
- *     can return them to the original URL after sign-in).
+ *     guard short-circuits. /login is meaningless without Clerk so we
+ *     bounce it to /.
+ *   - In prod mode the guard waits for Clerk to load. PUBLIC_ROUTES
+ *     stay open; everything else bounces unauthenticated users to
+ *     /login (carrying a `next` param so we can return them to the
+ *     original URL after sign-in). The Home page (/) is public so a
+ *     brand-new visitor lands on the marketing surface, not a Clerk
+ *     redirect — they sign in by clicking the hero CTA.
  */
 
 import { createRouter, createWebHistory, type RouteRecordRaw } from "vue-router";
 
 import { useConfigStore } from "./stores/config";
 
-// Routes that bypass the Clerk auth guard. The picker (both "/" and
-// the "/sessions" alias) stays public because:
+// Routes that bypass the Clerk auth guard. Home / Picker stay public
+// because:
 //
-//   1. Clerk's hosted sign-in redirects here right after sign-in, but
-//      the auth cookie hasn't necessarily been written by the time
-//      the guard runs (race window during the OAuth round-trip). If
-//      the guard 401-bounces in that window we end up in a redirect
-//      loop: / → /login → Clerk → / → /login → ...
-//   2. The picker UI itself works gracefully whether signed in or
-//      not — the BrandHeader's <ClerkShow :when="'signed-out'"> /
+//   1. Clerk's hosted sign-in redirects to /sessions right after
+//      sign-in, but the auth cookie hasn't necessarily been written
+//      by the time the guard runs (race window during the OAuth
+//      round-trip). If the guard 401-bounces in that window we end
+//      up in a redirect loop: /sessions → /login → Clerk → /sessions
+//      → /login → ...
+//   2. The Home page itself is the marketing landing — it MUST be
+//      reachable without auth or new visitors hit a sign-in wall
+//      with no context.
+//   3. The picker UI works gracefully whether signed in or not —
+//      the BrandHeader's <ClerkShow :when="'signed-out'"> /
 //      <ClerkShow :when="'signed-in'"> pair handles the auth state
 //      without help from the router.
 //
@@ -49,7 +63,7 @@ import { useConfigStore } from "./stores/config";
 // portal, etc.) gates itself at the API layer or via per-component
 // guards, not here.
 const PUBLIC_ROUTES = new Set([
-  "picker",
+  "home",
   "login",
   "sessions",
   "privacy",
@@ -71,50 +85,54 @@ const PUBLIC_ROUTES = new Set([
 const routes: RouteRecordRaw[] = [
   {
     path: "/",
-    name: "picker",
-    component: () => import("./views/Picker.vue"),
+    name: "home",
+    component: () => import("./views/Home.vue"),
+    meta: { header: "full", footer: true },
   },
   {
-    // Clerk's Account Portal sends users to /sessions after sign-in /
-    // sign-up (see dashboard → User redirects). Alias to the picker
-    // so we don't have to maintain a separate component.
+    // Picker — the first authenticated surface. Clerk's Account
+    // Portal sends users to /sessions after sign-in / sign-up, so
+    // the route name is fixed.
     path: "/sessions",
     name: "sessions",
     component: () => import("./views/Picker.vue"),
+    meta: { header: "full", footer: true },
   },
   {
     path: "/chat/:sid",
     name: "chat",
     component: () => import("./views/Workspace.vue"),
     props: true,
+    meta: { header: "compact", footer: false },
   },
   {
     path: "/login",
     name: "login",
     component: () => import("./views/Login.vue"),
+    meta: { header: "full", footer: true },
   },
   {
     // Desktop sign-in bounce page. The Tauri shell opens this URL in
     // the user's default browser; after Clerk authenticates, the page
     // mints a fresh Clerk session via /api/auth/desktop-mint-handoff
     // and redirects to the digi-setu:// deep link the desktop client
-    // supplied via `?return=…`. The desktop sidecar then exchanges
-    // the session_id for a JWT via /api/auth/desktop-refresh, and
-    // the frontend stashes the session_id in the OS keychain so the
-    // user stays signed in across app restarts (Cursor-style SSO).
+    // supplied via `?return=…`.
     path: "/desktop/sign-in",
     name: "desktop-sign-in",
     component: () => import("./views/DesktopSignIn.vue"),
+    meta: { header: "full", footer: false },
   },
   {
     path: "/pricing",
     name: "pricing",
     component: () => import("./views/Pricing.vue"),
+    meta: { header: "full", footer: true },
   },
   {
     path: "/privacy",
     name: "privacy",
     component: () => import("./views/Privacy.vue"),
+    meta: { header: "full", footer: true },
   },
   {
     // Clerk's "Privacy Policy URL" field points to /privacy-policy
@@ -126,16 +144,19 @@ const routes: RouteRecordRaw[] = [
     path: "/terms",
     name: "terms",
     component: () => import("./views/Terms.vue"),
+    meta: { header: "full", footer: true },
   },
   {
     path: "/feedback",
     name: "feedback",
     component: () => import("./views/Feedback.vue"),
+    meta: { header: "full", footer: true },
   },
   {
     path: "/activity",
     name: "activity",
     component: () => import("./views/Activity.vue"),
+    meta: { header: "full", footer: true },
   },
   {
     // Public landing for the desktop installer download. Linked from
@@ -144,6 +165,7 @@ const routes: RouteRecordRaw[] = [
     path: "/download",
     name: "download",
     component: () => import("./views/Download.vue"),
+    meta: { header: "full", footer: true },
   },
   {
     path: "/:pathMatch(.*)*",

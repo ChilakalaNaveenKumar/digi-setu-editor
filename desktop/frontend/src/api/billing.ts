@@ -151,6 +151,12 @@ export interface UsageEvent {
 export interface UsageEventsResponse {
   events: UsageEvent[];
   limit: number;
+  /** True when at least `limit` rows came back from the cloud — i.e.
+   *  there are likely more older entries to load. Drives the "Load
+   *  older" button visibility on the Activity page. Conservatively
+   *  false when the cloud was unreachable (no point offering a page
+   *  we can't actually fetch). */
+  has_more: boolean;
   /** "cloud" when the proxy succeeded; "offline*" if the sidecar
    *  couldn't reach api.digi-setu.com. SPA renders a small banner. */
   source?: "cloud" | "offline" | "offline_signed_out";
@@ -158,18 +164,30 @@ export interface UsageEventsResponse {
 }
 
 /**
- * Returns the most recent activity events for the signed-in user,
- * newest first. Sidecar forwards this from digi-setu.com — see
- * services/cloud_api.py. Use `since` (ISO-8601 UTC) to poll
- * incrementally.
+ * Returns activity events for the signed-in user, newest first.
+ * Sidecar forwards this from digi-setu.com — see services/cloud_api.py.
+ *
+ * - `limit`  page size, capped at 500 server-side.
+ * - `since`  ISO-8601 UTC. Returns ONLY events strictly after this
+ *            time. Used by the Activity page to poll for new rows
+ *            without re-shipping the full window every 30s.
+ * - `before` ISO-8601 UTC. Returns ONLY events strictly older than
+ *            this. Cursor for "Load older" — pass the timestamp of
+ *            the oldest visible row to fetch the next page back in
+ *            history.
+ *
+ * Default `limit` matches the SPA's call site (100). The proxy
+ * forwards all three params verbatim.
  */
 export function getUsageEvents(opts: {
   limit?: number;
   since?: string;
+  before?: string;
 } = {}): Promise<UsageEventsResponse> {
   const params = new URLSearchParams();
   if (opts.limit) params.set("limit", String(opts.limit));
   if (opts.since) params.set("since", opts.since);
+  if (opts.before) params.set("before", opts.before);
   const qs = params.toString();
   return apiJson(`/api/usage/events${qs ? "?" + qs : ""}`);
 }
@@ -213,6 +231,7 @@ export interface ByokUsageResponse {
   events: ByokEvent[];
   summary: ByokSummary;
   limit: number;
+  has_more: boolean;
 }
 
 /**
@@ -225,14 +244,21 @@ export interface ByokUsageResponse {
  * no money to track on the cloud. Deleting the local file blanks
  * the user's *own* activity log; it cannot grant them free
  * subscription usage.
+ *
+ * Pagination mirrors `getUsageEvents`: `since` for incremental
+ * polling of new rows, `before` for "Load older" history. The
+ * `summary` block is always full-history regardless of pagination,
+ * so the rollup numbers don't change as the user pages through.
  */
 export function getByokUsage(opts: {
   limit?: number;
   since?: string;
+  before?: string;
 } = {}): Promise<ByokUsageResponse> {
   const params = new URLSearchParams();
   if (opts.limit) params.set("limit", String(opts.limit));
   if (opts.since) params.set("since", opts.since);
+  if (opts.before) params.set("before", opts.before);
   const qs = params.toString();
   return apiJson(`/api/usage/byok${qs ? "?" + qs : ""}`);
 }

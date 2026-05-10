@@ -3,10 +3,15 @@
  *
  * Routes (history mode so the URL shows real paths, not `#`-hashes):
  *
- *   /                  Home — public marketing landing
- *   /sessions          Picker — recent chats (web) or workspaces (desktop).
- *                      This is the first authenticated surface; Clerk's
- *                      hosted sign-in also redirects here post-auth.
+ *   /                  Picker — workspace / session list. Desktop
+ *                      doesn't ship a separate "marketing home"
+ *                      surface; the picker IS the home page because
+ *                      the user has already installed the app and
+ *                      isn't being sold to. The web fork serves the
+ *                      marketing landing — see web/frontend/router.ts.
+ *   /sessions          Alias for / — Clerk's hosted sign-in redirects
+ *                      here after auth (configured in the Clerk
+ *                      dashboard).
  *   /workspaces/:wsid  Desktop landing — resolves to the most-recent
  *                      chat in the workspace (or auto-creates one), then
  *                      redirects to /chat/:sid. Kept for bookmark stability;
@@ -36,19 +41,19 @@
  *
  * Auth guard:
  *   - The guard does NOT block navigation based on auth state. Users
- *     can browse the home page, picker, open folders, view workspaces,
- *     and read legal pages without signing in. The actual gate lives
- *     in the chat surface: when a user tries to send a message without
- *     a usable backend (no Clerk session AND no BYOK key), the chat
+ *     can browse the picker, open folders, view workspaces, and read
+ *     legal pages without signing in. The actual gate lives in the
+ *     chat surface: when a user tries to send a message without a
+ *     usable backend (no Clerk session AND no BYOK key), the chat
  *     panel renders an inline "sign in or add a key" prompt instead
  *     of trying to spawn the runtime and crashing the bridge.
- *   - On true first launch (`requires_setup=true`) we land the user on
- *     the public Home page (/), which carries its own primary CTA into
- *     /login. We do NOT bounce / → /login any more — the user always
- *     sees the marketing surface first so they know what they're
- *     signing in to.
- *   - /login is auto-redirected to /sessions once auth is satisfied so
- *     the dead "auth disabled" / "you're already signed in" stub never
+ *   - On true first launch (`requires_setup=true` AND nothing in the
+ *     URL bar — the user just opened the app), we land them on
+ *     /login (the Welcome screen) as a friendly default. They can
+ *     navigate away from there to / freely; we never bounce them
+ *     back.
+ *   - /login is auto-redirected to / once auth is satisfied so the
+ *     dead "auth disabled" / "you're already signed in" stub never
  *     shows.
  */
 
@@ -57,17 +62,29 @@ import { createRouter, createWebHistory, type RouteRecordRaw } from "vue-router"
 import { useConfigStore } from "./stores/config";
 import { useAuthStore } from "./stores/auth";
 
+// Routes that bypass the cold-launch /login bounce. `sessions` stays
+// public because Clerk lands here right after sign-in and the auth
+// cookie hasn't necessarily been written by the time the guard runs.
+const PUBLIC_ROUTES = new Set([
+  "login",
+  "sessions",
+  "privacy",
+  "terms",
+  "pricing",
+  "feedback",
+]);
+
 const routes: RouteRecordRaw[] = [
   {
     path: "/",
-    name: "home",
-    component: () => import("./views/Home.vue"),
+    name: "picker",
+    component: () => import("./views/Picker.vue"),
     meta: { header: "full", footer: true },
   },
   {
-    // Picker is the first authenticated surface. Clerk's Account
-    // Portal sends users to /sessions after sign-in / sign-up (see
-    // dashboard → User redirects), so the route name is fixed.
+    // Clerk's Account Portal sends users to /sessions after sign-in /
+    // sign-up. Alias to the picker so we don't have to maintain a
+    // separate component.
     path: "/sessions",
     name: "sessions",
     component: () => import("./views/Picker.vue"),
@@ -138,9 +155,7 @@ const routes: RouteRecordRaw[] = [
     // on the cloud relay writes a row there); a separate desktop page
     // would drift, leak the user's chat history into a local SQLite
     // (which they could delete), and force the desktop to make
-    // authenticated reads against the cloud DB. Sending users to
-    // {CLOUD}/activity keeps the data path: browser → Caddy → cloud
-    // FastAPI → SQLite-on-VM. The desktop never reaches that DB.
+    // authenticated reads against the cloud DB.
     path: "/activity",
     name: "activity",
     component: () => import("./views/CloudRedirect.vue"),
@@ -158,6 +173,12 @@ export const router = createRouter({
   routes,
 });
 
+// True on the very first navigation of a session. Used so that on
+// cold launch we can land a brand-new (no auth, no BYOK) user on the
+// Welcome screen as a friendly default — but we never bounce them
+// back to Welcome after that, even if they navigate away.
+let firstNavigation = true;
+
 router.beforeEach(async (to) => {
   const cfg = useConfigStore();
   const auth = useAuthStore();
@@ -165,18 +186,32 @@ router.beforeEach(async (to) => {
   if (!cfg.ready) await cfg.refresh();
   if (!auth.ready) await auth.refresh();
 
+  const wasFirst = firstNavigation;
+  firstNavigation = false;
+
   // /login is the Welcome screen. If the user is already signed in
   // (or running in BYOK / dev mode), there's nothing useful for
-  // /login to show — send them straight to the picker. This also
-  // avoids the "you're already signed in" dead-end stub.
+  // /login to show — send them home. This also avoids the "you're
+  // already signed in" dead-end stub.
   if (to.name === "login" && (auth.signedIn || !cfg.authRequired)) {
-    return { name: "sessions" };
+    return { path: "/" };
   }
 
-  // Otherwise: every route is open. Cold-launch first-time users
-  // land on / (the public Home page) and choose to sign in from
-  // the hero CTA — we no longer punt them to /login behind their
-  // back. Chat itself prompts for sign-in or BYOK at message-send
-  // time when no backend is configured.
+  // Cold-launch friendly redirect: brand-new user (auth required, not
+  // signed in, no BYOK) opening / for the first time → land them on
+  // the Welcome screen. Only on the very first navigation; after that
+  // they can roam freely between picker / pricing / privacy / etc.
+  if (
+    wasFirst &&
+    to.path === "/" &&
+    cfg.requiresSetup &&
+    !PUBLIC_ROUTES.has(String(to.name))
+  ) {
+    return { name: "login" };
+  }
+
+  // Otherwise: every route is open. Chat itself prompts for sign-in
+  // or BYOK at message-send time when no backend is configured;
+  // navigation is never blocked.
   return true;
 });

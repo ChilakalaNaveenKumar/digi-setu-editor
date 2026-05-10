@@ -35,7 +35,6 @@
 import { computed, ref } from "vue";
 import { Icon } from "@iconify/vue";
 
-import BrandHeader from "../components/BrandHeader.vue";
 
 const APP_VERSION = "0.1.0";
 
@@ -144,9 +143,7 @@ const windowsAvailable = false;     // Pending Azure Trusted Signing identity ve
 </script>
 
 <template>
-  <div class="min-h-screen bg-background text-foreground">
-    <BrandHeader />
-
+  <div class="flex min-h-0 w-full flex-1 flex-col bg-background text-foreground">
     <!-- Hero -->
     <section class="mx-auto max-w-4xl px-6 pt-16 pb-20 text-center">
       <p class="mb-3 inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/40 px-3 py-1 text-caption font-mono uppercase tracking-wide text-muted-foreground">
@@ -437,12 +434,5 @@ const windowsAvailable = false;     // Pending Azure Trusted Signing identity ve
       </div>
     </section>
 
-    <footer class="border-t border-border py-10 text-center text-caption text-muted-foreground">
-      <p>
-        Need help installing? <a class="underline hover:text-foreground" href="/feedback">Send feedback</a>
-        · <a class="underline hover:text-foreground" href="/privacy">Privacy</a>
-        · <a class="underline hover:text-foreground" href="/terms">Terms</a>
-      </p>
-    </footer>
   </div>
 </template>

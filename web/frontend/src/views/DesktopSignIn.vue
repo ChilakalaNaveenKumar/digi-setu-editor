@@ -63,7 +63,6 @@ import { computed, ref, watch } from "vue";
 import { useRoute } from "vue-router";
 import { SignIn, useUser } from "@clerk/vue";
 
-import BrandHeader from "../components/BrandHeader.vue";
 import { apiPost } from "../api/client";
 import { useConfigStore } from "../stores/config";
 
@@ -177,16 +176,7 @@ watch(
 </script>
 
 <template>
-  <div class="flex min-h-screen flex-col bg-background text-foreground">
-    <BrandHeader
-      :show-account="false"
-      :show-feedback="false"
-      :links="[
-        { to: '/privacy', label: 'Privacy' },
-        { to: '/terms', label: 'Terms' },
-      ]"
-    />
-
+  <div class="flex min-h-0 flex-1 flex-col bg-background text-foreground">
     <main class="flex flex-1 flex-col items-center justify-center px-6 py-12">
       <div
         v-if="!returnIsValid"
@@ -257,11 +247,5 @@ watch(
         </p>
       </div>
     </main>
-
-    <footer
-      class="border-t border-border bg-card/40 px-6 py-4 text-center text-caption text-muted-foreground"
-    >
-      © {{ new Date().getFullYear() }} Digi Setu
-    </footer>
   </div>
 </template>

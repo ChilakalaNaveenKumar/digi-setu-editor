@@ -52,9 +52,11 @@ const props = withDefaults(
 // FIXED nav set used on every page. Activity + Pricing route to the
 // cloud web app (browser-side billing UI lives there). Privacy / Terms
 // move to the footer to keep the top bar focused on actions.
+//
+// Desktop ships no separate "marketing home" page — the picker IS
+// the home — so we just expose Workspaces (/) and the cloud links.
 const NAV: NavLink[] = [
-  { to: "/", label: "Home" },
-  { to: "/sessions", label: "Workspaces" },
+  { to: "/", label: "Workspaces" },
   { external: "PRICING", label: "Pricing" },
   { external: "ACTIVITY", label: "Activity" },
 ];
@@ -80,27 +82,19 @@ async function onExternalClick(token: "ACTIVITY" | "PRICING"): Promise<void> {
   await openExternal(_externalUrl(token));
 }
 
-// Cancel + Manage subscription both bounce to the Stripe Customer
-// Portal. We surface them as separate menu items so users searching
-// for "cancel" don't have to discover that "manage" hides the cancel
-// flow inside Stripe. Both items are gated on hasCustomer because the
-// portal 404s without a Stripe customer record.
+// Manage Subscription bounces to the Stripe Customer Portal in the
+// user's signed-in browser session. We surface it on desktop so paid
+// users can update their card without hunting through the cloud SPA;
+// "Cancel plan" itself lives there too (one click inside the portal),
+// but the desktop binary doesn't expose a separate cancel flow — that
+// CTA only ships on the web fork where the billing surface lives.
 async function onManageSubscription(): Promise<void> {
-  closeMenu();
-  await openExternal(cloudPortalUrl());
-}
-async function onCancelPlan(): Promise<void> {
   closeMenu();
   await openExternal(cloudPortalUrl());
 }
 
 const hasCustomer = computed(() => !!billing.credit?.stripe_customer_id);
-const isPaidPlan = computed(() => {
-  const id = billing.credit?.plan?.id ?? "free";
-  return id !== "free";
-});
 const showManageSubscription = computed(() => hasCustomer.value);
-const showCancelPlan = computed(() => hasCustomer.value && isPaidPlan.value);
 
 const isCompact = computed(() => props.variant === "compact");
 const padding = computed(() =>
@@ -346,24 +340,6 @@ onBeforeUnmount(() => watchMenu(false));
           @click="onManageSubscription"
         >
           <span>{{ $t("nav.manageSubscription") }}</span>
-          <svg
-            class="h-3 w-3 opacity-70"
-            viewBox="0 0 12 12"
-            fill="none"
-            aria-hidden="true"
-          >
-            <path d="M4.5 2H10v5.5M10 2L5 7M2.5 4.5v5h5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" />
-          </svg>
-        </button>
-        <button
-          v-if="showCancelPlan"
-          type="button"
-          role="menuitem"
-          class="flex w-full items-center justify-between gap-2 px-3 py-2 text-left text-body text-foreground hover:bg-muted"
-          title="Cancel your subscription in the Stripe customer portal. You keep access until the current period ends."
-          @click="onCancelPlan"
-        >
-          <span>Cancel plan</span>
           <svg
             class="h-3 w-3 opacity-70"
             viewBox="0 0 12 12"

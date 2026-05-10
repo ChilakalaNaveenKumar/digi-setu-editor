@@ -74,41 +74,52 @@ const popoverStyle = ref<Record<string, string>>({});
 // overflow clipping, so a normal absolute-positioned dropdown gets
 // cut on the left side. Going through <Teleport> + fixed positioning
 // sidesteps every parent's clip box.
+//
+// Flip strategy: this picker lives in the composer toolbar, which
+// itself lives at the BOTTOM of the chat pane. Opening downward
+// almost always pushes the dropdown off-screen (or into the
+// 200 px-strip-of-life cropping it to a single visible row).
+// Rule:
+//   space_below  := viewport.bottom - trigger.bottom
+//   space_above  := trigger.top
+//   desired      := 280 px (3 modes + footer + breathing room)
+// Open downward only when space_below ≥ desired OR space_below ≥
+// space_above. Otherwise flip up. The previous threshold was a
+// hard "< 200 px below" cut-off which left the picker awkwardly
+// half-off-screen at composer heights between 200–280 px below.
 function reposition(): void {
   const t = triggerRef.value;
   if (!t) return;
   const rect = t.getBoundingClientRect();
   const margin = 8;
   const desiredWidth = 320;
+  const desiredHeight = 280;
   const width = Math.min(desiredWidth, window.innerWidth - margin * 2);
   let left = rect.right - width;
   if (left < margin) left = margin;
   if (left + width > window.innerWidth - margin) {
     left = window.innerWidth - margin - width;
   }
-  // Place below; if not enough room, flip above the trigger.
-  const spaceBelow = window.innerHeight - rect.bottom;
-  let top = rect.bottom + 4;
-  let maxHeight = spaceBelow - margin;
-  if (spaceBelow < 200 && rect.top > 200) {
-    top = rect.top - 4;
-    maxHeight = rect.top - margin;
+  const spaceBelow = window.innerHeight - rect.bottom - margin;
+  const spaceAbove = rect.top - margin;
+  const flipUp = spaceBelow < desiredHeight && spaceAbove > spaceBelow;
+  if (flipUp) {
     popoverStyle.value = {
       position: "fixed",
       top: "auto",
       bottom: `${window.innerHeight - rect.top + 4}px`,
       left: `${left}px`,
       width: `${width}px`,
-      maxHeight: `${maxHeight}px`,
+      maxHeight: `${Math.min(desiredHeight, spaceAbove)}px`,
     };
     return;
   }
   popoverStyle.value = {
     position: "fixed",
-    top: `${top}px`,
+    top: `${rect.bottom + 4}px`,
     left: `${left}px`,
     width: `${width}px`,
-    maxHeight: `${Math.min(360, maxHeight)}px`,
+    maxHeight: `${Math.min(desiredHeight, spaceBelow)}px`,
   };
 }
 

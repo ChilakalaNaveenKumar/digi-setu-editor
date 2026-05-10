@@ -163,19 +163,35 @@ def record(
         print(f"[byok_usage] WARN: record failed: {exc}", file=sys.stderr)
 
 
-def recent_events(limit: int = 200, since_iso: Optional[str] = None) -> list[dict[str, Any]]:
-    """Most recent rows (newest first), paginated by `limit`. `since_iso`
-    is exclusive — passing the timestamp of the most recent row returns
-    only newer entries (useful for incremental polling)."""
+def recent_events(
+    limit: int = 200,
+    since_iso: Optional[str] = None,
+    before_iso: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """Most recent rows (newest first), paginated by `limit`.
+
+    `since_iso` is exclusive — passing the timestamp of the most
+    recent row returns only NEWER entries (used for incremental
+    polling so we don't re-ship the whole table every 30s).
+
+    `before_iso` is exclusive — passing the timestamp of the OLDEST
+    visible row returns the next `limit` entries strictly older than
+    it (used by the Activity page's "Load older" button)."""
     sql = (
         "SELECT ts, session_id, workspace_id, provider, model_id, "
         "input_tokens, output_tokens, cache_read, cache_write "
         "FROM byok_events"
     )
     args: list[Any] = []
+    where: list[str] = []
     if since_iso:
-        sql += " WHERE ts > ?"
+        where.append("ts > ?")
         args.append(since_iso)
+    if before_iso:
+        where.append("ts < ?")
+        args.append(before_iso)
+    if where:
+        sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY ts DESC LIMIT ?"
     args.append(int(limit))
     try:

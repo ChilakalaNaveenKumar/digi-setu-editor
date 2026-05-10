@@ -58,7 +58,7 @@ async function open(): Promise<void> {
   }
 
   if (!wsid) {
-    router.replace({ name: "picker" });
+    router.replace({ name: "sessions" });
     return;
   }
 
@@ -85,22 +85,34 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
+  <!--
+    Layout — full-viewport IDE shell.
+
+    Outer  : `h-full` chains from App.vue's middle div (which is the
+             flex-grow child of the `h-screen` root on the chat route);
+             gives this view a definite 100vh height to lay out
+             children against.
+    Header : intrinsic height (~40px).
+    AppShell wrapper: `flex-1 min-h-0` is the canonical "give me the
+             remaining height" pattern. Without it, AppShell's inner
+             `h-full` resolves against the ENTIRE 100vh (not the
+             post-header remainder), so the splitpanes overflow by
+             the header's height and either get clipped or, depending
+             on the parent flex layout, collapse to less than full
+             height — which is exactly what produced the giant black
+             void below the chat panes the user reported.
+    Conn banner / PermissionPrompt: intrinsic height after the panes.
+  -->
   <div class="flex h-full w-full flex-col bg-background text-foreground">
-    <!-- Compact brand header for the IDE shell. The back-to-sessions
-         affordance lives in the file-tree sidebar (FileTreePane) where
+    <!-- Compact brand header for the IDE shell. Same global BrandHeader
+         used everywhere else (the FIXED nav set keeps the user oriented
+         no matter what view they're in), shrunk via variant=compact and
+         given a centre slot with the chat title. The back-to-sessions
+         affordance lives in the file-tree sidebar (FileTreePane), where
          it sits directly above the session ID — that's the more
          contextual location. We deliberately do NOT add a second back
          button to this top bar. -->
-    <BrandHeader
-      variant="compact"
-      :links="[
-        { to: '/activity', label: $t('nav.activity') },
-        { to: '/pricing',  label: $t('nav.pricing') },
-        { to: '/privacy',  label: $t('nav.privacy') },
-        { to: '/terms',    label: $t('nav.terms') },
-      ]"
-      :home-link="false"
-    >
+    <BrandHeader variant="compact">
       <!-- Centre: current chat title. The title updates live when the
            background titler lands a polished version (see chat.ts →
            applyTitleUpdate). -->
@@ -112,7 +124,9 @@ onBeforeUnmount(() => {
       </div>
     </BrandHeader>
 
-    <AppShell />
+    <div class="flex min-h-0 w-full flex-1 flex-col">
+      <AppShell />
+    </div>
 
     <div
       v-if="connState === 'closed' || connState === 'error'"

@@ -240,11 +240,25 @@ body {
   animation: pi-shimmer 2.6s ease-in-out infinite;
 }
 
-/* User-bubble token-driven gradient (replaces pi-web-ui's hardcoded oranges). */
-.user-bubble {
-  background: var(--user-bubble-bg);
-  border: 1px solid var(--user-bubble-border);
-}
+/* User-bubble — slim left accent rail, NO full border / heavy fill.
+ *
+ * Earlier version wrapped every user message in a chunky bordered card
+ * with a translucent teal fill. Result: the user's "Hi" looked like a
+ * loud announcement banner sitting next to a plain assistant paragraph,
+ * so the conversation read as label-vs-paragraph instead of a dialogue.
+ *
+ * The new style keeps the same vertical rhythm as the assistant message
+ * (same line-height, same margin) and adds a 2 px accent rail on the
+ * left so you can still scan-read who said what without your eyes
+ * dropping into a coloured pit on every user turn. */
+/*
+ * .user-bubble is now just an HMR / scoping anchor — the actual visual
+ * weight lives on the inner card div in UserMessage.vue (Tailwind
+ * utility classes: rounded-xl + border + bg-muted/40). Keeping the
+ * class name so existing snapshot selectors / scroll-to-bubble code
+ * keeps working.
+ */
+.user-bubble { /* intentionally empty — visual styles are inline */ }
 
 /* Permission-prompt attention pulse.
  *

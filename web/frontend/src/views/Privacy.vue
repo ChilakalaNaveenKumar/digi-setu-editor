@@ -18,7 +18,6 @@
 -->
 <script setup lang="ts">
 import { Icon } from "@iconify/vue";
-import BrandHeader from "../components/BrandHeader.vue";
 
 interface KeyFact {
   icon: string;
@@ -59,14 +58,7 @@ const SECTIONS: Section[] = [
 </script>
 
 <template>
-  <div class="flex min-h-screen flex-col bg-background text-foreground">
-    <BrandHeader
-      :links="[
-        { to: '/pricing', label: $t('nav.pricing') },
-        { to: '/terms',   label: $t('nav.terms') },
-      ]"
-    />
-
+  <div class="flex min-h-0 flex-1 flex-col bg-background text-foreground">
     <main class="mx-auto w-full max-w-3xl flex-1 px-6 py-12 md:py-16">
       <header class="mb-10">
         <span class="inline-flex items-center gap-1 rounded-full bg-muted px-2.5 py-0.5 text-caption uppercase tracking-wider text-muted-foreground">
@@ -311,9 +303,5 @@ const SECTIONS: Section[] = [
         </section>
       </article>
     </main>
-
-    <footer class="border-t border-border bg-card/40 px-6 py-4 text-center text-caption text-muted-foreground">
-      © {{ new Date().getFullYear() }} Digi Setu
-    </footer>
   </div>
 </template>

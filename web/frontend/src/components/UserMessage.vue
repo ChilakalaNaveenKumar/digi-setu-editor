@@ -1,6 +1,21 @@
 <!--
-  UserMessage — chat bubble for the user. Compact card with subtle accent
-  rail on the left.
+  UserMessage — chat bubble for the user.
+
+  Visual: ChatGPT/Claude-style card on a slightly tinted background
+  surface. Rounded card + soft `bg-muted/40` fill + 1 px border, with
+  a small "YOU" eyebrow label and a hover-revealed "↶ revert turn"
+  button on the right edge of the eyebrow row.
+
+  Earlier passes oscillated between two extremes:
+   1. Heavy filled card with strong border — every "Hi" looked like a
+      banner announcement next to a plain-text assistant reply.
+   2. Bare 2 px left rail with no fill — too minimal, the "user said
+      what?" affordance got lost in long threads with lots of tool
+      cards in between.
+  The current design splits the difference: enough fill that the
+  user's prompt is visually anchored as a discrete unit, but soft
+  enough (muted, not primary) that the assistant reply still reads
+  as the main content of the turn.
 
   Long messages (>~12 lines or 1500 chars of source) auto-collapse to a
   preview with a "Show more / less" toggle, so a single 100k-char paste
@@ -88,40 +103,61 @@ async function revertTurn(): Promise<void> {
 </script>
 
 <template>
-  <div ref="root" class="user-bubble group my-5 rounded-md px-4 py-3">
-    <div class="mb-1 flex items-center justify-between">
-      <span class="text-caption uppercase tracking-wide text-muted-foreground">
-        you<span v-if="isLong" class="ml-1.5 normal-case opacity-60">·
+  <!--
+    `group` enables the hover-revealed revert button. The outer wrap
+    handles vertical rhythm; the inner card owns the visual weight.
+  -->
+  <div ref="root" class="user-bubble group my-5">
+    <!-- Eyebrow row — speaker label on the left, revert affordance
+         (only on hover) on the right. Sitting OUTSIDE the bubble so
+         the bubble surface stays a clean rectangle of message text. -->
+    <div class="mb-1.5 flex items-center justify-between gap-3 px-1">
+      <span class="text-caption font-semibold uppercase tracking-wider text-foreground/70">
+        You<span v-if="isLong" class="ml-1.5 font-normal normal-case tracking-normal text-muted-foreground/70">·
           {{ lineCount }} lines, {{ text.length.toLocaleString() }} chars</span>
       </span>
       <button
         type="button"
         :disabled="revertBusy"
-        class="rounded-sm border border-border bg-background px-1.5 py-0.5 text-caption text-muted-foreground opacity-0 transition-opacity hover:border-destructive/60 hover:text-destructive group-hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-50"
+        class="inline-flex items-center gap-1 rounded-md border border-border bg-background px-2 py-0.5 text-caption text-muted-foreground opacity-0 transition-all hover:border-destructive/60 hover:text-destructive group-hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-50"
         title="Revert every file change made in response to this prompt"
         @click="revertTurn"
       >
-        {{ revertBusy ? "reverting…" : "↶ revert turn" }}
+        <Icon
+          :icon="revertBusy ? 'codicon:loading' : 'codicon:discard'"
+          :class="revertBusy && 'animate-spin'"
+          class="h-3 w-3"
+        />
+        {{ revertBusy ? "reverting…" : "revert turn" }}
       </button>
     </div>
-    <!--
-      Soft fade at the bottom of the preview gives a clear visual cue
-      that the message is truncated, without needing scroll bars or a
-      hard cut-off line. Disabled when expanded so the full text reads
-      cleanly.
-    -->
-    <div class="relative">
-      <div class="pi-markdown text-foreground" v-html="html" />
+
+    <!-- Bubble surface. Soft muted fill + 1 px border + rounded corners
+         is the ChatGPT / Claude convention — clearly anchors "this was
+         the user's message" without competing with the assistant reply
+         (which renders as plain prose on the page background). The
+         `transition-colors` lets us tint the border on hover later
+         without a visible jump. -->
+    <div
+      class="relative rounded-xl border border-border/70 bg-muted/40 px-4 py-3 transition-colors"
+    >
+      <div class="pi-markdown leading-relaxed text-foreground" v-html="html" />
+      <!-- Soft fade at the bottom of the preview gives a visual cue
+           that the message is truncated. We fade INTO the bubble's
+           own bg colour (muted) so it doesn't look like a stripe. -->
       <div
         v-if="isLong && !expanded"
-        class="pointer-events-none absolute inset-x-0 bottom-0 h-10 bg-gradient-to-t from-[var(--user-bubble-bg,theme(colors.muted.DEFAULT))] to-transparent"
+        class="pointer-events-none absolute inset-x-0 bottom-0 h-10 rounded-b-xl bg-gradient-to-t from-muted/60 to-transparent"
         aria-hidden="true"
       />
     </div>
+
+    <!-- Show-more toggle sits below the bubble in the same gutter as
+         the eyebrow. Keeps the bubble surface uncluttered. -->
     <button
       v-if="isLong"
       type="button"
-      class="mt-1 inline-flex items-center gap-1 rounded text-caption font-mono text-muted-foreground hover:text-foreground"
+      class="mt-1 inline-flex items-center gap-1 rounded px-1 text-caption font-mono text-muted-foreground hover:text-foreground"
       @click="expanded = !expanded"
     >
       <Icon
@@ -132,25 +168,15 @@ async function revertTurn(): Promise<void> {
     </button>
     <div
       v-if="revertedFiles"
-      class="mt-1 text-caption text-success"
+      class="mt-1 px-1 text-caption text-success"
     >
       reverted {{ revertedFiles.length }} file{{ revertedFiles.length === 1 ? "" : "s" }}
     </div>
     <div
       v-if="revertError"
-      class="mt-1 text-caption text-destructive"
+      class="mt-1 px-1 text-caption text-destructive"
     >
       {{ revertError }}
     </div>
   </div>
 </template>
-
-<style scoped>
-/* Pull the bubble's exact background colour into the fade gradient via
-   a CSS variable, so the fade reads as "fading into the bubble" rather
-   than fading into a generic surface. Falls back to muted when the
-   bubble doesn't expose its own bg variable. */
-.user-bubble {
-  --user-bubble-bg: hsl(var(--card));
-}
-</style>

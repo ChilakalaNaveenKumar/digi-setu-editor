@@ -13,8 +13,8 @@
   Layout:
     1. Hero (title + tagline)
     2. Plan cards row (Free / Pro / Enterprise / Custom)
-    3. "What's included" feature matrix
-    4. Trust strip (Stripe + cancel anytime + cards never seen)
+    3. Trust strip (Stripe + cancel anytime + cards never seen) +
+       Manage / Cancel buttons for active subscribers
 -->
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
@@ -22,7 +22,6 @@ import { storeToRefs } from "pinia";
 import { useRouter } from "vue-router";
 import { Icon } from "@iconify/vue";
 
-import BrandHeader from "../components/BrandHeader.vue";
 import { useBillingStore } from "../stores/billing";
 import { useConfigStore } from "../stores/config";
 
@@ -53,6 +52,25 @@ onMounted(async () => {
 
 const currentPlanId = computed(() => credit.value?.plan?.id ?? "free");
 const hasCustomer = computed(() => !!credit.value?.stripe_customer_id);
+const isPaidPlan = computed(() => currentPlanId.value !== "free");
+// The "Cancel plan" button in the footer is ALWAYS rendered so users
+// searching for it can find it — the previous version hid it for free-
+// tier users entirely, which made first-time visitors panic ("where
+// did the cancel button go?"). When there's nothing to cancel (free
+// plan or no Stripe customer record yet) we render it disabled with
+// a tooltip explaining why, instead of vanishing it. Clicking when
+// active opens the Stripe Customer Portal.
+const canCancel = computed(() => hasCustomer.value && isPaidPlan.value);
+const cancelLabel = computed(() => {
+  if (busy.value === "cancel") return "Opening browser…";
+  return "Cancel plan";
+});
+const cancelTitle = computed(() => {
+  if (!isPaidPlan.value) return "You're on the Free plan — nothing to cancel.";
+  if (!hasCustomer.value)
+    return "Stripe customer record not found — refresh after your first paid period kicks in.";
+  return "Opens the Stripe customer portal. You can cancel and keep access until the current period ends.";
+});
 
 async function onUpgrade(planId: string): Promise<void> {
   if (planId === "free" || planId === currentPlanId.value) return;
@@ -79,6 +97,20 @@ async function onManage(): Promise<void> {
   }
 }
 
+async function onCancel(): Promise<void> {
+  // Cancel = open the Stripe customer portal too. Stripe owns the
+  // actual cancel button (we don't have a "cancel directly" API
+  // because the portal handles edge cases like prorated refunds,
+  // active payment methods, dunning state, etc).
+  busy.value = "cancel";
+  try {
+    await billing.openPortal();
+  } catch (exc) {
+    console.warn("[pricing] cancel failed", exc);
+    busy.value = null;
+  }
+}
+
 function fmtUsd(v: number): string {
   return v % 1 === 0 ? `$${v}` : `$${v.toFixed(2)}`;
 }
@@ -91,12 +123,8 @@ function ctaLabel(planId: string): string {
   return "Upgrade";
 }
 
-// Highlight a "popular" plan visually. Pulled by id rather than
-// hard-coded so the same template handles plan changes server-side.
 const POPULAR_PLAN_ID = "pro";
 
-// What each plan includes — a single source of truth for the feature
-// bullets shown under each card. Keeps the template lean.
 function bullets(planId: string): string[] {
   switch (planId) {
     case "free":
@@ -126,24 +154,20 @@ function bullets(planId: string): string[] {
 </script>
 
 <template>
-  <div class="flex min-h-screen flex-col bg-background text-foreground">
-    <BrandHeader
-      :links="[
-        { to: '/privacy', label: 'Privacy' },
-        { to: '/terms', label: 'Terms' },
-      ]"
-    />
-
-    <main class="mx-auto w-full max-w-6xl flex-1 px-6 py-12 md:py-16">
+  <div class="flex min-h-0 flex-1 flex-col bg-background text-foreground">
+    <main class="mx-auto w-full max-w-6xl flex-1 px-6 py-10 md:py-14">
       <!-- HERO -->
       <header class="mx-auto max-w-2xl text-center">
-        <h1 class="text-h1 font-semibold tracking-tight md:text-h1">
-          Plans &amp; pricing
+        <h1
+          class="font-semibold tracking-tight text-foreground"
+          style="font-size: clamp(28px, 4vw, 36px); line-height: 1.15;"
+        >
+          Pricing that follows the meter
         </h1>
-        <p class="mt-3 text-lead leading-relaxed text-muted-foreground md:text-lead">
+        <p class="mt-4 text-lead leading-relaxed text-muted-foreground">
           Pay once a month for credit. We pass the actual model + infra cost
-          through — no per-token surprises, no hidden margin. Cancel any
-          time, no contracts.
+          through — no per-token surprises, no hidden margin.
+          <span class="text-foreground/85">Cancel any time</span>, no contracts.
         </p>
         <p
           v-if="enabled === false"
@@ -170,7 +194,6 @@ function bullets(planId: string): string[] {
               : '',
           ]"
         >
-          <!-- Popular badge -->
           <div
             v-if="p.id === POPULAR_PLAN_ID"
             class="absolute -top-3 left-1/2 -translate-x-1/2 rounded-full bg-primary px-3 py-0.5 text-caption font-semibold uppercase tracking-wider text-primary-foreground shadow"
@@ -235,12 +258,25 @@ function bullets(planId: string): string[] {
             >
               {{ ctaLabel(p.id) }}
             </button>
+            <p
+              v-if="p.id !== 'free'"
+              class="mt-2 text-center text-caption text-muted-foreground"
+            >
+              Cancel any time — you keep access until the period ends.
+            </p>
           </div>
         </article>
       </section>
 
-      <!-- TRUST STRIP -->
-      <footer class="mt-12 flex flex-col items-center justify-between gap-3 rounded-lg border border-border bg-card/60 px-5 py-4 text-body text-muted-foreground sm:flex-row">
+      <!-- TRUST STRIP + ACCOUNT ACTIONS
+           Cancel + Manage are surfaced as separate buttons here so a
+           user looking specifically for "cancel" doesn't have to guess
+           that the cancel flow is buried inside Stripe's "manage"
+           portal. Both bounce to the same Stripe Customer Portal in
+           the user's signed-in browser session. -->
+      <footer
+        class="mt-12 flex flex-col items-center justify-between gap-3 rounded-lg border border-border bg-card/60 px-5 py-4 text-body text-muted-foreground sm:flex-row"
+      >
         <div class="flex flex-wrap items-center justify-center gap-4 sm:justify-start">
           <span class="flex items-center gap-1.5">
             <Icon icon="codicon:shield" class="h-3.5 w-3.5" />
@@ -252,23 +288,33 @@ function bullets(planId: string): string[] {
           </span>
           <span class="flex items-center gap-1.5">
             <Icon icon="codicon:close-all" class="h-3.5 w-3.5" />
-            Cancel any time
+            Cancel any time — keep access until period end
           </span>
         </div>
-        <button
-          v-if="enabled && hasCustomer"
-          type="button"
-          class="rounded border border-border bg-background px-2.5 py-1 text-body hover:bg-muted disabled:opacity-50"
-          :disabled="busy !== null"
-          @click="onManage"
-        >
-          Manage subscription
-        </button>
+        <div v-if="enabled" class="flex items-center gap-2">
+          <button
+            v-if="hasCustomer"
+            type="button"
+            class="rounded-md border border-border bg-background px-3 py-1.5 text-body text-foreground hover:bg-muted disabled:opacity-50"
+            :disabled="busy !== null"
+            @click="onManage"
+          >
+            {{ busy === "portal" ? "Opening browser…" : "Manage subscription" }}
+          </button>
+          <!-- Cancel plan — always rendered so it's discoverable; the
+               disabled state + tooltip explain why it's a no-op when
+               you don't have an active subscription yet. -->
+          <button
+            type="button"
+            class="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-1.5 text-body font-medium text-destructive hover:bg-destructive/20 disabled:cursor-not-allowed disabled:border-border disabled:bg-card disabled:text-muted-foreground"
+            :disabled="busy !== null || !canCancel"
+            :title="cancelTitle"
+            @click="onCancel"
+          >
+            {{ cancelLabel }}
+          </button>
+        </div>
       </footer>
     </main>
-
-    <footer class="border-t border-border bg-card/40 px-6 py-4 text-center text-caption text-muted-foreground">
-      © {{ new Date().getFullYear() }} Digi Setu
-    </footer>
   </div>
 </template>

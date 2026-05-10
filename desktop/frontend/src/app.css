@@ -295,12 +295,14 @@ body {
  * (same line-height, same margin) and adds a 2 px accent rail on the
  * left so you can still scan-read who said what without your eyes
  * dropping into a coloured pit on every user turn. */
-.user-bubble {
-  background: transparent;
-  border: 0;
-  border-left: 2px solid var(--user-bubble-border);
-  border-radius: 0;
-}
+/*
+ * .user-bubble is now just an HMR / scoping anchor — the actual visual
+ * weight lives on the inner card div in UserMessage.vue (Tailwind
+ * utility classes: rounded-xl + border + bg-muted/40). Keeping the
+ * class name so existing snapshot selectors / scroll-to-bubble code
+ * keeps working.
+ */
+.user-bubble { /* intentionally empty — visual styles are inline */ }
 
 /* Permission-prompt attention pulse.
  *

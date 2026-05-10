@@ -243,12 +243,13 @@ function bullets(planId: string): string[] {
         </article>
       </section>
 
-      <!-- TRUST STRIP + ACCOUNT ACTIONS
-           Cancel + Manage are surfaced as separate buttons here so a
-           user looking specifically for "cancel" doesn't have to guess
-           that the cancel flow is buried inside Stripe's "manage"
-           portal. Both bounce to the same Stripe Customer Portal in
-           the system browser. -->
+      <!-- TRUST STRIP + MANAGE
+           Single "Manage subscription" button bounces to the Stripe
+           Customer Portal in the system browser; from there the user
+           can update card / invoices / cancel. We don't ship a
+           dedicated "Cancel plan" CTA on desktop — the cancel surface
+           lives on the web fork (digi-setu.com/pricing) where the
+           billing UX as a whole is hosted. -->
       <footer class="mt-12 flex flex-col items-center justify-between gap-3 rounded-lg border border-border bg-card/60 px-5 py-4 text-body text-muted-foreground sm:flex-row">
         <div class="flex flex-wrap items-center justify-center gap-4 sm:justify-start">
           <span class="flex items-center gap-1.5">
@@ -272,15 +273,6 @@ function bullets(planId: string): string[] {
             @click="onManage"
           >
             {{ busy === "portal" ? "Opening browser…" : "Manage subscription" }}
-          </button>
-          <button
-            type="button"
-            class="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-1.5 text-body font-medium text-destructive hover:bg-destructive/20 disabled:opacity-50"
-            :disabled="busy !== null"
-            title="Opens the Stripe customer portal in your browser. You can cancel and keep access until the current period ends."
-            @click="onManage"
-          >
-            Cancel plan
           </button>
         </div>
       </footer>

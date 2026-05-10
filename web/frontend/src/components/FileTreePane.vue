@@ -122,7 +122,7 @@ const cwdShort = computed(() => {
 
 function back(): void {
   chat.disconnect();
-  router.push({ name: "picker" });
+  router.push({ name: "sessions" });
 }
 
 // ── Toolbar actions ────────────────────────────────────────────────────

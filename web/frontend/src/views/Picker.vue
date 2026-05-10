@@ -1,19 +1,18 @@
 <!--
-  Picker — landing view (flat list of recent chats).
+  Picker — workspace list. The web Home page (/) markets the product;
+  this page (/sessions) is the first authenticated surface — a flat
+  list of the user's recent chats, each in its own sandboxed workspace.
 
-  Layout:
-    BrandHeader      (logo + nav)
+  Layout (header + footer mounted globally in App.vue):
     hero             (tagline + primary CTA)
     recent strip     (search + 5 most recent + "view all" toggle)
     "built on pi"    (small footer credit, deliberately understated)
-    site footer      (copyright)
 -->
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
 import { Icon } from "@iconify/vue";
 
-import BrandHeader from "../components/BrandHeader.vue";
 import { useChatSessionStore } from "../stores/chat-session";
 import { useConfigStore } from "../stores/config";
 import { useUiStore } from "../stores/ui";
@@ -142,28 +141,26 @@ const isReady = computed(() => cfg.ready);
 </script>
 
 <template>
-  <div class="flex min-h-screen w-full flex-col bg-background text-foreground">
-    <BrandHeader :home-link="false" />
-
-    <main class="mx-auto flex w-full max-w-5xl flex-1 flex-col px-6 py-10 md:py-16">
+  <div class="flex min-h-0 w-full flex-1 flex-col bg-background text-foreground">
+    <main class="mx-auto flex w-full max-w-5xl flex-1 flex-col px-6 py-10 md:py-14">
       <!-- HERO -->
-      <div class="text-center">
-        <h1 class="text-h1 font-semibold tracking-tight md:text-h1">
-          What do you want to build today?
+      <div>
+        <h1 class="text-h1 font-semibold tracking-tight text-foreground">
+          Your workspaces
         </h1>
-        <p class="mx-auto mt-3 max-w-xl text-lead leading-relaxed text-muted-foreground">
-          Each chat runs in its own sandboxed workspace. Digi Setu writes
-          Typst documents, code, and PDFs for you — start a new one or
-          jump back into a recent thread.
+        <p class="mt-2 max-w-2xl text-lead leading-relaxed text-muted-foreground">
+          Each chat runs in its own sandboxed workspace — files,
+          terminals and snapshots are scoped to the chat. Pick up a
+          recent thread or start a new one.
         </p>
       </div>
 
       <!-- PRIMARY CTA -->
-      <div class="mx-auto mt-8 w-full max-w-md">
+      <div class="mt-6 max-w-md">
         <button
           v-if="isReady"
           type="button"
-          class="flex w-full items-center justify-center gap-2 rounded-lg bg-primary px-5 py-3 text-lead font-semibold text-primary-foreground shadow-md transition-opacity hover:opacity-90 disabled:opacity-60"
+          class="flex w-full items-center justify-center gap-2 rounded-md bg-primary px-4 py-2.5 text-lead font-semibold text-primary-foreground shadow-sm transition-opacity hover:opacity-90 disabled:opacity-60"
           :disabled="busy"
           @click="startNewWebSession"
         >
@@ -173,7 +170,7 @@ const isReady = computed(() => cfg.ready);
 
         <div
           v-else
-          class="flex items-center justify-center gap-2 rounded-lg border border-border bg-card px-5 py-3 text-lead text-muted-foreground"
+          class="flex items-center justify-center gap-2 rounded-md border border-border bg-card px-4 py-2.5 text-lead text-muted-foreground"
         >
           <Icon icon="codicon:loading" class="h-4 w-4 animate-spin" />
           Loading…
@@ -324,12 +321,5 @@ const isReady = computed(() => cfg.ready);
         UI, and the production-grade Typst pipeline.
       </p>
     </main>
-
-    <footer
-      class="border-t border-border bg-card/40 px-6 py-4 text-center text-caption text-muted-foreground"
-    >
-      © {{ new Date().getFullYear() }} Digi Setu — built for writers,
-      coders &amp; everyone in between.
-    </footer>
   </div>
 </template>
