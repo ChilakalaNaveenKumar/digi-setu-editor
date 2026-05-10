@@ -21,12 +21,15 @@ import { Icon } from "@iconify/vue";
 import { apiJson, apiPatch } from "../api/client";
 import { useBillingStore } from "../stores/billing";
 import { useConfigStore } from "../stores/config";
+import { useWorkspaceStore } from "../stores/workspace";
 
 import PermissionModePicker from "./PermissionModePicker.vue";
+import StorageCleanupSection from "./StorageCleanupSection.vue";
 import UpgradeModal from "./UpgradeModal.vue";
 
 const billing = useBillingStore();
 const cfg = useConfigStore();
+const workspace = useWorkspaceStore();
 const {
   credit,
   remainingPct,
@@ -62,11 +65,11 @@ function reposition(): void {
   const rect = t.getBoundingClientRect();
   const margin = 8;
   const desiredWidth = 320;
-  // Estimated content height — permissions row + (optional) routing
-  // toggle + credit row + footer hint. The desktop edition can show
-  // the routing toggle (BYOK vs Cloud) which web doesn't, so the
-  // budget is slightly larger than the web version's 360.
-  const desiredHeight = 420;
+  // Estimated content height — permissions + (optional) routing toggle
+  // + credit + storage cleanup section + footer. We've grown over time;
+  // the popover scrolls internally when this is exceeded so an
+  // overestimate just shows a tighter scroll handle.
+  const desiredHeight = 560;
   const width = Math.min(desiredWidth, window.innerWidth - margin * 2);
   let left = rect.right - width;
   if (left < margin) left = margin;
@@ -381,6 +384,15 @@ function openUpgrade(): void {
           </RouterLink>
         </div>
       </div>
+
+          <!-- Per-workspace storage cleanup (chats, audits, uploads,
+               shadows). Surfaces only when there's an active workspace
+               id — opening the menu before picking a workspace would
+               give us nothing to clean. -->
+          <StorageCleanupSection
+            v-if="workspace.activeId"
+            :wsid="workspace.activeId"
+          />
 
           <!-- Footer hint -->
           <div class="px-3 py-2 text-caption leading-tight text-muted-foreground">

@@ -24,6 +24,7 @@ import "splitpanes/dist/splitpanes.css";
 import ChatPane from "./ChatPane.vue";
 import EditorPane from "./EditorPane.vue";
 import FileTreePane from "./FileTreePane.vue";
+import StorageCycleBanner from "./StorageCycleBanner.vue";
 import TerminalPane from "./TerminalPane.vue";
 import { useFilesStore } from "../stores/files";
 import { useTerminalsStore } from "../stores/terminals";
@@ -177,7 +178,11 @@ onMounted(() => {
 </script>
 
 <template>
-  <div class="flex h-full w-full bg-background text-foreground overflow-hidden">
+  <div class="flex h-full w-full flex-col bg-background text-foreground overflow-hidden">
+    <!-- Rolling-90-day cleanup notice. Only renders within the
+         banner_lead_days window AND when there's pending data; the
+         component takes zero space when hidden. -->
+    <StorageCycleBanner />
     <Splitpanes
       class="ide-splitpanes flex-1"
       :dbl-click-splitter="false"

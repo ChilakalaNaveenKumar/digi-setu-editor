@@ -356,16 +356,24 @@ const inputDisabled = computed(() => connState.value !== "open");
         <!-- Model -->
         <ModelPicker />
 
-        <!-- Streaming indicator. Sits between the mode/model chips and
-             the right-side actions so the user sees instantly when pi
-             is in the middle of a turn. -->
-        <span
+        <!-- Stop pill. The whole pill is the abort button — one tap
+             kills the in-flight pi turn. We deliberately drop the
+             "streaming…" label users complained about; the spinner-
+             dot + "Stop" + stop-icon already convey "something is
+             happening, click to cancel" without the redundant text.
+             Replaces a previously buried 28×28 icon button that users
+             routinely missed. -->
+        <button
           v-if="isStreaming"
-          class="ml-1 inline-flex items-center gap-1 text-caption text-warning"
+          type="button"
+          class="ml-1 inline-flex items-center gap-1.5 rounded-full border border-destructive/40 bg-destructive/10 px-2.5 py-1 text-caption text-destructive transition-colors hover:border-destructive hover:bg-destructive hover:text-destructive-foreground"
+          title="Stop the current response"
+          @click="chat.abort"
         >
-          <span class="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-warning" />
-          streaming…
-        </span>
+          <span class="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-destructive" />
+          <span>Stop</span>
+          <Icon icon="codicon:debug-stop" class="h-3 w-3" />
+        </button>
 
         <span class="ml-auto" />
 
@@ -414,29 +422,20 @@ const inputDisabled = computed(() => connState.value !== "open");
           <Icon icon="codicon:send" class="h-3.5 w-3.5" />
         </button>
 
-        <template v-else>
-          <button
-            type="button"
-            :disabled="
-              (!text.trim() && pendingAttachments.length === 0) ||
-              inputDisabled ||
-              isUploading
-            "
-            class="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-primary/60 bg-primary/15 text-primary transition-colors hover:bg-primary/25 disabled:cursor-not-allowed disabled:opacity-30"
-            :title="`Queue (⌘/Ctrl + ↵) — pi will run this after the current turn. ${queuedMessages.length} queued.`"
-            @click="submit"
-          >
-            <Icon icon="codicon:add" class="h-3.5 w-3.5" />
-          </button>
-          <button
-            type="button"
-            class="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-destructive text-destructive-foreground transition-opacity hover:opacity-90"
-            title="Abort the current pi turn"
-            @click="chat.abort"
-          >
-            <Icon icon="codicon:debug-stop" class="h-3.5 w-3.5" />
-          </button>
-        </template>
+        <button
+          v-else
+          type="button"
+          :disabled="
+            (!text.trim() && pendingAttachments.length === 0) ||
+            inputDisabled ||
+            isUploading
+          "
+          class="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-primary/60 bg-primary/15 text-primary transition-colors hover:bg-primary/25 disabled:cursor-not-allowed disabled:opacity-30"
+          :title="`Queue (⌘/Ctrl + ↵) — pi will run this after the current turn. ${queuedMessages.length} queued.`"
+          @click="submit"
+        >
+          <Icon icon="codicon:add" class="h-3.5 w-3.5" />
+        </button>
       </div>
     </div>
   </div>

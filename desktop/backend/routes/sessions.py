@@ -19,6 +19,10 @@ from fastapi import APIRouter, Depends, HTTPException
 from models.workspace import SessionCreate, SessionModelUpdate, SessionRename
 from routes._helpers import session_for_user_or_404, workspace_for_user_or_404
 from services.auth import require_user
+from services.chat_storage import (
+    cleanup_categories as _cleanup_categories,
+    workspace_storage_summary as _workspace_storage_summary,
+)
 from services.history import load_history
 from services.models_registry import is_allowed
 from services.plan_cache import get_plan_id as _get_plan_id
@@ -144,3 +148,46 @@ async def get_session_history(
     """
     session_for_user_or_404(sid, user_id)
     return {"messages": load_history(Registry.instance().session_chat_dir(sid))}
+
+
+# ── Storage cleanup (per-workspace, manual, multi-category) ────────
+# Desktop policy: each workspace exposes 4 cleanup categories — chats
+# (newest-100 keep), audits (90-day age trim), uploads (30-day age
+# trim), and the destructive "purge shadow git" (kills the AI revert
+# history for this workspace).
+#
+# GET returns the unified summary the Storage panel renders; POST
+# accepts ``{categories: ["chats", "audits", ...]}`` and runs each
+# in turn. We intentionally split GET vs POST so the UI can show
+# "you'd free X MB" without ever risking an accidental delete on
+# page load.
+#
+# See services/chat_storage.py for per-category retention policy and
+# the (deliberately tight) list of things we don't auto-touch.
+@router.get("/api/workspaces/{wsid}/storage")
+async def get_workspace_storage(
+    wsid: str, user_id: str = Depends(require_user)
+) -> dict[str, Any]:
+    workspace_for_user_or_404(wsid, user_id)
+    return _workspace_storage_summary(wsid)
+
+
+@router.post("/api/workspaces/{wsid}/storage/cleanup")
+async def cleanup_workspace_storage(
+    wsid: str,
+    payload: dict[str, Any] | None = None,
+    user_id: str = Depends(require_user),
+) -> dict[str, Any]:
+    """Run cleanup for the categories listed in ``payload.categories``.
+
+    Body shape: ``{"categories": ["chats", "audits", "uploads", "shadows"]}``
+    — any subset is fine. Unknown categories are silently ignored
+    (forward-compat — see ``services.chat_storage.cleanup_categories``).
+
+    Empty / missing body is treated as "no-op": the SPA always knows
+    which categories the user ticked and sends them explicitly.
+    """
+    workspace_for_user_or_404(wsid, user_id)
+    raw = (payload or {}).get("categories")
+    categories: list[str] = [str(c) for c in raw] if isinstance(raw, list) else []
+    return _cleanup_categories(wsid, categories=categories)
