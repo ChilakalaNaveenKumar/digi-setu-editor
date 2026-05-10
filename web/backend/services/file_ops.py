@@ -71,7 +71,10 @@ def read_file(workspace_path: Path, rel_path: str, max_bytes: int = 2 * 1024 * 1
     size = abs_path.stat().st_size
     kind = classify_extension(abs_path.name)
 
-    if kind in ("image", "pdf", "audio", "video", "office"):
+    if kind in (
+        "image", "pdf", "audio", "video",
+        "office", "spreadsheet", "word", "slides", "sqlite",
+    ):
         return {
             "path": rel_path,
             "size": size,
@@ -159,6 +162,10 @@ def stream_raw_path(workspace_path: Path, rel_path: str) -> tuple[Path, str]:
             "svg": "image/svg+xml",
             "audio": "audio/mpeg",
             "video": "video/mp4",
+            "spreadsheet": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "word": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "slides": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "sqlite": "application/vnd.sqlite3",
         }.get(kind, "application/octet-stream")
     return abs_path, mime
 

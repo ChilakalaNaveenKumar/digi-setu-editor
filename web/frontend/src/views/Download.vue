@@ -88,8 +88,14 @@ const platform = computed<Platform>(() => {
 const primaryHref = computed(() => {
   switch (platform.value) {
     case "mac-arm": return `/downloads/${MACOS_ARM_DMG}`;
-    // Native Intel DMG built on macos-15-intel — no Rosetta needed.
-    case "mac-intel": return `/downloads/${MACOS_INTEL_DMG}`;
+    // No native Intel DMG yet (see `macIntelAvailable` above) — fall
+    // back to the arm64 DMG which runs fine under Rosetta 2 on Intel
+    // Macs. macOS prompts to install Rosetta on first launch (one-time
+    // ~30 sec) and from then on it's transparent.
+    case "mac-intel":
+      return macIntelAvailable
+        ? `/downloads/${MACOS_INTEL_DMG}`
+        : `/downloads/${MACOS_ARM_DMG}`;
     case "linux-deb": return `/downloads/${LINUX_DEB}`;
     case "linux-appimage": return `/downloads/${LINUX_APPIMAGE}`;
     case "windows": return `/downloads/${WINDOWS_EXE}`;
@@ -100,7 +106,13 @@ const primaryHref = computed(() => {
 const primaryLabel = computed(() => {
   switch (platform.value) {
     case "mac-arm": return "Download for macOS (Apple Silicon)";
-    case "mac-intel": return "Download for macOS (Intel)";
+    // When we hand an Intel Mac user the arm64 DMG, be explicit about
+    // what's happening so they don't think the page is broken when
+    // macOS asks them to install Rosetta.
+    case "mac-intel":
+      return macIntelAvailable
+        ? "Download for macOS (Intel)"
+        : "Download for macOS (Intel · via Rosetta)";
     case "linux-deb": return "Download .deb for Linux";
     case "linux-appimage": return "Download AppImage for Linux";
     case "windows": return "Download for Windows";
@@ -135,12 +147,14 @@ const firstLaunchKind = computed<"mac" | "windows" | "linux">(() => {
 // macOS Apple Silicon (arm64): produced by GHA's `macos-arm` job
 // (.github/workflows/release.yml) on every v*.*.* tag, AND can still
 // be built locally with `release.sh --mac` on an M-series Mac.
-// macOS Intel (x86_64): produced by GHA's `macos-intel` job on the
-// macos-15-intel runner (the only Intel runner GitHub still ships,
-// available until Aug 2027). The PyInstaller sidecar is built natively
-// on that Intel runner, so the resulting DMG runs without Rosetta.
+// macOS Intel (x86_64): currently UNAVAILABLE. The macos-15-intel
+// hosted runner's DiskArbitration deadlock kept hanging `create-dmg`
+// past our 60-min job budget, so we removed the dedicated job on
+// 2026-05-10. Intel Mac users can run the arm64 DMG under Rosetta 2
+// in the meantime; when we ship a real Intel installer it'll be a
+// universal2 binary from the macos-arm runner (no separate Intel job).
 const macArmAvailable = true;
-const macIntelAvailable = true;
+const macIntelAvailable = false;
 // .deb covers Ubuntu/Debian/Mint/Pop!_OS — easily 80%+ of Linux desktop
 // installs. .AppImage is held back because Tauri 2's bundler downloads
 // its own copy of `linuxdeploy.AppImage` and execs it directly, which

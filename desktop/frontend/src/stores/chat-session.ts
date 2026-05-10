@@ -12,6 +12,7 @@ import { computed, ref } from "vue";
 import * as api from "../api/sessions";
 import type { SessionRecord } from "../api/types";
 
+import { useChatStore } from "./chat";
 import { useUiStore } from "./ui";
 import { useWorkspaceStore } from "./workspace";
 
@@ -65,6 +66,15 @@ export const useChatSessionStore = defineStore("chat-session", () => {
 
   async function remove(sid: string): Promise<void> {
     await api.deleteSession(sid);
+    // Release any parked WS bridge for this chat. Without this the
+    // multi-bridge tab cache (chat store) keeps the deleted session's
+    // WebSocket alive — heartbeating, auto-reconnecting, and pinning a
+    // pi process on the backend until the workspace is closed.
+    try {
+      useChatStore().closeSession(sid);
+    } catch {
+      /* chat store not initialised yet — nothing parked */
+    }
     sessions.value = sessions.value.filter((s) => s.id !== sid);
     if (activeId.value === sid) activeId.value = null;
   }

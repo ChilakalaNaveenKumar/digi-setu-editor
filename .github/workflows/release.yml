@@ -4,14 +4,28 @@
 #   - windows      : .exe + .msi  (only place these CAN be built — NSIS
 #                                    + WiX are Windows-only binaries)
 #   - macos-arm    : arm64 .dmg   (macos-15 hosted runner, M-series)
-#   - macos-intel  : x86_64 .dmg  (macos-15-intel hosted runner; the only
-#                                    Intel runner GitHub still ships,
-#                                    available until Aug 2027 per their
-#                                    deprecation roadmap)
 #   - linux .deb   : NOT here    — Bitbucket's `linux-release` step
 #                                    already produces and uploads it;
 #                                    duplicating on GHA wastes private-
 #                                    repo minutes for zero benefit.
+#
+# Removed (2026-05-10): `macos-intel` job.
+#   - The `macos-15-intel` hosted runner has a persistent DiskArbitration
+#     deadlock that hangs `create-dmg` for the full 8-min wall-clock
+#     timeout on EVERY rc, then retries 3× → 24+ min wasted per build.
+#     We landed an 8-min-per-attempt timeout + `hdiutil -srcfolder`
+#     salvage path; even those weren't enough — runs frequently still
+#     burn through the full 60-min job budget and get cancelled.
+#   - macOS Intel users get the arm64 DMG under Rosetta 2 in the
+#     meantime (works, just one extra layer). Download.vue's
+#     `macIntelAvailable=false` surfaces this as "coming soon — use the
+#     Apple Silicon DMG via Rosetta meanwhile".
+#   - When we ship a real macOS Intel installer it'll be via
+#     `tauri build --target universal-apple-darwin` from macos-15 —
+#     one universal2 DMG that runs native on both archs, no separate
+#     Intel runner needed. Blocked on auditing our Python wheels for
+#     universal2 (cryptography, pydantic-core, etc. ship universal2;
+#     a few internal sidecar deps don't yet).
 #
 # Why this exists alongside desktop/scripts/release.sh:
 #   - release.sh builds macOS + Linux locally on a dev's laptop. Windows
@@ -297,108 +311,6 @@ jobs:
           name: macos-arm-dmg
           path: /tmp/Digi-Setu-*-arm64.dmg
 
-  # ── macOS Intel (x86_64) ─────────────────────────────────────────────
-  # Output: Digi-Setu-<version>-x86_64.dmg
-  # Why a separate Intel job:
-  #   - Cross-compiling the Rust + Tauri side from arm64 to x86_64 IS
-  #     possible (`rustup target add x86_64-apple-darwin`), but our
-  #     PyInstaller-frozen sidecar is host-arch-locked. Building it on
-  #     a real Intel runner is the only way to ship a true x86_64 DMG
-  #     that doesn't rely on Rosetta.
-  #   - GitHub introduced `macos-15-intel` in Sep 2025 as the
-  #     replacement for the deprecated macos-13 runner. Available
-  #     until Aug 2027; that's our window for native Intel builds.
-  #   - When August 2027 hits and the Intel runner goes away, switch
-  #     this job to a `tauri build --target universal-apple-darwin` on
-  #     macos-15 — but ONLY after auditing the Python wheels we depend
-  #     on (cryptography, pydantic-core, etc.) ship universal2 wheels,
-  #     otherwise PyInstaller's --target-arch=universal2 fails to lipo.
-  macos-intel:
-    runs-on: macos-15-intel      # x86_64 native; available through Aug 2027
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-
-      - id: flags
-        shell: bash
-        env:
-          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
-        run: |
-          [[ -n "$GCP_SA_KEY" ]] && echo "has_gcp=true" >> "$GITHUB_OUTPUT" || echo "has_gcp=false" >> "$GITHUB_OUTPUT"
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-apple-darwin
-
-      - uses: actions/setup-node@v4
-        with: { node-version: 22 }
-
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
-
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            desktop/src-tauri/target
-          key: cargo-macos-intel-${{ hashFiles('desktop/src-tauri/Cargo.lock') }}
-
-      - name: Install create-dmg + Pillow
-        run: |
-          brew install create-dmg
-          python3 -m pip install --quiet Pillow
-
-      - if: steps.flags.outputs.has_gcp == 'true'
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
-
-      - if: steps.flags.outputs.has_gcp == 'true'
-        uses: google-github-actions/setup-gcloud@v2
-
-      - name: Stage backend/.env so release.sh --local-env picks up Clerk + cloud-target keys
-        shell: bash
-        env:
-          CLERK_PUBLISHABLE_KEY_PROD: ${{ secrets.CLERK_PUBLISHABLE_KEY_PROD }}
-          CLERK_SECRET_KEY_PROD:      ${{ secrets.CLERK_SECRET_KEY_PROD }}
-        run: |
-          mkdir -p desktop/backend
-          {
-            echo "CLERK_PUBLISHABLE_KEY_PROD=$CLERK_PUBLISHABLE_KEY_PROD"
-            echo "CLERK_SECRET_KEY_PROD=$CLERK_SECRET_KEY_PROD"
-            echo "PI_CLOUD_API_BASE=https://digi-setu.com"
-            echo "PI_RELAY_BASE=https://api.digi-setu.com"
-            echo "CLERK_TENANT=prod"
-          } > desktop/backend/.env
-          chmod 0600 desktop/backend/.env
-
-      - name: Build mac DMG (release.sh --mac --local-env --no-upload)
-        env:
-          APP_VERSION: ${{ env.APP_VERSION }}
-        run: |
-          # release.sh detects host arch via `uname -m` → x86_64 here →
-          # produces Digi-Setu-<v>-x86_64.dmg. The PyInstaller sidecar
-          # is built on the same Intel runner, so it's a true native
-          # x86_64 binary (no Rosetta needed at runtime).
-          bash desktop/scripts/release.sh --mac --local-env --no-upload
-
-      - name: Upload .dmg to digi-setu.com (only if SA key provided)
-        if: steps.flags.outputs.has_gcp == 'true'
-        env:
-          GCP_PROJECT: ${{ secrets.GCP_PROJECT || 'digi-setu-dev' }}
-          GCP_VM:      ${{ secrets.GCP_VM      || 'digi-setu-live' }}
-          GCP_ZONE:    ${{ secrets.GCP_ZONE    || 'us-central1-a' }}
-        run: |
-          DMG="/tmp/Digi-Setu-${APP_VERSION}-x86_64.dmg"
-          if [[ -f "$DMG" ]]; then
-            bash deploy/scripts/upload-installer.sh "$DMG"
-          else
-            echo "::warning::no x86_64 .dmg produced at $DMG"
-            ls -la /tmp/Digi-Setu-* || true
-          fi
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: macos-intel-dmg
-          path: /tmp/Digi-Setu-*-x86_64.dmg
+  # macos-intel job removed 2026-05-10 — see header comment for the
+  # reasoning. Intel users get the arm64 DMG via Rosetta until we ship
+  # a universal2 build from the macos-arm runner.

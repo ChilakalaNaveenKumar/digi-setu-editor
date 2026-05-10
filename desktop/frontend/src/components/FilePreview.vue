@@ -37,10 +37,23 @@ import { useUiStore } from "../stores/ui";
 import { useWorkspaceStore } from "../stores/workspace";
 
 import AnnotateOverlay from "./AnnotateOverlay.vue";
+import SpreadsheetPreview from "./SpreadsheetPreview.vue";
+import WordPreview from "./WordPreview.vue";
+import SqlitePreview from "./SqlitePreview.vue";
 
 const props = defineProps<{
   path: string;
-  kind: "image" | "pdf" | "svg" | "audio" | "video" | "office";
+  kind:
+    | "image"
+    | "pdf"
+    | "svg"
+    | "audio"
+    | "video"
+    | "office"
+    | "spreadsheet"
+    | "word"
+    | "slides"
+    | "sqlite";
   /** For SVG: when true we're showing source code, not the image. */
   showAsCode?: boolean;
 }>();
@@ -133,7 +146,10 @@ const officeRenderedHtml = computed(() =>
 );
 
 async function _refreshOffice(): Promise<void> {
-  if (props.kind !== "office") {
+  // Slides (.pptx) don't yet have a native in-browser viewer; we
+  // route them through the same server-side markitdown path as the
+  // legacy office formats (.doc/.odt/.rtf/.eml/.epub/.msg).
+  if (props.kind !== "office" && props.kind !== "slides") {
     officeMarkdown.value = null;
     officeError.value = null;
     return;
@@ -424,7 +440,15 @@ function onAnnotateCancel(): void {
 </script>
 
 <template>
-  <div class="flex h-full min-h-0 w-full flex-col bg-editor">
+  <!-- Native in-browser viewers for spreadsheets / Word / SQLite. These
+       render the file VISUALLY (no markdown extraction) using the same
+       libraries Excel-online / Word-online use under the hood. They
+       carry their own toolbar so we delegate the entire pane to them. -->
+  <SpreadsheetPreview v-if="kind === 'spreadsheet'" :path="path" />
+  <WordPreview v-else-if="kind === 'word'" :path="path" />
+  <SqlitePreview v-else-if="kind === 'sqlite'" :path="path" />
+
+  <div v-else class="flex h-full min-h-0 w-full flex-col bg-editor">
     <!-- PDF info bar — the actual zoom controls live INSIDE the PDF.js
          viewer (browser-native), but users don't always realise that.
          Surface the keyboard shortcut up here so they don't keep trying
@@ -471,12 +495,12 @@ function onAnnotateCancel(): void {
          button (re-extracts ignoring the cache, useful when the user
          saves a new revision in another window). -->
     <div
-      v-if="kind === 'office'"
+      v-if="kind === 'office' || kind === 'slides'"
       class="flex items-center justify-between border-b border-border bg-card/40 px-3 py-1 text-body text-muted-foreground"
     >
       <div class="flex items-center gap-2 font-mono">
         <Icon icon="material-icon-theme:document" class="h-[14px] w-[14px]" />
-        <span>Office preview</span>
+        <span>{{ kind === "slides" ? "Slides preview" : "Office preview" }}</span>
         <span class="text-caption opacity-60">
           · converted to Markdown for inline reading
           <span v-if="officeFromCache" class="ml-1 rounded bg-success/10 px-1 text-success">cached</span>
@@ -615,7 +639,7 @@ function onAnnotateCancel(): void {
       ref="stage"
       class="preview-stage relative flex min-h-0 flex-1 overflow-hidden bg-[color-mix(in_oklab,var(--editor-bg)_90%,#000)]"
       :class="[
-        kind === 'office' ? 'items-stretch justify-stretch' : 'items-center justify-center',
+        (kind === 'office' || kind === 'slides') ? 'items-stretch justify-stretch' : 'items-center justify-center',
         { 'is-pannable': isPannable },
       ]"
     >
@@ -690,7 +714,7 @@ function onAnnotateCancel(): void {
       <!-- Office (docx / xlsx / pptx / csv / eml / …) — server-side
            markitdown produces Markdown and we render it with the same
            markdown-it pipeline used for chat messages. -->
-      <template v-else-if="kind === 'office'">
+      <template v-else-if="kind === 'office' || kind === 'slides'">
         <div
           v-if="officeLoading"
           class="flex flex-col items-center gap-2 text-body text-muted-foreground"

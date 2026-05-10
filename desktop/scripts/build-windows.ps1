@@ -169,8 +169,18 @@ $BundleDir = Join-Path $Desktop "src-tauri\target\$Target\release\bundle"
 $MsiSrc  = Get-ChildItem -Path (Join-Path $BundleDir "msi")  -Filter *.msi  -ErrorAction SilentlyContinue | Select-Object -First 1
 $ExeSrc  = Get-ChildItem -Path (Join-Path $BundleDir "nsis") -Filter *-setup.exe -ErrorAction SilentlyContinue | Select-Object -First 1
 
-$MsiOut = Join-Path $env:TEMP "Digi-Setu-$AppVersion-x64.msi"
-$ExeOut = Join-Path $env:TEMP "Digi-Setu-$AppVersion-x64-setup.exe"
+# Output dir: prefer $env:RUNNER_TEMP on GitHub Actions runners (= D:\a\_temp,
+# the GHA-managed scratch dir that the release.yml upload step also reads
+# from). Fall back to $env:TEMP for local dev builds. Without this fork,
+# the GHA Windows job silently emitted "missing artefact" warnings because
+# $env:TEMP (C:\Users\RUNNER~1\AppData\Local\Temp) and $env:RUNNER_TEMP
+# (D:\a\_temp) are different directories on the runner — the build wrote
+# to one and the upload step looked at the other, so the .exe / .msi
+# never reached digi-setu.com/downloads/ even though the job reported
+# "success".
+$OutDir = if ($env:RUNNER_TEMP -and (Test-Path $env:RUNNER_TEMP)) { $env:RUNNER_TEMP } else { $env:TEMP }
+$MsiOut = Join-Path $OutDir "Digi-Setu-$AppVersion-x64.msi"
+$ExeOut = Join-Path $OutDir "Digi-Setu-$AppVersion-x64-setup.exe"
 
 if ($MsiSrc) {
     Copy-Item $MsiSrc.FullName $MsiOut -Force

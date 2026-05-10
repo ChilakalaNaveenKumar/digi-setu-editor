@@ -56,6 +56,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from config import CORS_ORIGINS
 from routes import (
+    admin,
     attachments,
     auth_webhook,
     bg,
@@ -210,6 +211,7 @@ def create_app() -> FastAPI:
 
     # Order doesn't matter functionally; grouped by concern for readability.
     app.include_router(health.router)
+    app.include_router(admin.router)
     app.include_router(config_route.router)
     # Loopback-only routes consumed by the spawned pi child (read_doc
     # → markitdown). NOT proxied by Caddy — see routes/internal.py for

@@ -13,7 +13,12 @@ import { computed, reactive, ref, watch } from "vue";
 
 import { fetchSessionHistory } from "../api/sessions";
 import { i18n } from "../i18n";
-import { applyEvent, createRouterState, pushUserMessage } from "../lib/event-router";
+import {
+  applyEvent,
+  createRouterState,
+  pushUserMessage,
+  type RouterState,
+} from "../lib/event-router";
 // `appRouter` here is Vue Router (for navigation); `router` later in
 // this module refers to the chat-message router state from
 // event-router. Aliased to avoid the name clash.
@@ -98,7 +103,14 @@ function _localiseError(code: string | null | undefined): string {
 }
 
 export const useChatStore = defineStore("chat", () => {
-  const router = createRouterState();
+  // `router` is `let` (not `const`) because the multi-bridge tab-switch
+  // logic below swaps the entire RouterState when parking the current
+  // session and restoring a previously-parked one. Each session keeps
+  // its own router instance (messages, toolCallIndex) inside the
+  // parkedSessions map; the active store always points `router` at
+  // whichever session is on screen. Mirrors desktop/frontend/src/stores/
+  // chat.ts so both clients survive a tab switch mid-stream identically.
+  let router = createRouterState();
   const messages = ref<ChatMessage[]>([]);
   const session = ref<SessionInfo | null>(null);
   const connState = ref<ConnState>("idle");
@@ -110,6 +122,46 @@ export const useChatStore = defineStore("chat", () => {
   // closed". NOT a `ref` — only the connect/abort code paths read it,
   // and we don't want a stale render to fire reconnect twice.
   let _abortedAwaitingReconnect = false;
+
+  // ── parked sessions (multi-bridge) ─────────────────────────────────
+  // When the user switches chat tabs we *don't* close the old WS — long
+  // tool turns (e.g. `pip install`) would lose their tail and the next
+  // visit would spawn a fresh pi instead of resuming. Instead the bridge
+  // is "parked": its dispatcher callbacks are rebound to a parked-mode
+  // dispatcher that updates a per-session snapshot, the WS stays
+  // connected, and pi keeps streaming straight into the snapshot's
+  // router. When the user comes back, _restoreFromParked() swaps the
+  // active store's state in for the snapshot and rebinds the bridge to
+  // the live dispatcher — without ever interrupting the underlying WS.
+  //
+  // Memory cost is bounded: one bridge + one router per chat tab the
+  // user has *visited this session*. disconnect() (workspace exit /
+  // sign-out) closes them all.
+  //
+  // Note: web has at most ONE Workspace.vue route mounted at a time, so
+  // "parked" here means "user switched to a different session id within
+  // the same tab". Multiple browser tabs each have their own chat store
+  // already (separate JS realms), so they don't need parking.
+  interface ParkedSession {
+    sid: string;
+    wsid: string | null;
+    bridge: ChatBridge;
+    router: RouterState;
+    isStreaming: boolean;
+    lastError: string | null;
+    connState: ConnState;
+    cwd: string | undefined;
+    queuedMessages: QueuedMessage[];
+    pendingAttachments: PendingAttachment[];
+    displayHigh: {
+      input: number;
+      output: number;
+      cacheRead: number;
+      cacheWrite: number;
+      cost: number;
+    };
+  }
+  const parkedSessions = new Map<string, ParkedSession>();
 
   // Files the user attached (paperclip / paste / drop) that haven't
   // been included in a prompt yet. The composer renders one chip per
@@ -303,14 +355,38 @@ export const useChatStore = defineStore("chat", () => {
     // mid-swap, which manifests as "pi crashed" + needs-browser-refresh
     // when the user changes models during a streaming turn.
     _abortedAwaitingReconnect = false;
-    disconnect();
 
-    router.messages = [];
-    router.toolCallIndex.clear();
+    // Decide what to do with the *currently* active session before we
+    // touch any state for the incoming one:
+    //
+    //   1. Same session (refresh / model swap)  → full teardown + fresh
+    //      reconnect, exactly like the previous single-bridge code did.
+    //   2. Different session, with a live bridge → park it. The bridge's
+    //      WS stays open, its dispatcher is rebound to a parked-mode
+    //      stub that updates the parked snapshot, and a long pi turn
+    //      keeps streaming. We DO NOT close it.
+    //   3. No prior session                      → nothing to park.
+    const switchingToDifferent =
+      session.value !== null && session.value.id !== sessionId && bridge !== null;
+    if (switchingToDifferent) {
+      _parkCurrent();
+    } else {
+      // Same-session refresh OR first-ever connect — drop everything.
+      disconnect();
+    }
+
+    // Reset per-session active state. Even if we're about to restore from
+    // a parked snapshot, having a clean slate first prevents a flicker
+    // where the previous session's messages briefly bleed onto the new
+    // tab.
+    router = createRouterState();
     messages.value = [];
     session.value = { id: sessionId };
     isStreaming.value = false;
     lastError.value = null;
+    _resetDisplayTotals();
+    queuedMessages.value = [];
+    pendingAttachments.value = [];
 
     const workspace = useWorkspaceStore();
     const files = useFilesStore();
@@ -321,6 +397,16 @@ export const useChatStore = defineStore("chat", () => {
     terminals.resetForNewSession();
 
     void files.refreshTree();
+
+    // If we visited this session earlier in the workspace lifetime and
+    // its bridge is parked, restore from the snapshot — pi is still
+    // streaming there and may have advanced since we left.
+    const parked = parkedSessions.get(sessionId);
+    if (parked) {
+      parkedSessions.delete(sessionId);
+      _restoreFromParked(parked);
+      return;
+    }
 
     try {
       const { messages: hist } = await fetchSessionHistory(sessionId);
@@ -369,6 +455,196 @@ export const useChatStore = defineStore("chat", () => {
     newBridge.open();
   }
 
+  // ── parked-session helpers (multi-bridge) ──────────────────────────
+  /**
+   * Move the *currently* active session into the parked map. The
+   * underlying WebSocket is NOT closed — pi keeps streaming into the
+   * parked router so a long-running tool call (e.g. `pip install`) is
+   * preserved across the tab switch. `bridge` is cleared so the caller
+   * can immediately install a new active bridge.
+   */
+  function _parkCurrent(): void {
+    if (!bridge || !session.value) return;
+    const sid = session.value.id;
+    const wsid = useWorkspaceStore().activeId;
+    const parked: ParkedSession = {
+      sid,
+      wsid,
+      bridge,
+      router,
+      isStreaming: isStreaming.value,
+      lastError: lastError.value,
+      connState: connState.value,
+      cwd: session.value.cwd,
+      queuedMessages: queuedMessages.value.slice(),
+      pendingAttachments: pendingAttachments.value.slice(),
+      displayHigh: {
+        input: _displayHigh.input,
+        output: _displayHigh.output,
+        cacheRead: _displayHigh.cacheRead,
+        cacheWrite: _displayHigh.cacheWrite,
+        cost: _displayHigh.cost,
+      },
+    };
+
+    // Rebind to the parked-mode dispatcher BEFORE we move the bridge
+    // into the map; otherwise an event arriving in the rebind/move
+    // window would still hit the live dispatcher and mutate the new
+    // active session's state.
+    bridge.rebind({
+      sessionId: sid,
+      onState: (state, error) => {
+        parked.connState = state;
+        // The bridge sends a stable code; localise so the user sees a
+        // friendly sentence when they come back to this tab.
+        if (state === "error" && error) parked.lastError = _localiseError(error);
+        if (state === "closed" || state === "error") parked.isStreaming = false;
+      },
+      onEvent: (raw) => {
+        _dispatchParked(parked, raw as RpcEvent & Record<string, unknown>);
+      },
+    });
+
+    parkedSessions.set(sid, parked);
+    bridge = null;
+  }
+
+  /**
+   * Restore a previously-parked session: swap its router back into the
+   * active store, repopulate the visible refs from the snapshot, and
+   * rebind the bridge's dispatcher to the live one. The WS itself was
+   * never closed, so any progress pi made while we were away is already
+   * sitting in `parked.router.messages`.
+   */
+  function _restoreFromParked(parked: ParkedSession): void {
+    router = parked.router;
+    messages.value = router.messages.slice();
+    session.value = { id: parked.sid, cwd: parked.cwd };
+    isStreaming.value = parked.isStreaming;
+    lastError.value = parked.lastError;
+    connState.value = parked.connState;
+
+    queuedMessages.value = parked.queuedMessages;
+    pendingAttachments.value = parked.pendingAttachments;
+
+    _displayHigh.input = parked.displayHigh.input;
+    _displayHigh.output = parked.displayHigh.output;
+    _displayHigh.cacheRead = parked.displayHigh.cacheRead;
+    _displayHigh.cacheWrite = parked.displayHigh.cacheWrite;
+    _displayHigh.cost = parked.displayHigh.cost;
+
+    const restoredBridge = parked.bridge;
+    bridge = restoredBridge;
+
+    restoredBridge.rebind({
+      sessionId: parked.sid,
+      onState: (state, error) => {
+        if (bridge !== restoredBridge) return;
+        connState.value = state;
+        if (state === "error" && error) lastError.value = _localiseError(error);
+        if (state === "closed" || state === "error") isStreaming.value = false;
+        if (state === "closed" && _abortedAwaitingReconnect) {
+          _abortedAwaitingReconnect = false;
+          void reconnect();
+        }
+      },
+      onEvent: (raw) => {
+        if (bridge !== restoredBridge) return;
+        _dispatch(raw as RpcEvent & Record<string, unknown>);
+      },
+    });
+  }
+
+  /**
+   * Parked-mode event dispatcher. Mirrors the live `_dispatch` but:
+   *   - applies router events to the parked snapshot, not the active one;
+   *   - silently drops events whose side-effects target stores that
+   *     are scoped to the *active* workspace (fs_change, bg_*, permission
+   *     prompts, _session_info). The user will see the up-to-date result
+   *     when they switch back; surfacing them now would mutate state
+   *     belonging to the wrong tab.
+   *
+   * Title updates and (unlike desktop) quota_exceeded errors ARE applied
+   * globally — they're user-scoped not session-scoped, so making the
+   * upgrade modal pop / picker label refresh is the right UX even when
+   * the affected session is in the background.
+   */
+  function _dispatchParked(
+    parked: ParkedSession,
+    evt: RpcEvent & Record<string, unknown>,
+  ): void {
+    if (DEBUG_EVENTS) {
+      console.debug("[parked rpc]", parked.sid, evt.type, evt);
+    }
+
+    if (evt.type === "agent_start" || evt.type === "turn_start") {
+      parked.isStreaming = true;
+    } else if (evt.type === "agent_end") {
+      parked.isStreaming = false;
+    }
+
+    if (evt.type === "session") {
+      parked.cwd = String(evt.cwd ?? "");
+      return;
+    }
+    // Model-pin / permission-mode info is global to the active store
+    // and doesn't apply to a backgrounded tab.
+    if (evt.type === "_session_info") return;
+
+    // Background-tab permission prompts can't be answered (the modal
+    // belongs to the foreground session). pi will time out the
+    // ctx.ui.select() call on its own and the tool will resolve to deny,
+    // which is the safe default.
+    if (evt.type === "permission_request") return;
+
+    // Title updates ARE safe to apply globally — the chat-session store
+    // is keyed by sid, so we want the picker to show the polished title
+    // immediately even if the user is viewing a different chat.
+    if (evt.type === "_session_titled") {
+      const sid = String(evt.sessionId ?? "");
+      const title = String(evt.title ?? "").trim();
+      if (sid && title) useChatSessionStore().applyTitleUpdate(sid, title);
+      return;
+    }
+
+    if (evt.type === "_bridge_error") {
+      const code = String(evt.code ?? "internal");
+      parked.lastError = _localiseError(code);
+      parked.isStreaming = false;
+      // quota_exceeded is user-scoped, not session-scoped: if one chat
+      // runs the user out of credit, EVERY chat hits the same wall on
+      // the next prompt. Flip the global billing flag so the upgrade
+      // modal pops immediately instead of waiting for the user to come
+      // back to this tab. The other bridge_error codes are session-
+      // local (rate limit, internal, etc.) and stay on the snapshot.
+      if (code === "quota_exceeded") {
+        useBillingStore().noteExhausted(null);
+      }
+      return;
+    }
+
+    // fs / background-terminal events belong to the active workspace
+    // only — applying them while parked would corrupt the foreground
+    // tab's file tree and terminal panes.
+    if (evt.type === "fs_change") return;
+    if (evt.type === "bg_started" || evt.type === "bg_output" || evt.type === "bg_ended") {
+      return;
+    }
+
+    applyEvent(parked.router, evt);
+
+    const tail = parked.router.messages[parked.router.messages.length - 1];
+    if (tail && tail.kind === "assistant" && tail.errorCode && !tail.error) {
+      tail.error = _localiseError(tail.errorCode);
+    }
+    if (evt.type === "message_end" && !parked.lastError) {
+      if (tail && tail.kind === "assistant" && tail.error) {
+        parked.lastError = tail.error;
+        parked.isStreaming = false;
+      }
+    }
+  }
+
   /**
    * Replay a server-projected ChatMessage[] into router state so the UI
    * paints prior turns. Each entry is wrapped in `reactive()` so Vue
@@ -402,10 +678,21 @@ export const useChatStore = defineStore("chat", () => {
       bridge.close();
       bridge = null;
     }
+    // Close every parked bridge too — disconnect() is called on workspace
+    // exit / sign-out / Workspace.vue unmount, which means the user is
+    // leaving the entire chat surface. Leaving parked WSs open would
+    // pile up zombie pi processes on the backend.
+    for (const p of parkedSessions.values()) {
+      try {
+        p.bridge.close();
+      } catch {
+        /* already gone */
+      }
+    }
+    parkedSessions.clear();
     session.value = null;
     messages.value = [];
-    router.messages = [];
-    router.toolCallIndex.clear();
+    router = createRouterState();
     isStreaming.value = false;
     // Reset the monotonic-totals high-water mark so a brand-new chat
     // doesn't inherit the previous chat's cost. The persisted JSONL
@@ -427,6 +714,29 @@ export const useChatStore = defineStore("chat", () => {
     // reconnected.
     queuedMessages.value = [];
     useWorkspaceStore().setActive(null);
+  }
+
+  /**
+   * Close + drop a specific session's WS. Called from chat-session when
+   * the user deletes a chat: without this, the parked bridge would keep
+   * its WS open (heartbeat + auto-reconnect) and pin a pi process on
+   * the backend forever. Safe to call for the active session too — it
+   * just delegates to disconnect() so the rest of the cleanup
+   * (workspace teardown, queue drop, etc.) runs uniformly.
+   */
+  function closeSession(sid: string): void {
+    if (session.value?.id === sid) {
+      disconnect();
+      return;
+    }
+    const parked = parkedSessions.get(sid);
+    if (!parked) return;
+    parkedSessions.delete(sid);
+    try {
+      parked.bridge.close();
+    } catch {
+      /* already gone */
+    }
   }
 
   /**
@@ -771,6 +1081,7 @@ export const useChatStore = defineStore("chat", () => {
     queuedMessages,
     connect,
     disconnect,
+    closeSession,
     reconnect,
     sendPrompt,
     enqueueMessage,

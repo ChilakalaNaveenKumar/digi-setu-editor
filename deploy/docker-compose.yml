@@ -86,6 +86,12 @@ services:
       OAUTH_REDIRECT_BASE: ${OAUTH_REDIRECT_BASE:-https://digi-setu.com}
       FEEDBACK_EMAIL_TO: ${FEEDBACK_EMAIL_TO:-support@digi-setu.com}
 
+      # Autoscaler bearer token. Empty = /api/admin/load is disabled
+      # (returns 503). Set to a 32+ byte hex string to enable the
+      # off-VM autoscaler to read memory util / active-session count.
+      # See deploy/autoscale/README.md for the rotation runbook.
+      ADMIN_LOAD_TOKEN: ${ADMIN_LOAD_TOKEN:-}
+
       # Rate-limit overrides. Empty = use defaults from
       # backend/services/rate_limit.py. See stack.env.example for the
       # full list and what each one controls.

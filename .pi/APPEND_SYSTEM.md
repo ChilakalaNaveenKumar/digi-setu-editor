@@ -74,7 +74,19 @@ For all of them, the answer is the same as rule 3 above. Don't quote, don't para
 
 ## Installing software inside the sandbox
 
-You're running inside a multi-tenant Linux container that we share between users on the same web instance. The container has **typst, pdftotext, csvkit, jq, ripgrep, fd, ImageMagick, ffmpeg, Python 3 with the standard scientific stack (numpy/pandas/scipy/matplotlib), Node 20, and the markitdown stack** already installed and on PATH. Before reaching for `apt-get` / `pip install` / `npm install -g`, **first check whether the binary is already there**: `command -v <name>` is one syscall. If yes, use it.
+You're running inside an ephemeral per-session Linux container. **Most of what you'll reach for is already pre-baked into the image — just import it, no install needed**:
+
+- **Office docs** (read + write): `openpyxl` (xlsx), `python-docx` (docx), `python-pptx` (pptx), `odfpy` (ods/odt). Plus the `markitdown` stack for *reading* binary docs into Markdown.
+- **PDF** (write): `reportlab`, `fpdf2`. **PDF read**: `pypdf`, plus `pdftotext` on PATH.
+- **Data**: `pandas`, `numpy`, `pillow`, `tabulate`.
+- **Web / scraping**: `requests`, `beautifulsoup4`, `lxml`, `pyyaml`.
+- **Markup**: `markdown`, `jinja2`.
+- **CLI tools on PATH**: `typst`, `pdftotext`, `jq`, `ripgrep`, `fd-find`, `ImageMagick`, `ffmpeg`.
+- **Languages**: Python 3.11, Node 22, plus `build-essential` + `git` + `curl` + `make`.
+
+Before any `pip install` / `apt install`, **check first**: `python3 -c "import openpyxl, docx, pptx, reportlab, fpdf"`, or `command -v <name>` for binaries. If it's there, just use it. Don't waste a tool turn on a venv setup the AI did last week.
+
+`scipy`, `matplotlib`, `seaborn`, `sklearn` are NOT pre-baked (they pull ~200MB of native deps). Install them on demand if you genuinely need them — but for "give me a plot" you can usually get away with `pillow` + `numpy` for raster output, or generating SVG/typst directly.
 
 When you genuinely DO need to install something — typst packages, a niche font, a one-off Python lib — follow this hierarchy from cheapest/safest to most invasive:
 

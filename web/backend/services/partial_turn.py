@@ -1,39 +1,63 @@
 """
-Mirror the in-flight assistant turn so we can persist a synthetic
-``type: "message"`` JSONL line when the user clicks Stop (or the prompt
-watchdog kills pi, or the WS drops mid-stream) BEFORE pi-mono's own
-``message_end`` event fires.
+Mirror the in-flight assistant turn so we can persist it on Stop /
+timeout / disconnect / crash BEFORE pi-mono's own ``message_end``
+event fires.
 
 Why this exists
 ---------------
 pi-mono only writes a turn to its session JSONL on ``message_end`` —
 that is the moment the assistant's content[] is fully assembled and pi
 can persist a complete, well-typed record. Streaming deltas
-(``text_delta``, ``thinking_delta``) are transient: they ship out on the
-WS for the SPA to render in real time, but they never hit disk.
+(``text_delta``, ``thinking_delta``, ``toolcall_delta``, …) are
+transient: they ship out on the WS for the SPA to render in real time,
+but they never hit disk.
 
 That's fine for happy-path turns. The failure mode is the user clicking
-the red Stop button mid-stream::
+the red Stop button mid-stream, OR the WS dropping mid-stream, OR pi
+crashing while a tool call's args are still being progressively-parsed::
 
-    1. SPA sends `{type: "abort"}` over the WS.
-    2. chat_ws sets `aborted["flag"] = True` and calls `pi.terminate()`.
-    3. pi gets a SIGTERM before it ever reaches `message_end`.
-    4. The synthetic JSONL on disk is unchanged — there's no record of
-       the half-finished response the user already saw streaming.
-    5. On reconnect, `services/history.load_history` walks the JSONL
-       files and finds nothing for that turn. The chat history shows
-       the user's prompt followed by *silence*.
+    1. Assistant streams text + thinking → toolcall_start("write") →
+       a flood of toolcall_deltas accumulating the file body.
+    2. tool_execution_start hasn't fired yet (UI shows "queued").
+    3. Connection dies / Stop pressed / pi crashed.
+    4. pi-mono had nothing to persist — there is no record on disk
+       of the half-finished tool call we already showed the user.
+    5. On reconnect, ``services/history.load_history`` walks the JSONL
+       and finds nothing for that turn. The chat shows the user's
+       prompt followed by *silence*. Worse: the AI loaded into a fresh
+       session has no idea what it was about to do.
 
-We accumulate text + thinking deltas as they pass through the
-``pi_to_ws`` pump and, on abort/timeout/disconnect, write our own
-synthetic line into the same chats_dir pi-mono uses. ``load_history``
-treats it like any other completed turn — content[] just gets a stop
-banner appended so the user can see why it cut off.
+We accumulate text + thinking + tool-call args + tool-execution status
+as they pass through the ``pi_to_ws`` pump and, on
+abort/timeout/disconnect, write our own synthetic line into the same
+chats_dir pi-mono uses. ``load_history`` treats it like any other
+completed turn — content[] just gets a stop banner appended so the user
+can see why it cut off, and tool calls show up with their final
+accumulated args + an "Aborted" toolResult so the AI can resume by
+retrying instead of starting from zero.
+
+Belt-and-braces: alongside the in-memory tracker, every relevant event
+is *also* appended verbatim to a per-turn
+``<turn-id>-inflight.jsonl`` file. That file is deleted on the normal
+``message_end`` path (canonical record exists) and *kept* on any abort
+path so you can grep it later if the synthetic line ever fails to
+project the right state.
+
+Files written
+-------------
+- ``YYYYMMDDTHHMMSS-…-inflight.jsonl`` — opened at turn start, every
+  relevant event appended verbatim, deleted on message_end, *kept* on
+  abort/disconnect/timeout.
+- ``YYYYMMDDTHHMMSS-…-aborted.jsonl`` — single-or-multi-line JSONL
+  containing the synthetic assistant ``message`` plus one
+  ``toolResult`` per still-pending tool call, written from
+  ``persist_if_in_flight``. This is the file ``load_history`` consumes
+  on reload.
 
 The file is named ``<UTC ISO>-aborted.jsonl`` so it sorts after pi's
 existing files (pi uses the same ISO-prefix convention) but before any
-future pi spawn. The history loader globs ``*.jsonl`` and folds them
-in chronological order, so the partial turn lands exactly where the
+future pi spawn. The history loader globs ``*.jsonl`` and folds them in
+chronological order, so the partial turn lands exactly where the
 user's eye expects it.
 
 This module is intentionally self-contained and free of FastAPI / pi /
@@ -67,13 +91,17 @@ from __future__ import annotations
 import json
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, IO
 
 
 class PartialTurnTracker:
-    """Track text + thinking deltas of the in-flight assistant turn.
+    """Track text + thinking + tool calls of the in-flight assistant
+    turn. Also tees every observed event to a per-turn ``inflight``
+    JSONL file so a hard process death (kernel panic, OOM kill before
+    finally runs) still leaves a recoverable record on disk.
 
     Not thread-safe; each WS session owns its own tracker and is
     accessed from the single asyncio loop that runs the four pumps.
@@ -87,6 +115,10 @@ class PartialTurnTracker:
         "_message_id",
         "_text",
         "_thinking",
+        "_tool_calls",
+        "_tool_call_order",
+        "_stream_path",
+        "_stream_fp",
     )
 
     def __init__(self, *, chats_dir: Path, session_id: str) -> None:
@@ -97,6 +129,15 @@ class PartialTurnTracker:
         self._message_id = ""
         self._text = ""
         self._thinking = ""
+        # tc_id → {id, name, arguments, arguments_partial_json,
+        #          execution_status, result_text, is_error}
+        # `arguments` is replaced (not appended) on each toolcall_delta
+        # because pi-ai already does the progressive-JSON parsing and
+        # ships us the running parsed object, NOT a raw delta string.
+        self._tool_calls: dict[str, dict[str, Any]] = {}
+        self._tool_call_order: list[str] = []
+        self._stream_path: Path | None = None
+        self._stream_fp: IO[str] | None = None
 
     # ── observation ──────────────────────────────────────────────────
 
@@ -111,64 +152,287 @@ class PartialTurnTracker:
         et = evt.get("type")
         if et in ("agent_start", "turn_start"):
             self._reset_for_new_turn()
+            self._open_stream_file()
             return
         if et == "message_end":
-            # pi will persist the canonical line itself; drop our buffer
-            # so the next abort doesn't double-write.
+            # pi will persist the canonical line itself; drop our
+            # buffer + delete the inflight tee so the next abort
+            # doesn't double-write.
             self._ended = True
             self._active = False
+            self._close_stream_file(delete=True)
             self._message_id = ""
             self._text = ""
             self._thinking = ""
+            self._tool_calls = {}
+            self._tool_call_order = []
             return
+
+        # Every observed event after agent_start (and before
+        # message_end) gets teed to disk verbatim. This is the
+        # forensic safety net: even if persist_if_in_flight is never
+        # called (process died abruptly), the inflight file is
+        # already on disk with everything pi sent.
+        if self._active:
+            self._tee(evt)
+
+        if et == "tool_execution_start":
+            tc_id = evt.get("toolCallId")
+            if isinstance(tc_id, str) and tc_id:
+                self._ensure_tool_call(tc_id, name=evt.get("toolName"))
+                self._tool_calls[tc_id]["execution_status"] = "running"
+            return
+
+        if et == "tool_execution_end":
+            tc_id = evt.get("toolCallId")
+            if isinstance(tc_id, str) and tc_id:
+                tc = self._ensure_tool_call(tc_id, name=evt.get("toolName"))
+                is_error = bool(evt.get("isError"))
+                tc["execution_status"] = "error" if is_error else "success"
+                tc["is_error"] = is_error
+                tc["result_text"] = self._extract_result_text(evt.get("result"))
+            return
+
         if et != "message_update":
             return
+
         sub = evt.get("assistantMessageEvent")
         if not isinstance(sub, dict):
             return
-        sub_type = sub.get("type")
-        delta = sub.get("delta")
-        # Some pi versions ship the running text in a different shape
-        # (e.g. {text: "..."} on text_end) — those are non-essential for
-        # the abort case because text_delta already streamed every char.
-        if not isinstance(delta, str) or not delta:
-            return
+
         if not self._active:
             self._reset_for_new_turn()
-        if sub_type == "text_delta":
-            self._text += delta
-        elif sub_type == "thinking_delta":
-            self._thinking += delta
-        if not self._message_id:
-            mid = sub.get("messageId") or evt.get("id")
-            if isinstance(mid, str) and mid:
-                self._message_id = mid
+            self._open_stream_file()
+
+        sub_type = sub.get("type")
+
+        # ── text / thinking deltas ──────────────────────────────────
+        if sub_type in ("text_delta", "thinking_delta"):
+            delta = sub.get("delta")
+            if isinstance(delta, str) and delta:
+                if sub_type == "text_delta":
+                    self._text += delta
+                else:
+                    self._thinking += delta
+            if not self._message_id:
+                mid = sub.get("messageId") or evt.get("id")
+                if isinstance(mid, str) and mid:
+                    self._message_id = mid
+            return
+
+        # ── tool-call lifecycle ─────────────────────────────────────
+        # Event shape comes from pi-ai (verified against pi 0.73 +
+        # the patched anthropic-vertex provider): the toolCall block
+        # lives at sub.partial.content[contentIndex] for start/delta,
+        # and sub.toolCall has the final dict on toolcall_end.
+        if sub_type == "toolcall_start":
+            block = self._pick_tool_call_block(sub)
+            if isinstance(block, dict):
+                tc_id = block.get("id")
+                if isinstance(tc_id, str) and tc_id:
+                    name = block.get("name")
+                    self._ensure_tool_call(tc_id, name=name)
+            return
+
+        if sub_type == "toolcall_delta":
+            block = self._pick_tool_call_block(sub)
+            if isinstance(block, dict):
+                tc_id = block.get("id")
+                if isinstance(tc_id, str) and tc_id:
+                    tc = self._ensure_tool_call(tc_id, name=block.get("name"))
+                    args = block.get("arguments")
+                    # pi-ai ships the *running parsed* arguments dict
+                    # (not a delta) — we replace, never append.
+                    if isinstance(args, dict):
+                        tc["arguments"] = args
+                    raw = block.get("partialJson")
+                    if isinstance(raw, str):
+                        tc["arguments_partial_json"] = raw
+            return
+
+        if sub_type == "toolcall_end":
+            final = sub.get("toolCall")
+            if isinstance(final, dict):
+                tc_id = final.get("id")
+                if isinstance(tc_id, str) and tc_id:
+                    tc = self._ensure_tool_call(tc_id, name=final.get("name"))
+                    args = final.get("arguments")
+                    if isinstance(args, dict):
+                        tc["arguments"] = args
+            return
+
+    # ── helpers ─────────────────────────────────────────────────────
+
+    def _ensure_tool_call(self, tc_id: str, *, name: Any = None) -> dict[str, Any]:
+        tc = self._tool_calls.get(tc_id)
+        if tc is None:
+            tc = {
+                "id": tc_id,
+                "name": str(name) if isinstance(name, str) and name else "tool",
+                "arguments": {},
+                "arguments_partial_json": "",
+                "execution_status": "pending",
+                "is_error": False,
+                "result_text": "",
+            }
+            self._tool_calls[tc_id] = tc
+            self._tool_call_order.append(tc_id)
+        elif isinstance(name, str) and name and tc["name"] == "tool":
+            # Lazy-fill name if we discover it later (e.g. tool_execution_start
+            # before toolcall_end on legacy variants).
+            tc["name"] = name
+        return tc
+
+    @staticmethod
+    def _pick_tool_call_block(sub: dict[str, Any]) -> dict[str, Any] | None:
+        partial = sub.get("partial")
+        if not isinstance(partial, dict):
+            return None
+        content = partial.get("content")
+        if not isinstance(content, list) or not content:
+            return None
+        idx = sub.get("contentIndex")
+        if not isinstance(idx, int) or idx < 0 or idx >= len(content):
+            idx = len(content) - 1
+        block = content[idx]
+        if not isinstance(block, dict):
+            return None
+        if block.get("type") != "toolCall":
+            return None
+        return block
+
+    @staticmethod
+    def _extract_result_text(result: Any) -> str:
+        """Pull a textual summary out of a tool_execution_end result.
+        Used to enrich the synthetic toolResult line for tool calls
+        that DID complete but whose assistant message_end never fired
+        (e.g. user pressed Stop right between tool-end and the next
+        text delta)."""
+        if not isinstance(result, dict):
+            return ""
+        content = result.get("content")
+        if not isinstance(content, list):
+            return ""
+        out: list[str] = []
+        for c in content:
+            if not isinstance(c, dict):
+                continue
+            if c.get("type") == "text":
+                t = c.get("text")
+                if isinstance(t, str) and t:
+                    out.append(t)
+        return "\n".join(out)
 
     def _reset_for_new_turn(self) -> None:
+        # Close any leaked inflight file from a prior turn that never
+        # saw message_end (shouldn't happen normally — observe()
+        # itself resets between turns — but defensive against pi
+        # restarting mid-session).
+        if self._stream_fp is not None:
+            self._close_stream_file(delete=False)
         self._active = True
         self._ended = False
         self._message_id = ""
         self._text = ""
         self._thinking = ""
+        self._tool_calls = {}
+        self._tool_call_order = []
+
+    # ── streaming-to-disk tee ───────────────────────────────────────
+
+    def _open_stream_file(self) -> None:
+        """Open a per-turn ``inflight`` JSONL file the moment a turn
+        starts. Every observed event is appended verbatim. On
+        message_end the file is deleted (canonical pi record exists);
+        on any abort path it stays put so you can grep through it
+        later if anything misbehaves."""
+        try:
+            self._chats_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S-%f")
+            tag = uuid.uuid4().hex[:8]
+            self._stream_path = self._chats_dir / f"{stamp}-{tag}-inflight.jsonl"
+            # line buffering (1) keeps the OS page cache reasonably
+            # fresh without forcing fsync per write — good balance of
+            # safety vs throughput on a chatty hot path.
+            self._stream_fp = self._stream_path.open(
+                "w", encoding="utf-8", buffering=1
+            )
+        except Exception as exc:
+            print(
+                f"[partial_turn {self._session_id}] tee open failed: {exc!r}",
+                file=sys.stderr,
+            )
+            self._stream_path = None
+            self._stream_fp = None
+
+    def _tee(self, evt: dict[str, Any]) -> None:
+        fp = self._stream_fp
+        if fp is None:
+            return
+        try:
+            fp.write(json.dumps(evt, ensure_ascii=False, default=str) + "\n")
+        except Exception as exc:
+            # Disk full / closed — disable the tee so we don't spam
+            # logs once per event for the rest of the turn.
+            print(
+                f"[partial_turn {self._session_id}] tee write failed: {exc!r}",
+                file=sys.stderr,
+            )
+            try:
+                fp.close()
+            except Exception:
+                pass
+            self._stream_fp = None
+
+    def _close_stream_file(self, *, delete: bool, marker: dict[str, Any] | None = None) -> None:
+        fp = self._stream_fp
+        path = self._stream_path
+        self._stream_fp = None
+        self._stream_path = None
+        if fp is None:
+            return
+        try:
+            if marker is not None and not delete:
+                try:
+                    fp.write(
+                        json.dumps(marker, ensure_ascii=False, default=str) + "\n"
+                    )
+                except Exception:
+                    pass
+            fp.close()
+        except Exception:
+            pass
+        if delete and path is not None:
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     # ── persistence ──────────────────────────────────────────────────
 
     def persist_if_in_flight(self, *, reason: str) -> bool:
         """Write a synthetic ``type: "message"`` line if the current
-        turn never reached ``message_end``.
+        turn never reached ``message_end``. Also writes one
+        ``toolResult`` line per pending/running tool call so the
+        history loader marks them as errored on reload.
 
-        Returns True if a file was written, False otherwise. Idempotent
-        across multiple teardown calls.
+        Returns True if a file was written, False otherwise.
+        Idempotent across multiple teardown calls.
         """
         if not self._active or self._ended:
             return False
         text = self._text
         thinking = self._thinking
-        if not text and not thinking:
+        tool_calls = [self._tool_calls[i] for i in self._tool_call_order]
+        if not text and not thinking and not tool_calls:
             # Nothing to preserve — pi never streamed any content for
             # this turn (maybe abort fired before the first delta).
             self._active = False
             self._ended = True
+            self._close_stream_file(
+                delete=False,
+                marker={"type": "_aborted", "reason": reason, "empty": True},
+            )
             return False
 
         content: list[dict[str, Any]] = []
@@ -182,14 +446,28 @@ class PartialTurnTracker:
         banner = self._banner_for(reason)
         if text:
             content.append({"type": "text", "text": text + banner})
-        else:
+        elif not tool_calls:
             # No streamed text but we did capture thinking — surface a
             # standalone banner part so the turn isn't completely empty
             # in the rendered transcript.
             content.append({"type": "text", "text": banner.lstrip()})
 
+        # Append every tool call we tracked. The history loader
+        # (services/history.py::_flatten_assistant_content) already
+        # handles type="toolCall" with id/name/arguments, so the AI
+        # sees the full args (path + content for write, command for
+        # bash, etc.) on reload — and can resume by retrying instead
+        # of starting from zero.
+        for tc in tool_calls:
+            content.append({
+                "type": "toolCall",
+                "id": tc["id"],
+                "name": tc["name"],
+                "arguments": tc["arguments"] if isinstance(tc["arguments"], dict) else {},
+            })
+
         msg_id = self._message_id or f"abort-{int(time.time() * 1000)}"
-        line = {
+        lines: list[dict[str, Any]] = [{
             "type": "message",
             "id": msg_id,
             "message": {
@@ -201,14 +479,41 @@ class PartialTurnTracker:
                 "aborted": True,
                 "stopReason": reason,
             },
-        }
+        }]
+
+        # For each tool call, write a toolResult line. For ones that
+        # actually completed (status success/error) we have the real
+        # result text and pass it through; for ones that never reached
+        # tool_execution_end (status pending/running) we synthesize an
+        # error result with the abort reason so the rendered card
+        # shows the user WHY the tool didn't finish.
+        for tc in tool_calls:
+            status = tc.get("execution_status", "pending")
+            if status in ("success", "error"):
+                result_text = tc.get("result_text") or ""
+                is_error = bool(tc.get("is_error"))
+            else:
+                result_text = self._tool_abort_text(reason, tc["name"])
+                is_error = True
+            lines.append({
+                "type": "message",
+                "id": f"abort-result-{tc['id']}",
+                "message": {
+                    "role": "toolResult",
+                    "toolCallId": tc["id"],
+                    "content": [{"type": "text", "text": result_text}],
+                    "isError": is_error,
+                    "aborted": status not in ("success", "error"),
+                },
+            })
 
         try:
             self._chats_dir.mkdir(parents=True, exist_ok=True)
             stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S-%f")
             out = self._chats_dir / f"{stamp}-aborted.jsonl"
             with out.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(line, ensure_ascii=False) + "\n")
+                for line in lines:
+                    f.write(json.dumps(line, ensure_ascii=False) + "\n")
         except Exception as exc:
             # Persistence is best-effort — never let a disk error tear
             # down the abort handler.
@@ -217,8 +522,21 @@ class PartialTurnTracker:
                 f"(reason={reason}): {exc!r}",
                 file=sys.stderr,
             )
+            # Still close the inflight tee even if the synthetic
+            # write failed — the tee file IS the recovery copy of
+            # last resort.
+            self._close_stream_file(
+                delete=False,
+                marker={"type": "_aborted", "reason": reason, "synth_failed": True},
+            )
+            self._active = False
+            self._ended = True
             return False
 
+        self._close_stream_file(
+            delete=False,
+            marker={"type": "_aborted", "reason": reason, "lines": len(lines)},
+        )
         self._active = False
         self._ended = True
         return True
@@ -235,3 +553,28 @@ class PartialTurnTracker:
         if reason == "disconnect":
             return "\n\n_(connection closed — partial response saved)_"
         return f"\n\n_(stopped: {reason} — partial response saved)_"
+
+    @staticmethod
+    def _tool_abort_text(reason: str, tool_name: str) -> str:
+        if reason == "user_stop":
+            return (
+                f"Aborted: user pressed Stop before {tool_name} finished. "
+                f"Arguments above are the latest snapshot pi streamed; the "
+                f"call was not executed."
+            )
+        if reason == "timeout":
+            return (
+                f"Aborted: prompt timeout fired while {tool_name} was still "
+                f"streaming arguments. The call was not executed."
+            )
+        if reason == "disconnect":
+            return (
+                f"Aborted: WebSocket closed before {tool_name} finished. "
+                f"Arguments above are the last snapshot we received; the "
+                f"call may or may not have been executed by pi — re-run "
+                f"to be sure."
+            )
+        return (
+            f"Aborted: {reason}. {tool_name} did not finish. Arguments "
+            f"above are the latest snapshot pi streamed."
+        )

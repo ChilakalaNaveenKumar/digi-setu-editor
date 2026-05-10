@@ -3,7 +3,7 @@
  * accept `wsid` first; callers pass the active workspace from the store.
  */
 
-import { apiDelete, apiJson, apiPost, authBlobUrl, downloadAuthed } from "./client";
+import { apiDelete, apiJson, apiPost, authArrayBuffer, authBlobUrl, downloadAuthed } from "./client";
 import type { FileContent, FileEntry } from "./types";
 
 const _ws = (wsid: string, suffix: string) =>
@@ -36,6 +36,16 @@ export function rawFileUrl(wsid: string, path: string): string {
  */
 export function rawFileBlobUrl(wsid: string, path: string): Promise<string> {
   return authBlobUrl(_ws(wsid, `/files/raw?path=${encodeURIComponent(path)}`));
+}
+
+/**
+ * Fetch the raw bytes of a workspace file with auth and return them as
+ * an ArrayBuffer. Used by the in-browser visual viewers
+ * (`SpreadsheetPreview`, `WordPreview`, `SqlitePreview`) that need to
+ * parse the file directly with `xlsx`, `docx-preview`, or `sql.js`.
+ */
+export function rawFileBytes(wsid: string, path: string): Promise<ArrayBuffer> {
+  return authArrayBuffer(_ws(wsid, `/files/raw?path=${encodeURIComponent(path)}`));
 }
 
 /**

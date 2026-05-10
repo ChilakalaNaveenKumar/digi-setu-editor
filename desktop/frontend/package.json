@@ -48,6 +48,7 @@
     "codemirror-lang-elixir": "^4.0.1",
     "diff": "^9.0.0",
     "diff2html": "^3.4.56",
+    "docx-preview": "^0.3.5",
     "katex": "^0.16.45",
     "markdown-it": "^14.1.0",
     "markdown-it-anchor": "^9.2.0",
@@ -57,14 +58,17 @@
     "pinia": "^2.3.0",
     "shiki": "^1.29.2",
     "splitpanes": "^4.0.4",
+    "sql.js": "^1.13.0",
     "vue": "^3.5.13",
     "vue-i18n": "^11.4.2",
     "vue-router": "^4.6.4",
-    "vue-virtual-scroller": "^2.0.0-beta.8"
+    "vue-virtual-scroller": "^2.0.0-beta.8",
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
   },
   "devDependencies": {
     "@types/markdown-it": "^14.1.2",
     "@types/node": "^22.10.0",
+    "@types/sql.js": "^1.4.11",
     "@vitejs/plugin-vue": "^5.2.1",
     "autoprefixer": "^10.4.20",
     "postcss": "^8.4.49",

@@ -104,14 +104,25 @@ _PDF_EXTS = {"pdf"}
 _SVG_EXTS = {"svg"}
 _AUDIO_EXTS = {"mp3", "wav", "ogg", "flac", "m4a", "aac", "opus"}
 _VIDEO_EXTS = {"mp4", "mov", "webm", "mkv", "avi", "m4v"}
-# "office" = anything we route through markitdown for in-browser preview.
-# These have no native browser viewer, so we convert to markdown server-side
-# and render that in the editor pane (see services/binary_extract.py).
+# Native in-browser visual viewers (added 2026-05). These render the
+# binary FAITHFULLY — same look as Excel / Word — using:
+#   - SheetJS / xlsx for spreadsheets (frontend)
+#   - docx-preview for Word documents (frontend)
+#   - sql.js (SQLite-WASM) for .db browsers (frontend)
+# We classify them as their own kinds so the editor pane can dispatch
+# to the right viewer instead of falling back to a markdown text dump.
+_SPREADSHEET_EXTS = {"xlsx", "xls", "xlsm", "xlsb", "ods", "csv", "tsv"}
+_WORD_EXTS = {"docx"}                       # Only docx renders well via docx-preview.
+_SLIDES_EXTS = {"pptx"}                      # Reserved for future pptx viewer.
+_SQLITE_EXTS = {"db", "sqlite", "sqlite3", "db3", "sdb"}
+# Legacy or rarely-used office formats — fall back to server-side
+# markdown extraction (markitdown) for inline preview. Browsers have no
+# native viewer for these and there isn't a small/free in-browser
+# parser we'd trust for them.
 _OFFICE_EXTS = {
-    "docx", "doc", "odt", "rtf",
-    "xlsx", "xls", "ods", "csv", "tsv",
-    "pptx", "ppt", "odp",
-    "epub", "msg", "eml",
+    "doc", "odt", "rtf",          # legacy Word formats
+    "ppt", "odp",                  # legacy PowerPoint
+    "epub", "msg", "eml",          # ebook + email
 }
 
 
@@ -128,6 +139,14 @@ def classify_extension(name: str) -> str:
         return "audio"
     if ext in _VIDEO_EXTS:
         return "video"
+    if ext in _SPREADSHEET_EXTS:
+        return "spreadsheet"
+    if ext in _WORD_EXTS:
+        return "word"
+    if ext in _SLIDES_EXTS:
+        return "slides"
+    if ext in _SQLITE_EXTS:
+        return "sqlite"
     if ext in _OFFICE_EXTS:
         return "office"
     return "unknown"

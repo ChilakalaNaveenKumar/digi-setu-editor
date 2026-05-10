@@ -166,6 +166,64 @@ RUN echo "deb http://deb.debian.org/debian bookworm contrib" \
  && apt-get install -y --no-install-recommends ttf-mscorefonts-installer \
  && rm -rf /var/lib/apt/lists/*
 
+# ── Pre-baked Python libs the AI reaches for on every "make me a doc"
+#    request ─────────────────────────────────────────────────────────
+#
+# Without this layer the AI hits a wall the moment a user asks for
+# "generate me an xlsx / docx / pdf / csv summary":
+#
+#   1.  Debian bookworm's system Python is PEP 668 "externally
+#       managed" → plain `pip install` fails with the famous
+#           "error: externally-managed-environment"
+#       error and the hint to use `--break-system-packages`.
+#
+#   2.  The AI's typical workaround (a venv + pip install) hits the
+#       egress proxy at `pi-proxy:1080` with a fresh TLS handshake
+#       per package. On a slow network or proxy that retries and
+#       eventually times out (`ProxyError: Cannot connect to proxy.
+#       TimeoutError: timed out`) — every retry burns user-visible
+#       wall-clock time AND token cost.
+#
+#   3.  When all else fails, the AI starts hand-rolling 1,200-line
+#       OOXML-from-scratch scripts using only `zipfile` + `struct`.
+#       Impressive — but slow, fragile, and a waste of pi tokens.
+#
+# Pre-baking the common doc-generation set into the image means most
+# requests just work (no install, no egress, no thousand-line zip
+# scaffolds). Users can still `sudo apt install` system pkgs or `pip
+# install --break-system-packages …` more on top — this is just the
+# first-prompt-latency-friendly default.
+#
+# Set chosen for breadth-of-use vs. image-size tradeoff:
+#   * Office: openpyxl, python-docx, python-pptx, odfpy
+#   * PDF:    reportlab, fpdf2, pypdf
+#   * Data:   pandas, numpy, pillow, tabulate
+#   * Web:    requests, beautifulsoup4, lxml, pyyaml
+#   * Misc:   markdown, jinja2
+#
+# matplotlib / seaborn / scipy / sklearn are NOT pre-baked — they
+# pull ~200MB of native deps and the userbase that wants charts is
+# small enough that `sudo apt install python3-matplotlib` (or pip
+# install) on demand is fine.
+RUN pip3 install --no-cache-dir --break-system-packages \
+        openpyxl \
+        python-docx \
+        python-pptx \
+        odfpy \
+        reportlab \
+        fpdf2 \
+        pypdf \
+        pandas \
+        numpy \
+        pillow \
+        tabulate \
+        requests \
+        beautifulsoup4 \
+        lxml \
+        pyyaml \
+        markdown \
+        jinja2
+
 # Generate a UTF-8 locale so terminal output / typst / python don't
 # fall back to ASCII-only modes.
 RUN sed -i 's/# en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen \

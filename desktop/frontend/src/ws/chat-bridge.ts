@@ -135,6 +135,23 @@ export class ChatBridge {
     }
   }
 
+  /**
+   * Swap the dispatcher callbacks without touching the underlying WS.
+   * Used by the chat store to "park" a bridge when the user switches
+   * tabs: events are routed to the parked snapshot's dispatcher, and
+   * when the user comes back the live dispatcher is rebound. The
+   * WebSocket stays connected throughout, so a long-running pi turn
+   * (e.g. `pip install`) continues streaming straight into the parked
+   * session's router instead of being aborted.
+   *
+   * Safe to call at any time — handler refs (`onopen`, `onclose`,
+   * `onmessage`, `onerror`) all read `this.opts.X(...)` lazily, so a
+   * mid-flight callback after rebind() will land on the new opts.
+   */
+  rebind(next: BridgeOpts): void {
+    this.opts = next;
+  }
+
   get isOpen(): boolean {
     return this.ws?.readyState === WebSocket.OPEN;
   }

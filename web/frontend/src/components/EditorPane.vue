@@ -68,13 +68,44 @@ const isEditableMode = computed(() => {
  *  remember the choice while they're on this file. */
 const svgShowAsCode = ref(false);
 
-/** Which preview component (if any) should render this file. */
-const previewKind = computed<"image" | "pdf" | "svg" | "audio" | "video" | "office" | null>(() => {
+/** Which preview component (if any) should render this file.
+ *
+ *  The full union mirrors the backend's `classify_extension()` plus the
+ *  in-browser viewers we added: spreadsheet (xlsx/xls/csv/ods), word
+ *  (docx), sqlite (.db). "office" remains the catch-all for legacy
+ *  formats (.doc/.odt/.rtf/.eml/.epub) that still go through the
+ *  server-side markitdown text fallback.
+ */
+type PreviewKind =
+  | "image"
+  | "pdf"
+  | "svg"
+  | "audio"
+  | "video"
+  | "office"
+  | "spreadsheet"
+  | "word"
+  | "slides"
+  | "sqlite";
+
+const previewKind = computed<PreviewKind | null>(() => {
   const f = currentFile.value;
   if (!f) return null;
   if (inReview.value) return null;
   const k = f.kind;
-  if (k === "image" || k === "pdf" || k === "audio" || k === "video" || k === "office") return k;
+  if (
+    k === "image" ||
+    k === "pdf" ||
+    k === "audio" ||
+    k === "video" ||
+    k === "office" ||
+    k === "spreadsheet" ||
+    k === "word" ||
+    k === "slides" ||
+    k === "sqlite"
+  ) {
+    return k;
+  }
   if (k === "svg" && !svgShowAsCode.value) return "svg";
   return null;
 });

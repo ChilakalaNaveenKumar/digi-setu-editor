@@ -209,6 +209,16 @@ export async function authBlobUrl(path: string): Promise<string> {
 }
 
 /**
+ * Fetch `path` with auth headers and return the raw bytes as an
+ * ArrayBuffer. Used by the in-browser document viewers (xlsx, docx,
+ * sql.js) that parse the file directly rather than via a blob URL.
+ */
+export async function authArrayBuffer(path: string): Promise<ArrayBuffer> {
+  const res = await _request(path);
+  return await res.arrayBuffer();
+}
+
+/**
  * Trigger a browser download of `path` with auth, suggesting `filename`
  * to the Save-As dialog. Revokes the blob URL after dispatch so we don't
  * leak memory across many downloads.
