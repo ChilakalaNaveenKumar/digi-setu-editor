@@ -88,7 +88,11 @@ const platform = computed<Platform>(() => {
 const primaryHref = computed(() => {
   switch (platform.value) {
     case "mac-arm": return `/downloads/${MACOS_ARM_DMG}`;
-    case "mac-intel": return `/downloads/${MACOS_INTEL_DMG}`;
+    // Intel Mac: x86_64 .dmg isn't built yet (release.sh is host-only and
+    // we don't have an Intel runner). Apple Silicon DMG runs fine on
+    // Intel via Rosetta 2, so point Intel visitors at the arm64 build
+    // rather than handing them a guaranteed 404.
+    case "mac-intel": return `/downloads/${MACOS_ARM_DMG}`;
     case "linux-deb": return `/downloads/${LINUX_DEB}`;
     case "linux-appimage": return `/downloads/${LINUX_APPIMAGE}`;
     case "windows": return `/downloads/${WINDOWS_EXE}`;
@@ -99,7 +103,7 @@ const primaryHref = computed(() => {
 const primaryLabel = computed(() => {
   switch (platform.value) {
     case "mac-arm": return "Download for macOS (Apple Silicon)";
-    case "mac-intel": return "Download for macOS (Intel)";
+    case "mac-intel": return "Download for macOS (Apple Silicon · runs on Intel via Rosetta)";
     case "linux-deb": return "Download .deb for Linux";
     case "linux-appimage": return "Download AppImage for Linux";
     case "windows": return "Download for Windows";
@@ -130,7 +134,15 @@ const firstLaunchKind = computed<"mac" | "windows" | "linux">(() => {
 // Status flags per platform — flip these to true the moment the
 // matching artefact is uploaded. They control whether a row in the
 // "All downloads" grid is a live link or a "Coming soon" placeholder.
-const macAvailable = true;
+//
+// macOS Apple Silicon: built locally via release.sh on a Sonoma+ M-series
+// host. macOS Intel x86_64: held back because release.sh today only builds
+// for the host architecture (arm64) and we don't have a hosted Intel Mac
+// runner; cross-compiling to x86_64 from arm64 needs the right rust target
+// + universal2 PyInstaller bundle. Tracked separately — flip macIntelAvailable
+// the moment we ship a real `Digi-Setu-X.Y.Z-x64.dmg`.
+const macArmAvailable = true;
+const macIntelAvailable = false;
 // .deb covers Ubuntu/Debian/Mint/Pop!_OS — easily 80%+ of Linux desktop
 // installs. .AppImage is held back because Tauri 2's bundler downloads
 // its own copy of `linuxdeploy.AppImage` and execs it directly, which
@@ -139,7 +151,7 @@ const macAvailable = true;
 const linuxDebAvailable = true;
 const linuxAppImageAvailable = false;
 const linuxAvailable = linuxDebAvailable || linuxAppImageAvailable;
-const windowsAvailable = false;     // Pending Azure Trusted Signing identity verification
+const windowsAvailable = false;     // Pending GHA build (PyInstaller bootstrap fix landing in next pipeline run)
 </script>
 
 <template>
@@ -320,40 +332,40 @@ const windowsAvailable = false;     // Pending Azure Trusted Signing identity ve
       <div class="overflow-hidden rounded-lg border border-border">
         <!-- macOS Apple Silicon -->
         <component
-          :is="macAvailable ? 'a' : 'div'"
-          :href="macAvailable ? `/downloads/${MACOS_ARM_DMG}` : undefined"
+          :is="macArmAvailable ? 'a' : 'div'"
+          :href="macArmAvailable ? `/downloads/${MACOS_ARM_DMG}` : undefined"
           class="flex items-center justify-between gap-4 border-b border-border bg-muted/20 px-4 py-3 last:border-b-0"
-          :class="macAvailable ? 'hover:bg-muted/40' : 'text-muted-foreground'"
+          :class="macArmAvailable ? 'hover:bg-muted/40' : 'text-muted-foreground'"
         >
           <div class="flex items-center gap-3">
             <Icon icon="mdi:apple" class="h-5 w-5 text-foreground" />
             <div>
               <div class="font-semibold">macOS · Apple Silicon</div>
               <div class="font-mono text-caption text-muted-foreground">
-                {{ macAvailable ? MACOS_ARM_DMG : "Coming soon" }}
+                {{ macArmAvailable ? MACOS_ARM_DMG : "Coming soon" }}
               </div>
             </div>
           </div>
-          <Icon :icon="macAvailable ? 'mdi:download' : 'mdi:clock-outline'" class="h-5 w-5 text-muted-foreground" />
+          <Icon :icon="macArmAvailable ? 'mdi:download' : 'mdi:clock-outline'" class="h-5 w-5 text-muted-foreground" />
         </component>
 
         <!-- macOS Intel -->
         <component
-          :is="macAvailable ? 'a' : 'div'"
-          :href="macAvailable ? `/downloads/${MACOS_INTEL_DMG}` : undefined"
+          :is="macIntelAvailable ? 'a' : 'div'"
+          :href="macIntelAvailable ? `/downloads/${MACOS_INTEL_DMG}` : undefined"
           class="flex items-center justify-between gap-4 border-b border-border bg-muted/20 px-4 py-3 last:border-b-0"
-          :class="macAvailable ? 'hover:bg-muted/40' : 'text-muted-foreground'"
+          :class="macIntelAvailable ? 'hover:bg-muted/40' : 'text-muted-foreground'"
         >
           <div class="flex items-center gap-3">
             <Icon icon="mdi:apple" class="h-5 w-5 text-foreground" />
             <div>
               <div class="font-semibold">macOS · Intel</div>
               <div class="font-mono text-caption text-muted-foreground">
-                {{ macAvailable ? MACOS_INTEL_DMG : "Coming soon" }}
+                {{ macIntelAvailable ? MACOS_INTEL_DMG : "Coming soon — use Apple Silicon DMG via Rosetta meanwhile" }}
               </div>
             </div>
           </div>
-          <Icon :icon="macAvailable ? 'mdi:download' : 'mdi:clock-outline'" class="h-5 w-5 text-muted-foreground" />
+          <Icon :icon="macIntelAvailable ? 'mdi:download' : 'mdi:clock-outline'" class="h-5 w-5 text-muted-foreground" />
         </component>
 
         <!-- Linux .deb -->

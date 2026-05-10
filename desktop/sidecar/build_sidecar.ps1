@@ -26,11 +26,19 @@ if (-not (Test-Path $Venv)) {
 # Activate the venv for this script's lifetime.
 . (Join-Path $Venv "Scripts\Activate.ps1")
 
-# Lazy-install PyInstaller — keeps it out of the prod requirements.txt
-$probe = & python -c "import PyInstaller" 2>$null
+# Lazy-install PyInstaller — keeps it out of the prod requirements.txt.
+#
+# `python -c "import PyInstaller"` writes a Python traceback to stderr when
+# the module is missing. In PowerShell 7 with $ErrorActionPreference = "Stop"
+# any stderr write from a native command is promoted to a terminating
+# NativeCommandError, so the `if ($LASTEXITCODE)` branch below never even
+# runs. Easiest workaround: skip the probe and install unconditionally —
+# `pip install` is idempotent and a no-op when PyInstaller is already
+# present (~1s overhead vs. forever-broken Windows builds).
+Write-Host "[build] Ensuring PyInstaller is present in backend venv..."
+& python -m pip install --quiet --disable-pip-version-check "pyinstaller>=6.10,<7"
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "[build] Installing PyInstaller into backend venv..."
-    python -m pip install --quiet "pyinstaller>=6.10,<7"
+    throw "pip install pyinstaller failed (exit $LASTEXITCODE)"
 }
 
 Push-Location $Here
