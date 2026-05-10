@@ -96,18 +96,34 @@ _load_dotenv_into_environ(_BACKEND_DIR / ".env")
 DEPLOY_MODE = os.environ.get("PI_MODE", "web").strip().lower() or "web"
 
 
-# ── Desktop home dir (~/.digi-setu/) ───────────────────────────────
-# Desktop mode keeps EVERYTHING under one user-visible folder:
-#   ~/.digi-setu/.env                user-editable (BYOK keys, prefs)
-#   ~/.digi-setu/workspaces/         per-workspace chats + shadow git
-#   ~/.digi-setu/audits/             AI tool-call audit trail
-#   ~/.digi-setu/registry.json       workspace catalogue
-#   ~/.digi-setu/prefs.json          permission_mode + UI prefs
+# ── Desktop home dir ───────────────────────────────────────────────
+# Desktop mode keeps everything under one app-data folder:
+#   <DATA_ROOT>/.env              user-editable (BYOK keys, prefs)
+#   <DATA_ROOT>/.session_id       Clerk session cache
+#   <DATA_ROOT>/workspaces/       per-workspace chats + shadow git
+#   <DATA_ROOT>/audits/           AI tool-call audit trail
+#   <DATA_ROOT>/registry.json     workspace catalogue
+#   <DATA_ROOT>/prefs.json        permission_mode + UI prefs
+#   <DATA_ROOT>/pi-runtime/       self-healed mirror of the bundle's
+#                                 pi-coding-agent + node + patches
+#                                 (see services/pi_integrity.py)
 #
-# The path is set by the Tauri shell via PI_DATA_ROOT, but we recompute
-# it here too as a fallback (running the sidecar binary by hand without
-# Tauri) and use it to locate the .env file. On Windows this becomes
-# %USERPROFILE%\.digi-setu\.
+# The Tauri shell (see desktop/src-tauri/src/sidecar.rs) resolves
+# DATA_ROOT to the platform-standard app-data dir (Tauri's
+# ``app_data_dir()``) and forwards it via DIGI_SETU_HOME + PI_DATA_ROOT:
+#   macOS:   ~/Library/Application Support/com.digi-setu.desktop/
+#   Windows: %APPDATA%\Digi Setu\
+#   Linux:   ~/.local/share/digi-setu/
+#
+# On a fresh boot of the new build, ``services.pi_integrity.ensure_runtime``
+# also migrates the legacy ``~/.digi-setu/`` Unix-hidden folder (used by
+# pre-app-data-dir builds) into the new path so existing chats / login /
+# .env carry over without the user noticing. Subsequent boots short-
+# circuit on a marker file in the legacy folder.
+#
+# When running the sidecar binary by hand without Tauri (dev loop),
+# neither env var is set and we fall back to the legacy path so
+# existing dev workflows keep working.
 def _desktop_home() -> Path:
     explicit = os.environ.get("DIGI_SETU_HOME", "").strip()
     if explicit:
@@ -480,10 +496,36 @@ if DEPLOY_MODE == "desktop":
                 file=_sys.stderr,
             )
     elif CLERK_SECRET_KEY:
+        # Print BOTH cloud bases so the operator can spot a host
+        # mismatch at a glance. The apex serves /api/* (billing,
+        # usage, workspaces); the api subdomain serves /v1/* (relay
+        # WS, relay HTTP, typst). Mixing them up was the root cause
+        # of the long-running "chat hangs forever on streaming…"
+        # bug — the local proxy was forwarding /v1/relay/vertex/*
+        # to the apex, which 405'd POSTs to unknown paths. Surfacing
+        # both at startup makes a future regression obvious.
+        _apex = os.environ.get('PI_CLOUD_API_BASE') or 'https://digi-setu.com'
+        # PI_RELAY_HTTP_BASE is computed lower in this file (forward
+        # reference avoidance), so we duplicate the tiny scheme-swap
+        # logic inline. The substantive constant lives at the bottom
+        # of the file and is what every runtime call site reads.
+        _raw_relay = (
+            os.environ.get('PI_RELAY_HTTP_BASE')
+            or os.environ.get('PI_RELAY_BASE')
+            or 'wss://api.digi-setu.com'
+        )
+        if _raw_relay.startswith('wss://'):
+            _relay_http = 'https://' + _raw_relay[len('wss://'):]
+        elif _raw_relay.startswith('ws://'):
+            _relay_http = 'http://' + _raw_relay[len('ws://'):]
+        else:
+            _relay_http = _raw_relay
+        _relay_http = _relay_http.rstrip('/')
         print(
             f"[config] Clerk tenant = {CLERK_TENANT_KIND} "
             f"(publishable={CLERK_PUBLISHABLE_KEY[:14] + '…' if CLERK_PUBLISHABLE_KEY else 'unset'}). "
-            f"Cloud target = {os.environ.get('PI_CLOUD_API_BASE') or 'https://digi-setu.com'}. "
+            f"Cloud apex (billing/usage)   = {_apex}. "
+            f"Cloud relay (LLM proxy)      = {_relay_http}. "
             f"Override with CLERK_TENANT=test|prod if these don't match.",
             file=_sys.stderr,
         )
@@ -544,6 +586,88 @@ PI_RELAY_PATH = (
     os.environ.get("PI_RELAY_PATH", "").strip()
     or "/v1/ws/desktop-relay"
 )
+
+# ── Cloud relay HTTP base ──────────────────────────────────────────
+# HTTP analog of PI_RELAY_BASE. The cloud-side `/v1/relay/vertex/*`
+# (LLM passthrough) and `/v1/typst/search_docs` endpoints live ONLY
+# on api.digi-setu.com — see deploy/caddy/Caddyfile, where the apex
+# explicitly returns 404 for anything not under `/api/`, `/ws/`, or
+# `/healthz`. Forwarding to the apex (`https://digi-setu.com/v1/...`)
+# silently 405s because the apex serves SPA HTML for unknown paths,
+# which makes pi appear to "stream forever" on the very first prompt.
+#
+# We derive this from `PI_RELAY_BASE` by swapping the WS scheme for
+# HTTP, so a single env var (PI_RELAY_BASE) stays the source of truth
+# for "where does the relay live". The override is exposed for
+# completeness — same hardening as the others (process env only).
+def _ws_to_http_scheme(url: str) -> str:
+    if url.startswith("wss://"):
+        return "https://" + url[len("wss://"):]
+    if url.startswith("ws://"):
+        return "http://" + url[len("ws://"):]
+    return url
+
+
+PI_RELAY_HTTP_BASE = (
+    os.environ.get("PI_RELAY_HTTP_BASE", "").strip()
+    or _ws_to_http_scheme(PI_RELAY_BASE)
+).rstrip("/")
+
+
+# ── Local LLM proxy base ───────────────────────────────────────────
+# The single source of truth for "where does the spawned pi runtime
+# reach the JWT-injecting localhost proxy". Every call site that
+# needs this URL must go through ``local_proxy_base()`` instead of
+# rolling its own ``f"http://127.0.0.1:{PORT}/llm-proxy"`` — that's
+# how we ended up with two stale ``8000`` defaults that pointed at a
+# completely unrelated FastAPI on the dev machine, returning the
+# generic ``{"detail":"Not Found"}`` 404 that pi's Anthropic Vertex
+# SDK then surfaced as ``404 {"detail":"Not Found"}`` with no log
+# trace.
+#
+# Why this is a function, not a constant
+# --------------------------------------
+# ``config.py`` is imported during sidecar boot, BEFORE
+# ``sidecar_main.py`` exports ``PORT`` from the parsed ``--port``
+# CLI flag. A constant evaluated at import time would freeze the
+# wrong value (or empty). The function reads ``os.environ`` lazily
+# at call time, so by the time ``relay_spawn.cloud_relay_subprocess_env``
+# runs we always see the real port.
+#
+# The function is opinionated about the bundled-app branch: when
+# ``PI_DESKTOP_PI_DIR`` is set (Tauri shell, see ``sidecar.rs``) and
+# ``PORT`` is unset, it raises rather than silently using ``8000``.
+# That's a wiring bug that needs to fail loud — see the long-form
+# comment in ``services/relay_spawn.py``.
+def local_proxy_base() -> str:
+    """Return ``http://127.0.0.1:<PORT>/llm-proxy``.
+
+    Single source of truth — everything that needs the proxy URL
+    (relay_spawn for spawn env, llm_proxy health, integrity-check
+    self-test, …) imports this. Lazy by design: see the docstring on
+    ``config.py``'s LLM-proxy section for the full rationale.
+    """
+    port = (os.environ.get("PORT", "") or "").strip()
+    if port:
+        return f"http://127.0.0.1:{port}/llm-proxy"
+
+    bundled_runtime = bool((os.environ.get("PI_DESKTOP_PI_DIR", "") or "").strip())
+    if bundled_runtime:
+        raise RuntimeError(
+            "PORT env var is not exported, but PI_DESKTOP_PI_DIR is set "
+            "(bundled desktop app). The sidecar entry point must call "
+            "`os.environ['PORT'] = str(args.port)` after argparse so "
+            "spawned pi runtimes inherit the actual bound port. Without "
+            "that, pi POSTs LLM requests to http://127.0.0.1:8000 — the "
+            "legacy uvicorn default — and any stale FastAPI listening "
+            "there returns 404 {\"detail\":\"Not Found\"}, which pi's "
+            "Anthropic Vertex SDK surfaces with no log trace because "
+            "the request never hits us. See desktop/sidecar/sidecar_main.py."
+        )
+    # Operator dev loop (`uvicorn main:app --port 8000` directly,
+    # no Tauri shell) — keep the legacy behaviour so existing dev
+    # scripts don't break.
+    return "http://127.0.0.1:8000/llm-proxy"
 
 # ── Cloud HTTP API base ────────────────────────────────────────────
 # The desktop sidecar is a *thin client* for everything billing-

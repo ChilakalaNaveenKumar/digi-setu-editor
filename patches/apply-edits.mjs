@@ -459,10 +459,15 @@ function isValidThoughtSignature(signature) {
 // registry stays identical, and the env var is a no-op everywhere
 // else (cloud build doesn't set it, BYOK doesn't set it).
 //
-// ``@anthropic-ai/vertex-sdk`` already honours
-// ``ANTHROPIC_VERTEX_BASE_URL`` natively because pi-ai's
-// ``anthropic-vertex.js`` wrapper does NOT pass a baseURL — so no
-// equivalent patch is needed for the Anthropic side.
+// We also short-circuit GoogleAuth for the same flavour: when the
+// base URL is localhost-relay we pass a fake ``apiKey`` so the SDK
+// skips its ADC dance (line 19467 of @google/genai/dist/node/index.cjs
+// constructs ``new GoogleAuth(...)`` ONLY when no apiKey is set —
+// otherwise it sends ``Authorization: Bearer <apiKey>`` which our
+// relay strips and replaces with the real ADC bearer upstream).
+// Without this short-circuit, the SDK awaits ``getRequestHeaders()``
+// which probes the GCE metadata server (169.254.169.254) on a laptop
+// for ~15s × retries and the chat hangs forever on "streaming…".
 {
   const f = join(PI_AI, "dist/providers/google-vertex.js");
   patch(
@@ -480,6 +485,53 @@ function isValidThoughtSignature(signature) {
     const baseUrl = envBaseUrl || resolveCustomBaseUrl(model.baseUrl);`,
     "google-vertex: prefer GOOGLE_VERTEX_BASE_URL env over model.baseUrl",
     "GOOGLE_VERTEX_BASE_URL wins over model.baseUrl",
+  );
+
+  // Short-circuit GoogleAuth when targeting the localhost relay.
+  // Replace `createClient` so it routes through createClientWithApiKey
+  // with a placeholder API key, which sidesteps the ADC walk entirely.
+  // The cloud relay rewrites the bearer regardless of what the SDK
+  // ships — so the placeholder key is an inert token, not a credential.
+  patch(
+    f,
+    `function createClient(model, project, location, optionsHeaders) {
+    return new GoogleGenAI({
+        vertexai: true,
+        project,
+        location,
+        apiVersion: API_VERSION,
+        httpOptions: buildHttpOptions(model, optionsHeaders),
+    });
+}`,
+    `function createClient(model, project, location, optionsHeaders) {
+    // Patched (digi-setu/patches §11b): when running through the
+    // desktop's localhost relay proxy, swap the Vertex auth flow for
+    // an apiKey-flavoured client. @google/genai constructs
+    // GoogleAuth only when no apiKey is provided; with apiKey set
+    // the SDK sends "Authorization: Bearer <apiKey>" and our local
+    // proxy strips/replaces it before forwarding to the cloud relay.
+    // Stops the chat from hanging forever on metadata-server probes
+    // when the laptop has no ADC.
+    const envBaseUrl = (process.env.GOOGLE_VERTEX_BASE_URL || "").trim();
+    const isLocalRelay = /^https?:\\/\\/(127\\.0\\.0\\.1|localhost)\\b/i.test(envBaseUrl);
+    if (isLocalRelay) {
+        return new GoogleGenAI({
+            vertexai: true,
+            apiKey: "relay-managed",
+            apiVersion: API_VERSION,
+            httpOptions: buildHttpOptions(model, optionsHeaders),
+        });
+    }
+    return new GoogleGenAI({
+        vertexai: true,
+        project,
+        location,
+        apiVersion: API_VERSION,
+        httpOptions: buildHttpOptions(model, optionsHeaders),
+    });
+}`,
+    "google-vertex: short-circuit GoogleAuth on localhost relay",
+    "Patched (digi-setu/patches §11b)",
   );
 }
 

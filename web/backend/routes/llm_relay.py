@@ -879,8 +879,32 @@ async def vertex_passthrough(
                 )
 
         media_type = up_headers.get("content-type") or "text/event-stream"
+        # Pass through the upstream encoding hint (and a few related
+        # body-shape headers) so the desktop proxy + pi's SDK can
+        # decompress correctly. Vertex returns SSE with
+        # ``Content-Encoding: gzip`` over the wire; without this header
+        # the localhost proxy hands pi gzipped bytes tagged as
+        # ``text/event-stream``, the SDK parses them as raw SSE, gets
+        # garbage frames, and records an empty assistant message with
+        # 0 tokens. The bug surfaced as the desktop chat showing
+        # ``message_start`` immediately followed by ``message_end``
+        # with no text.
+        passthrough_headers: dict[str, str] = {}
+        for header_name in (
+            "content-encoding",
+            "cache-control",
+            "x-anthropic-request-id",
+            "anthropic-request-id",
+            "x-request-id",
+        ):
+            value = up_headers.get(header_name)
+            if value is not None:
+                passthrough_headers[header_name] = value
         return StreamingResponse(
-            _wrapped(), status_code=up_status, media_type=media_type,
+            _wrapped(),
+            status_code=up_status,
+            media_type=media_type,
+            headers=passthrough_headers,
         )
 
     try:

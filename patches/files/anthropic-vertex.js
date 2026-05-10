@@ -21,15 +21,44 @@ import { AnthropicVertex } from "@anthropic-ai/vertex-sdk";
 import { mapThinkingLevelToEffort, streamAnthropic, supportsAdaptiveThinking, } from "./anthropic.js";
 import { adjustMaxTokensForThinking, buildBaseOptions, } from "./simple-options.js";
 
+// When ANTHROPIC_VERTEX_BASE_URL points at a relay-style proxy
+// (typically the desktop's localhost JWT-injecting proxy that forwards
+// to our cloud Vertex passthrough), the proxy supplies its OWN bearer
+// — we MUST NOT let the SDK try to resolve real ADC, because:
+//   * On a user's laptop there is no ADC chain. The default GoogleAuth
+//     code path eventually probes the GCE metadata server
+//     (169.254.169.254) which on a Mac/Windows box hangs for the full
+//     timeout (15+ s × retries) and the chat appears to "stream
+//     forever". Setting the base URL alone is not enough — auth
+//     happens BEFORE the first HTTP request, in `prepareOptions`.
+//   * Even when ADC is present (operator dev box) we don't want it on
+//     this code path because the cloud relay rewrites the project id
+//     anyway, so the laptop-side bearer is throwaway. Burning cycles
+//     on `getClient()` just to throw the bearer away is wasteful.
+//
+// We detect the relay flavour via a localhost base URL prefix. The
+// stub auth client returns empty headers (the proxy replaces them
+// with a fresh Clerk JWT) and exposes the resolved projectId so the
+// SDK's `prepareOptions` skips its `getClient()` await entirely.
+function _isLocalRelayBaseUrl(url) {
+    if (!url || typeof url !== "string") return false;
+    return /^https?:\/\/(127\.0\.0\.1|localhost)\b/i.test(url);
+}
+
 function resolveProject(options) {
     const project = options?.project
         || process.env.PI_VERTEX_ANTHROPIC_PROJECT
         || process.env.GOOGLE_CLOUD_PROJECT
         || process.env.GCLOUD_PROJECT;
-    if (!project) {
-        throw new Error("anthropic-vertex requires a project ID. Set GOOGLE_CLOUD_PROJECT (or PI_VERTEX_ANTHROPIC_PROJECT) or pass project in options.");
+    if (project) return project;
+    // Relay short-circuit: when we're routing through the localhost
+    // relay proxy the cloud side rewrites the project id, so the
+    // value the SDK encodes in the URL path is cosmetic. Return a
+    // placeholder so `new AnthropicVertex()` doesn't throw early.
+    if (_isLocalRelayBaseUrl(process.env.ANTHROPIC_VERTEX_BASE_URL)) {
+        return "relay-managed";
     }
-    return project;
+    throw new Error("anthropic-vertex requires a project ID. Set GOOGLE_CLOUD_PROJECT (or PI_VERTEX_ANTHROPIC_PROJECT) or pass project in options.");
 }
 
 function resolveLocation(options) {
@@ -40,10 +69,23 @@ function resolveLocation(options) {
 }
 
 function buildClient(options) {
-    return new AnthropicVertex({
-        region: resolveLocation(options),
-        projectId: resolveProject(options),
-    });
+    const projectId = resolveProject(options);
+    const region = resolveLocation(options);
+    const baseUrl = process.env.ANTHROPIC_VERTEX_BASE_URL;
+    const args = { region, projectId };
+    if (_isLocalRelayBaseUrl(baseUrl)) {
+        // Stub auth client — the SDK awaits authClient.getRequestHeaders()
+        // and reads authClient.projectId in prepareOptions. By feeding
+        // a synchronous shim we sidestep the GoogleAuth dance. The
+        // empty header object is harmless: the localhost proxy
+        // overwrites Authorization with the cached Clerk JWT before
+        // forwarding upstream.
+        args.authClient = {
+            projectId,
+            getRequestHeaders: async () => ({}),
+        };
+    }
+    return new AnthropicVertex(args);
 }
 
 export const streamAnthropicVertex = (model, context, options) => {

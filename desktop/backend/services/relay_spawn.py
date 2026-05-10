@@ -63,20 +63,21 @@ real Vertex bearer.
 
 from __future__ import annotations
 
-import os
 from typing import Optional
 
+from config import local_proxy_base
 from services.models_registry import ModelSpec
 
 
 def _proxy_base_url() -> str:
-    """The localhost proxy base. We resolve from $PORT (the sidecar's
-    own listen port — see desktop/backend/main.py) so a Tauri shell
-    that picks a random free port at launch still gets a working
-    spawn env. Falls back to 8000 (uvicorn dev default) when unset.
+    """Backwards-compat alias for ``config.local_proxy_base()``.
+
+    All new call sites should import ``local_proxy_base`` directly
+    from ``config``; this thin wrapper is kept so existing tests keep
+    passing without churn. The single source of truth for the URL
+    shape, error policy, and PORT env handling lives in ``config.py``.
     """
-    port = (os.environ.get("PORT", "") or "8000").strip()
-    return f"http://127.0.0.1:{port}/llm-proxy"
+    return local_proxy_base()
 
 
 def cloud_relay_provider_for(spec: ModelSpec) -> Optional[str]:
@@ -162,5 +163,19 @@ def cloud_relay_subprocess_env(spec: ModelSpec, env: dict[str, str]) -> dict[str
     # location from its OWN env, so whatever the laptop encodes here
     # is cosmetic and gets overridden. We let pi keep these so the
     # SDK doesn't crash with "Vertex AI requires a project ID".
+    #
+    # If the parent process didn't set them (the common case on a
+    # stock laptop — the desktop user has no GCP env), inject safe
+    # placeholders. The Anthropic Vertex SDK and the @google/genai
+    # SDK both throw at construction when no project id is resolvable;
+    # without these defaults pi crashes BEFORE making any HTTP call
+    # and the chat hangs forever on "streaming…". The cloud relay
+    # rewrites both values upstream so the placeholder leaks no info.
+    out.setdefault("GOOGLE_CLOUD_PROJECT", "relay-managed")
+    out.setdefault("GOOGLE_CLOUD_LOCATION", "global")
+    # @anthropic-ai/vertex-sdk reads CLOUD_ML_REGION as the region
+    # source — match the location placeholder above so the
+    # constructor doesn't throw "No region was given".
+    out.setdefault("CLOUD_ML_REGION", out["GOOGLE_CLOUD_LOCATION"])
 
     return out

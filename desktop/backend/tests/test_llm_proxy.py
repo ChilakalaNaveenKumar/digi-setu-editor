@@ -152,9 +152,21 @@ def test_cloud_relay_env_does_not_mutate_input():
 # ── llm_proxy route ────────────────────────────────────────────────────
 @pytest.fixture
 def app(monkeypatch):
-    """Build a FastAPI app with just the llm_proxy router."""
+    """Build a FastAPI app with just the llm_proxy router.
+
+    NOTE: we set PI_RELAY_HTTP_BASE (the new HTTP base for /v1/relay/*
+    and /v1/typst/* on api.digi-setu.com) — NOT PI_CLOUD_API_BASE
+    (apex, used for /api/usage etc.). The proxy forwards to the
+    api host because that's where the relay lives. See llm_proxy.py
+    docstring for why.
+    """
     monkeypatch.setenv("PI_MODE", "desktop")
-    monkeypatch.setenv("PI_CLOUD_API_BASE", "https://digi-setu.test")
+    monkeypatch.setenv("PI_RELAY_HTTP_BASE", "https://api.digi-setu.test")
+    # Also set the WS base so any code path that derives the HTTP
+    # base from the WS base stays consistent. The two should ALWAYS
+    # point at the same host in tests; production keeps them in sync
+    # via _ws_to_http_scheme().
+    monkeypatch.setenv("PI_RELAY_BASE", "wss://api.digi-setu.test")
 
     import importlib
 
@@ -249,8 +261,10 @@ def test_proxy_strips_incoming_authorization(app, monkeypatch):
 
 def test_proxy_forwards_to_cloud_relay_vertex_path(app, monkeypatch):
     """Verify the URL transform: incoming /llm-proxy/vertex/{rest}
-    forwards to ${PI_CLOUD_API_BASE}/v1/relay/vertex/{rest} verbatim,
-    no path translation."""
+    forwards to ${PI_RELAY_HTTP_BASE}/v1/relay/vertex/{rest} verbatim,
+    no path translation. The relay host MUST be the api subdomain
+    (PI_RELAY_HTTP_BASE), NOT the apex (PI_CLOUD_API_BASE) — the apex
+    apex serves SPA HTML and 405s POSTs to unknown paths."""
     import routes.llm_proxy as _proxy
     captured: dict[str, str] = {}
 
@@ -288,7 +302,7 @@ def test_proxy_forwards_to_cloud_relay_vertex_path(app, monkeypatch):
     resp = client.post(inbound, json={})
     assert resp.status_code == 200
     expected = (
-        "https://digi-setu.test/v1/relay/vertex/v1/projects/my-proj/locations/global"
+        "https://api.digi-setu.test/v1/relay/vertex/v1/projects/my-proj/locations/global"
         "/publishers/anthropic/models/claude-sonnet-4-6:rawPredict"
     )
     assert captured["url"] == expected, (
@@ -343,7 +357,7 @@ def test_typst_search_docs_forwards_to_cloud(app, monkeypatch):
         json={"package": "cetz", "query": "draw a curve"},
     )
     assert resp.status_code == 200
-    assert captured["url"] == "https://digi-setu.test/v1/typst/search_docs"
+    assert captured["url"] == "https://api.digi-setu.test/v1/typst/search_docs"
     assert captured["headers"].get("authorization") == "Bearer REAL-JWT"
     body = resp.json()
     assert body["answer"] == "use canvas + draw.line"
@@ -398,3 +412,270 @@ def test_proxy_health_reports_signin_state(app, monkeypatch):
     body = resp.json()
     assert body["signed_in"] is True
     assert body["cloud"]
+    # The health probe must surface the RELAY HTTP base (api host),
+    # not the apex (PI_CLOUD_API_BASE). If somebody refactors and
+    # accidentally points it at the apex again we want this test to
+    # catch the regression — the original bug took ~3 hours to find
+    # because the symptom (chat hangs) is way downstream of the
+    # misconfigured upstream.
+    assert "api.digi-setu.test" in body["cloud"], (
+        f"health must report PI_RELAY_HTTP_BASE (api host), got {body['cloud']!r}"
+    )
+
+
+def test_relay_http_base_derives_from_relay_ws_base(monkeypatch):
+    """When only PI_RELAY_BASE is set (the canonical knob), the HTTP
+    base must auto-derive by swapping the scheme. This is the
+    contract that lets a single env var control both transports."""
+    monkeypatch.setenv("PI_MODE", "desktop")
+    monkeypatch.setenv("PI_RELAY_BASE", "wss://api.example.test")
+    # Explicitly leave PI_RELAY_HTTP_BASE unset.
+    monkeypatch.delenv("PI_RELAY_HTTP_BASE", raising=False)
+    import importlib
+    import config as _config
+    importlib.reload(_config)
+    assert _config.PI_RELAY_HTTP_BASE == "https://api.example.test"
+
+
+def test_relay_http_base_strips_trailing_slash(monkeypatch):
+    """A trailing slash in either env var would double up as
+    `//v1/relay/...` upstream and silently 404 / 308 the request.
+    Strip on parse so callers don't have to remember."""
+    monkeypatch.setenv("PI_MODE", "desktop")
+    monkeypatch.setenv("PI_RELAY_HTTP_BASE", "https://api.example.test/")
+    import importlib
+    import config as _config
+    importlib.reload(_config)
+    assert _config.PI_RELAY_HTTP_BASE == "https://api.example.test"
+
+
+# ── _proxy_base_url() — Tauri↔sidecar PORT propagation ─────────────
+# These tests pin the contract that broke in production: the Tauri
+# shell launches the sidecar with `--port <free>` (a CLI flag, NOT
+# the PORT env var), so unless the sidecar entry point exports PORT
+# itself, the spawned pi runtime inherits an unset PORT and our
+# helper used to silently fall back to `8000`. On a developer machine
+# with a stale `uvicorn --reload` on :8000, pi's first prompt got
+# `404 {"detail":"Not Found"}` from the WRONG server with no entry in
+# our log. The fix lives in two places:
+#   1. desktop/sidecar/sidecar_main.py — exports PORT after argparse.
+#   2. relay_spawn._proxy_base_url() — raises on the bundled-app
+#      branch when PORT is missing rather than returning the 8000
+#      default. The dev-loop branch (no PI_DESKTOP_PI_DIR) keeps the
+#      legacy default so `uvicorn main:app --port 8000` still works.
+def test_proxy_base_url_uses_port_env(monkeypatch):
+    """When PORT is set, the proxy base must point at the actual
+    bound port. This is the only path the desktop app should ever
+    take in production."""
+    monkeypatch.setenv("PORT", "19299")
+    monkeypatch.delenv("PI_DESKTOP_PI_DIR", raising=False)
+    from services.relay_spawn import _proxy_base_url
+
+    assert _proxy_base_url() == "http://127.0.0.1:19299/llm-proxy"
+
+
+def test_proxy_base_url_raises_in_bundled_app_when_port_missing(monkeypatch):
+    """In the bundled desktop app (PI_DESKTOP_PI_DIR is set by the
+    Tauri shell), an unset PORT is a wiring bug, not a fallback
+    case. Raising surfaces a real error in the sidecar log instead
+    of silently routing pi's LLM calls to whatever stale FastAPI
+    happens to be on :8000.
+    """
+    monkeypatch.delenv("PORT", raising=False)
+    monkeypatch.setenv("PI_DESKTOP_PI_DIR", "/Applications/Digi Setu.app/Contents/Resources/pi-runtime/vendor/pi")
+    from services.relay_spawn import _proxy_base_url
+
+    with pytest.raises(RuntimeError, match="PORT env var is not exported"):
+        _proxy_base_url()
+
+
+def test_proxy_base_url_falls_back_to_8000_in_dev_loop(monkeypatch):
+    """The legacy operator dev loop runs `uvicorn main:app --port 8000`
+    directly with no Tauri shell, so PI_DESKTOP_PI_DIR is unset. In
+    that case keeping the 8000 default preserves the existing dev UX
+    — only the bundled-app branch is opinionated."""
+    monkeypatch.delenv("PORT", raising=False)
+    monkeypatch.delenv("PI_DESKTOP_PI_DIR", raising=False)
+    from services.relay_spawn import _proxy_base_url
+
+    assert _proxy_base_url() == "http://127.0.0.1:8000/llm-proxy"
+
+
+def test_cloud_relay_env_uses_actual_port_not_default_8000(monkeypatch):
+    """End-to-end: when the sidecar exports the bound port the spawn
+    env hands pi a base URL that points at THIS sidecar (not a
+    stale :8000 server). This is the regression test for the
+    ``404 {"detail":"Not Found"}`` mystery — see the docstring on
+    ``relay_spawn._proxy_base_url`` for the full forensic story."""
+    monkeypatch.setenv("PORT", "19299")
+    monkeypatch.delenv("PI_DESKTOP_PI_DIR", raising=False)
+    from services.relay_spawn import cloud_relay_subprocess_env
+
+    out = cloud_relay_subprocess_env(_spec("anthropic-vertex"), {})
+    assert out["ANTHROPIC_VERTEX_BASE_URL"] == "http://127.0.0.1:19299/llm-proxy/vertex/v1"
+    assert out["PI_TYPST_DOCS_REMOTE_URL"] == "http://127.0.0.1:19299/llm-proxy/typst/search_docs"
+
+
+# ── streaming SSE + gzip handling ──────────────────────────────────
+# The cloud relay's ``vertex_passthrough`` propagates upstream bytes
+# verbatim via httpx ``aiter_raw`` but only echoes ``Content-Type``
+# downstream — so gzipped SSE arrives at the desktop with NO
+# ``Content-Encoding: gzip`` header. Pi's SDK can't auto-decompress
+# without the header, parses the gzip magic bytes as garbage SSE
+# frames, and records 0 text + 0 tokens. The user sees their prompt
+# vanish into an empty assistant turn.
+#
+# We can't patch the cloud relay from a desktop unit test, so the
+# desktop-side fix sniffs the first chunk; if it starts with
+# ``1f 8b 08`` (gzip magic) we decompress on the way through and
+# emit plain-bytes SSE downstream — exactly what pi's SDK expects.
+def _make_streaming_response_stub(body_bytes: bytes, content_encoding: str | None,
+                                   content_type: str = "text/event-stream"):
+    """Build httpx-shape stubs the streaming branch expects.
+
+    Returns (StubClient, captured_state) — tests assert on captured
+    state to verify auth + decompression + header propagation.
+    """
+    captured: dict = {}
+
+    class _Headers(dict):
+        def get(self, key, default=None):
+            return super().get(key.lower(), default)
+
+    headers = _Headers()
+    headers["content-type"] = content_type
+    if content_encoding:
+        headers["content-encoding"] = content_encoding
+
+    class _StubResp:
+        status_code = 200
+
+        def __init__(self):
+            self.headers = headers
+
+        async def aiter_raw(self):
+            # Mimic chunked SSE-style delivery so the proxy's gzip
+            # detector has to commit on chunk #1 like real life.
+            for offset in range(0, len(body_bytes), 64):
+                yield body_bytes[offset : offset + 64]
+
+        async def aclose(self):
+            captured["resp_closed"] = True
+
+    class _StubClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def build_request(self, method, url, content=None, headers=None):
+            captured["method"] = method
+            captured["url"] = url
+            captured["body"] = content
+            captured["headers"] = dict(headers or {})
+            return ("REQ", method, url)
+
+        async def send(self, req, stream=True):
+            captured["stream_flag"] = stream
+            return _StubResp()
+
+        async def aclose(self):
+            captured["client_closed"] = True
+
+    return _StubClient, captured
+
+
+def test_streaming_proxy_decompresses_gzip_when_upstream_strips_header(app, monkeypatch):
+    """Reproduces the silent-empty-response bug: cloud relay forwards
+    gzipped Vertex SSE but drops Content-Encoding. The desktop proxy
+    MUST detect the gzip magic bytes and decompress before pi sees
+    the body. Without the fix, pi receives gzipped junk labeled
+    text/event-stream and records 0 tokens / empty content.
+    """
+    import routes.llm_proxy as _proxy
+    monkeypatch.setattr(_proxy, "_fresh_bearer", lambda: "REAL-JWT")
+
+    plain_sse = (
+        b"event: message_start\n"
+        b"data: {\"type\":\"message_start\"}\n\n"
+        b"event: content_block_delta\n"
+        b"data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"Hi\"}}\n\n"
+    )
+    import gzip
+    gzipped = gzip.compress(plain_sse)
+    StubClient, captured = _make_streaming_response_stub(
+        body_bytes=gzipped,
+        content_encoding=None,  # cloud relay's bug: header stripped
+    )
+    monkeypatch.setattr(_proxy.httpx, "AsyncClient", StubClient)
+
+    client = TestClient(app)
+    resp = client.post(
+        "/llm-proxy/vertex/v1/projects/p/locations/global/publishers/anthropic"
+        "/models/claude-sonnet-4-6:streamRawPredict",
+        json={"stream": True, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert resp.status_code == 200
+    # Body MUST be the decompressed SSE stream (pi can parse this).
+    assert resp.content == plain_sse, (
+        "proxy did not decompress gzip-on-the-wire body — pi's SDK "
+        "would record empty content. See routes/llm_proxy.py docstring "
+        "for the full forensic story."
+    )
+    # Since we decompressed, we MUST NOT advertise gzip downstream.
+    assert "content-encoding" not in {k.lower() for k in resp.headers.keys()}
+    assert resp.headers.get("content-type", "").startswith("text/event-stream")
+
+
+def test_streaming_proxy_propagates_upstream_content_encoding_when_present(app, monkeypatch):
+    """Once the cloud relay propagates Content-Encoding (transparent
+    proxy mode), the desktop proxy should forward the header AND
+    yield the body verbatim — pi's SDK will auto-decompress."""
+    import routes.llm_proxy as _proxy
+    monkeypatch.setattr(_proxy, "_fresh_bearer", lambda: "REAL-JWT")
+
+    import gzip
+    plain_sse = b"event: ping\ndata: {\"type\":\"ping\"}\n\n"
+    gzipped = gzip.compress(plain_sse)
+    StubClient, captured = _make_streaming_response_stub(
+        body_bytes=gzipped,
+        content_encoding="gzip",  # cloud relay propagates header
+    )
+    monkeypatch.setattr(_proxy.httpx, "AsyncClient", StubClient)
+
+    client = TestClient(app)
+    resp = client.post(
+        "/llm-proxy/vertex/v1/projects/p/locations/global/publishers/anthropic"
+        "/models/claude-sonnet-4-6:streamRawPredict",
+        json={"stream": True, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert resp.status_code == 200
+    # When upstream advertised gzip, we forwarded raw bytes + the
+    # encoding header. TestClient + httpx handle the decompress for
+    # us; we just check the header reached the client.
+    assert resp.headers.get("content-encoding") == "gzip"
+
+
+def test_streaming_proxy_passes_plain_body_through(app, monkeypatch):
+    """Defensive: when upstream sends plain (non-gzipped) SSE, the
+    sniffer must NOT corrupt it — neither decompress nor add a stale
+    Content-Encoding header."""
+    import routes.llm_proxy as _proxy
+    monkeypatch.setattr(_proxy, "_fresh_bearer", lambda: "REAL-JWT")
+
+    plain_sse = b"event: hello\ndata: {\"x\":1}\n\n"
+    StubClient, captured = _make_streaming_response_stub(
+        body_bytes=plain_sse,
+        content_encoding=None,
+    )
+    monkeypatch.setattr(_proxy.httpx, "AsyncClient", StubClient)
+
+    client = TestClient(app)
+    resp = client.post(
+        "/llm-proxy/vertex/v1/projects/p/locations/global/publishers/anthropic"
+        "/models/claude-sonnet-4-6:streamRawPredict",
+        json={"stream": True, "messages": []},
+    )
+    assert resp.status_code == 200
+    assert resp.content == plain_sse
+    assert "content-encoding" not in {k.lower() for k in resp.headers.keys()}
