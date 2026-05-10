@@ -191,6 +191,36 @@ if ($ExeSrc) {
 if ($env:TRUSTED_SIGNING_DLIB_PATH -and $env:TRUSTED_SIGNING_ENDPOINT -and
     $env:TRUSTED_SIGNING_ACCOUNT   -and $env:TRUSTED_SIGNING_PROFILE) {
     Log "Azure Trusted Signing detected — signing artefacts"
+
+    # signtool.exe ships with the Windows SDK but isn't on default PATH on
+    # the windows-latest GHA runner. Search the Windows Kits install for
+    # the newest SDK that has signtool.exe and use its absolute path.
+    $signtool = $null
+    if ($env:SIGNTOOL_EXE -and (Test-Path $env:SIGNTOOL_EXE)) {
+        $signtool = $env:SIGNTOOL_EXE
+    } else {
+        $cmd = Get-Command signtool.exe -ErrorAction SilentlyContinue
+        if ($cmd) { $signtool = $cmd.Source }
+    }
+    if (-not $signtool) {
+        $kitRoots = @(
+            "${env:ProgramFiles(x86)}\Windows Kits\10\bin",
+            "${env:ProgramFiles}\Windows Kits\10\bin"
+        )
+        foreach ($root in $kitRoots) {
+            if (-not (Test-Path $root)) { continue }
+            $found = Get-ChildItem -Path $root -Recurse -Filter signtool.exe `
+                -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } |
+                Sort-Object FullName -Descending | Select-Object -First 1
+            if ($found) { $signtool = $found.FullName; break }
+        }
+    }
+    if (-not $signtool) {
+        throw "signtool.exe not found — install the Windows SDK or set `$env:SIGNTOOL_EXE"
+    }
+    Log "using signtool: $signtool"
+
     foreach ($artefact in @($ExeOut, $MsiOut)) {
         if ($artefact -and (Test-Path $artefact)) {
             $metadata = @{
@@ -200,10 +230,11 @@ if ($env:TRUSTED_SIGNING_DLIB_PATH -and $env:TRUSTED_SIGNING_ENDPOINT -and
             } | ConvertTo-Json -Compress
             $metaFile = [System.IO.Path]::GetTempFileName() + ".json"
             $metadata | Out-File -FilePath $metaFile -Encoding ASCII
-            & signtool sign /v /debug /fd SHA256 /tr "http://timestamp.acs.microsoft.com" `
+            & $signtool sign /v /debug /fd SHA256 /tr "http://timestamp.acs.microsoft.com" `
                 /td SHA256 /dlib $env:TRUSTED_SIGNING_DLIB_PATH /dmdf $metaFile $artefact
+            $rc = $LASTEXITCODE
             Remove-Item $metaFile -Force
-            if ($LASTEXITCODE -ne 0) { throw "signtool failed for $artefact" }
+            if ($rc -ne 0) { throw "signtool failed for $artefact (exit $rc)" }
             Log "signed: $artefact"
         }
     }
