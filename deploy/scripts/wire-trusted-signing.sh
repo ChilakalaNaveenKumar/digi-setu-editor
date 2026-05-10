@@ -29,7 +29,7 @@
 
 set -euo pipefail
 
-REPO="${GITHUB_REPO:-ChilakalaNaveenKumar/digi-setu-editor}"
+REPO="${GITHUB_REPO:-nchilaka-create/DIGI-SETU}"
 SP_NAME="${SP_NAME:-digi-setu-trusted-signing}"
 
 C_OK=$'\033[1;32m'

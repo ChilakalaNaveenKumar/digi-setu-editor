@@ -24,15 +24,19 @@
 #     the GHA Windows + Linux release jobs (those upload .exe / .msi /
 #     .deb / .AppImage to digi-setu.com/downloads/).
 #
-# Why GitHub for Windows: Bitbucket Cloud has no Windows runners. We
-# could attach a self-hosted Windows runner with the label "windows"
-# but that needs a Windows host on the team's network. GHA's free
-# windows-latest runners are simpler.
-#
-# Why macOS isn't here: Tauri's macOS bundler must run under macOS,
-# and Apple notarisation needs the dev's own Developer ID. The Mac
-# DMG stays a `bash desktop/scripts/release.sh --mac` from a dev's
-# laptop — automated with `make release-mac` if you prefer.
+# Why GitHub for Windows + macOS: Bitbucket Cloud has no Windows or
+# macOS hosted runners — only Linux. We mirror tags to GitHub so
+# .github/workflows/release.yml can produce:
+#   - Windows .exe + .msi   (windows-latest runner, signed via
+#                            Azure Trusted Signing when configured)
+#   - macOS arm64 .dmg      (macos-15 runner, native M-series build)
+#   - macOS Intel .dmg      (macos-15-intel runner, native x86_64;
+#                            available until Aug 2027 per GitHub's
+#                            Intel runner roadmap)
+# Linux .deb stays here on Bitbucket so we don't double our private-
+# repo GHA minute spend. AppImage is held back (FUSE not available
+# on cloud Bitbucket runners; needs a self-hosted runner with
+# /dev/fuse to land).
 #
 # Required pipeline variables (Repository settings → Pipelines → Variables):
 #
@@ -55,9 +59,9 @@
 #   GCP_ZONE              us-central1-a
 #
 #   ── for the GitHub-mirror step ──────────────────────────────────
-#   GH_MIRROR_TOKEN       GitHub PAT with `repo` + `workflow` scope
-#                         on ChilakalaNaveenKumar/digi-setu-editor
-#   GH_MIRROR_URL         https://github.com/ChilakalaNaveenKumar/digi-setu-editor.git
+#   GH_MIRROR_TOKEN       GitHub PAT with Contents + Workflows + Secrets
+#                         (Read+Write) on nchilaka-create/DIGI-SETU
+#   GH_MIRROR_REPO        nchilaka-create/DIGI-SETU
 #                         (override only if you fork / rename)
 
 image: ubuntu:22.04
@@ -251,7 +255,7 @@ definitions:
           - "/tmp/Digi-Setu-*-amd64.AppImage"
 
     # ── 4. Mirror to GitHub so GHA can build Windows ───────────────
-    # Pushing the same commit + tags to ChilakalaNaveenKumar/digi-setu-editor
+    # Pushing the same commit + tags to nchilaka-create/DIGI-SETU
     # automatically triggers .github/workflows/release.yml on every
     # `v*.*.*` tag, which produces the Windows .exe / .msi (signed
     # via Azure Trusted Signing when secrets are configured).
@@ -262,7 +266,7 @@ definitions:
           - apk add --no-cache git
           - git config --global user.email "ci@digi-setu.com"
           - git config --global user.name "Bitbucket Pipelines"
-          - git remote add github "https://x-access-token:${GH_MIRROR_TOKEN}@github.com/${GH_MIRROR_REPO:-ChilakalaNaveenKumar/digi-setu-editor}.git"
+          - git remote add github "https://x-access-token:${GH_MIRROR_TOKEN}@github.com/${GH_MIRROR_REPO:-nchilaka-create/DIGI-SETU}.git"
           # Bitbucket clones shallow by default; --no-shallow-since avoids
           # the "did not receive expected object" pack-negotiation error
           # that sinks fresh pushes to an empty / divergent target.

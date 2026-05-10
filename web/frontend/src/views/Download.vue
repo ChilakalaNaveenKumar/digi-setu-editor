@@ -39,7 +39,7 @@ import { Icon } from "@iconify/vue";
 const APP_VERSION = "0.1.0";
 
 const MACOS_ARM_DMG = `Digi-Setu-${APP_VERSION}-arm64.dmg`;
-const MACOS_INTEL_DMG = `Digi-Setu-${APP_VERSION}-x64.dmg`;
+const MACOS_INTEL_DMG = `Digi-Setu-${APP_VERSION}-x86_64.dmg`;
 const LINUX_DEB = `Digi-Setu-${APP_VERSION}-amd64.deb`;
 const LINUX_APPIMAGE = `Digi-Setu-${APP_VERSION}-amd64.AppImage`;
 const WINDOWS_EXE = `Digi-Setu-${APP_VERSION}-x64-setup.exe`;
@@ -88,11 +88,8 @@ const platform = computed<Platform>(() => {
 const primaryHref = computed(() => {
   switch (platform.value) {
     case "mac-arm": return `/downloads/${MACOS_ARM_DMG}`;
-    // Intel Mac: x86_64 .dmg isn't built yet (release.sh is host-only and
-    // we don't have an Intel runner). Apple Silicon DMG runs fine on
-    // Intel via Rosetta 2, so point Intel visitors at the arm64 build
-    // rather than handing them a guaranteed 404.
-    case "mac-intel": return `/downloads/${MACOS_ARM_DMG}`;
+    // Native Intel DMG built on macos-15-intel — no Rosetta needed.
+    case "mac-intel": return `/downloads/${MACOS_INTEL_DMG}`;
     case "linux-deb": return `/downloads/${LINUX_DEB}`;
     case "linux-appimage": return `/downloads/${LINUX_APPIMAGE}`;
     case "windows": return `/downloads/${WINDOWS_EXE}`;
@@ -103,7 +100,7 @@ const primaryHref = computed(() => {
 const primaryLabel = computed(() => {
   switch (platform.value) {
     case "mac-arm": return "Download for macOS (Apple Silicon)";
-    case "mac-intel": return "Download for macOS (Apple Silicon · runs on Intel via Rosetta)";
+    case "mac-intel": return "Download for macOS (Intel)";
     case "linux-deb": return "Download .deb for Linux";
     case "linux-appimage": return "Download AppImage for Linux";
     case "windows": return "Download for Windows";
@@ -135,14 +132,15 @@ const firstLaunchKind = computed<"mac" | "windows" | "linux">(() => {
 // matching artefact is uploaded. They control whether a row in the
 // "All downloads" grid is a live link or a "Coming soon" placeholder.
 //
-// macOS Apple Silicon: built locally via release.sh on a Sonoma+ M-series
-// host. macOS Intel x86_64: held back because release.sh today only builds
-// for the host architecture (arm64) and we don't have a hosted Intel Mac
-// runner; cross-compiling to x86_64 from arm64 needs the right rust target
-// + universal2 PyInstaller bundle. Tracked separately — flip macIntelAvailable
-// the moment we ship a real `Digi-Setu-X.Y.Z-x64.dmg`.
+// macOS Apple Silicon (arm64): produced by GHA's `macos-arm` job
+// (.github/workflows/release.yml) on every v*.*.* tag, AND can still
+// be built locally with `release.sh --mac` on an M-series Mac.
+// macOS Intel (x86_64): produced by GHA's `macos-intel` job on the
+// macos-15-intel runner (the only Intel runner GitHub still ships,
+// available until Aug 2027). The PyInstaller sidecar is built natively
+// on that Intel runner, so the resulting DMG runs without Rosetta.
 const macArmAvailable = true;
-const macIntelAvailable = false;
+const macIntelAvailable = true;
 // .deb covers Ubuntu/Debian/Mint/Pop!_OS — easily 80%+ of Linux desktop
 // installs. .AppImage is held back because Tauri 2's bundler downloads
 // its own copy of `linuxdeploy.AppImage` and execs it directly, which

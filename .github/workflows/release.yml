@@ -1,14 +1,26 @@
 # GitHub Actions release workflow.
 #
+# Job split (kept this way deliberately):
+#   - windows      : .exe + .msi  (only place these CAN be built — NSIS
+#                                    + WiX are Windows-only binaries)
+#   - macos-arm    : arm64 .dmg   (macos-15 hosted runner, M-series)
+#   - macos-intel  : x86_64 .dmg  (macos-15-intel hosted runner; the only
+#                                    Intel runner GitHub still ships,
+#                                    available until Aug 2027 per their
+#                                    deprecation roadmap)
+#   - linux .deb   : NOT here    — Bitbucket's `linux-release` step
+#                                    already produces and uploads it;
+#                                    duplicating on GHA wastes private-
+#                                    repo minutes for zero benefit.
+#
 # Why this exists alongside desktop/scripts/release.sh:
-#   - release.sh builds macOS natively + Linux in a local Docker
-#     container. Windows builds need a real Windows host (cargo can
-#     cross-link to MSVC, but Tauri's NSIS + WiX bundlers are
-#     Windows-only binaries).
-#   - GitHub-hosted runners give us free Windows + Linux compute,
-#     so we offload Windows builds here and leave macOS as the
-#     dev's local artefact (Apple notarisation requires the dev's
-#     own Developer ID anyway).
+#   - release.sh builds macOS + Linux locally on a dev's laptop. Windows
+#     builds need a real Windows host. GHA's hosted Mac/Windows runners
+#     remove the Windows requirement and add reproducible Mac builds.
+#   - GitHub-hosted runners are the cheapest way to get all three OSes
+#     without owning Mac mini + Windows hardware. Mac jobs are 10× the
+#     billed minutes of Linux on private repos, but our release cadence
+#     keeps us well under the 2,000 min/mo free-plan quota.
 #
 # Triggers:
 #   - Tag push matching v*.*.*       → builds + uploads every artefact
@@ -184,12 +196,20 @@ jobs:
             desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
             desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
 
-  linux:
-    # Optional: redundant with the local Docker build (release.sh --linux),
-    # but mirrors Windows's flow for the day we add tagged release automation.
-    # Comment this job out if you only want Windows-on-CI.
-    runs-on: ubuntu-22.04
-    timeout-minutes: 45
+  # NOTE — Linux .deb builds are NOT done here.
+  # Bitbucket Pipelines (`linux-release` step in bitbucket-pipelines.yml)
+  # already builds + uploads the .deb on every main + tag push. Doing it
+  # twice would double our private-repo GHA minute spend for zero benefit.
+  # If you ever migrate Linux off Bitbucket, restore the previous `linux:`
+  # job from git history.
+
+  # ── macOS arm64 (Apple Silicon) ─────────────────────────────────────
+  # Output: Digi-Setu-<version>-arm64.dmg
+  # Runs on M-series GitHub-hosted Mac. Native PyInstaller + Tauri build,
+  # ad-hoc codesign (no Apple Developer ID), DMG via create-dmg.
+  macos-arm:
+    runs-on: macos-15            # M-series; arm64 native
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -200,17 +220,9 @@ jobs:
         run: |
           [[ -n "$GCP_SA_KEY" ]] && echo "has_gcp=true" >> "$GITHUB_OUTPUT" || echo "has_gcp=false" >> "$GITHUB_OUTPUT"
 
-      - name: Install Tauri 2 system deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libgtk-3-dev libsoup-3.0-dev libwebkit2gtk-4.1-dev \
-            libayatana-appindicator3-dev librsvg2-dev xdg-utils \
-            libssl-dev libffi-dev fakeroot dpkg-dev
-
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-gnu
+          targets: aarch64-apple-darwin
 
       - uses: actions/setup-node@v4
         with: { node-version: 22 }
@@ -224,7 +236,12 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             desktop/src-tauri/target
-          key: cargo-linux-${{ hashFiles('desktop/src-tauri/Cargo.lock') }}
+          key: cargo-macos-arm-${{ hashFiles('desktop/src-tauri/Cargo.lock') }}
+
+      - name: Install create-dmg + Pillow
+        run: |
+          brew install create-dmg
+          python3 -m pip install --quiet Pillow
 
       - if: steps.flags.outputs.has_gcp == 'true'
         uses: google-github-actions/auth@v2
@@ -234,60 +251,154 @@ jobs:
       - if: steps.flags.outputs.has_gcp == 'true'
         uses: google-github-actions/setup-gcloud@v2
 
-      - name: Stage build env (Clerk keys come straight from GHA secrets)
+      - name: Stage backend/.env so release.sh --local-env picks up Clerk + cloud-target keys
         shell: bash
         env:
           CLERK_PUBLISHABLE_KEY_PROD: ${{ secrets.CLERK_PUBLISHABLE_KEY_PROD }}
-          CLERK_SECRET_KEY_PROD: ${{ secrets.CLERK_SECRET_KEY_PROD }}
+          CLERK_SECRET_KEY_PROD:      ${{ secrets.CLERK_SECRET_KEY_PROD }}
         run: |
+          mkdir -p desktop/backend
           {
             echo "CLERK_PUBLISHABLE_KEY_PROD=$CLERK_PUBLISHABLE_KEY_PROD"
             echo "CLERK_SECRET_KEY_PROD=$CLERK_SECRET_KEY_PROD"
             echo "PI_CLOUD_API_BASE=https://digi-setu.com"
             echo "PI_RELAY_BASE=https://api.digi-setu.com"
             echo "CLERK_TENANT=prod"
-          } > .release-secrets.tmp.env
+          } > desktop/backend/.env
+          chmod 0600 desktop/backend/.env
 
-      - name: Build (PyInstaller sidecar + frontend + Tauri Linux bundle)
+      - name: Build mac DMG (release.sh --mac --local-env --no-upload)
         env:
-          TAURI_BUILD_ENV: ${{ github.workspace }}/.release-secrets.tmp.env
-          # build-linux-inside.sh defaults WORKSPACE to /workspace for
-          # the dockerised path; on a hosted runner the repo lives at
-          # $GITHUB_WORKSPACE so we override here.
-          WORKSPACE: ${{ github.workspace }}
+          APP_VERSION: ${{ env.APP_VERSION }}
         run: |
-          export DEBIAN_FRONTEND=noninteractive
-          export TZ=Etc/UTC
-          # Reuse the same in-container script we use locally — runners
-          # have all the prereqs the Dockerfile installs, so we skip
-          # the Docker layer and execute the steps directly.
-          bash desktop/scripts/build-linux-inside.sh
+          # --local-env  → release.sh reads desktop/backend/.env (we just staged it)
+          # --no-upload  → CI controls the upload below; release.sh's smoke-test
+          #                 needs gcloud + curl against the eventual public URL,
+          #                 which is brittle to do mid-job.
+          bash desktop/scripts/release.sh --mac --local-env --no-upload
 
-      - name: Upload artefacts to digi-setu.com (only if SA key provided)
+      - name: Upload .dmg to digi-setu.com (only if SA key provided)
         if: steps.flags.outputs.has_gcp == 'true'
         env:
           GCP_PROJECT: ${{ secrets.GCP_PROJECT || 'digi-setu-dev' }}
           GCP_VM:      ${{ secrets.GCP_VM      || 'digi-setu-live' }}
           GCP_ZONE:    ${{ secrets.GCP_ZONE    || 'us-central1-a' }}
         run: |
-          # Tauri writes the .deb under desktop/build-out/linux/deb/ as
-          # `Digi Setu_<version>_amd64.deb` (with a space + underscores).
-          # Pass an explicit remote filename so /downloads/ uses the
-          # dash-normalised form Download.vue links to.
-          DEB=$(ls desktop/build-out/linux/deb/*.deb 2>/dev/null | head -n1 || true)
-          if [[ -n "$DEB" ]]; then
-            bash deploy/scripts/upload-installer.sh "$DEB" "Digi-Setu-${APP_VERSION}-amd64.deb"
+          DMG="/tmp/Digi-Setu-${APP_VERSION}-arm64.dmg"
+          if [[ -f "$DMG" ]]; then
+            bash deploy/scripts/upload-installer.sh "$DMG"
           else
-            echo "::warning::no .deb produced under desktop/build-out/linux/deb/"
-          fi
-          APPIMG=$(ls desktop/build-out/linux/appimage/*.AppImage 2>/dev/null | head -n1 || true)
-          if [[ -n "$APPIMG" ]]; then
-            bash deploy/scripts/upload-installer.sh "$APPIMG" "Digi-Setu-${APP_VERSION}-amd64.AppImage"
+            echo "::warning::no arm64 .dmg produced at $DMG"
+            ls -la /tmp/Digi-Setu-* || true
           fi
 
       - uses: actions/upload-artifact@v4
         with:
-          name: linux-installers
+          name: macos-arm-dmg
+          path: /tmp/Digi-Setu-*-arm64.dmg
+
+  # ── macOS Intel (x86_64) ─────────────────────────────────────────────
+  # Output: Digi-Setu-<version>-x86_64.dmg
+  # Why a separate Intel job:
+  #   - Cross-compiling the Rust + Tauri side from arm64 to x86_64 IS
+  #     possible (`rustup target add x86_64-apple-darwin`), but our
+  #     PyInstaller-frozen sidecar is host-arch-locked. Building it on
+  #     a real Intel runner is the only way to ship a true x86_64 DMG
+  #     that doesn't rely on Rosetta.
+  #   - GitHub introduced `macos-15-intel` in Sep 2025 as the
+  #     replacement for the deprecated macos-13 runner. Available
+  #     until Aug 2027; that's our window for native Intel builds.
+  #   - When August 2027 hits and the Intel runner goes away, switch
+  #     this job to a `tauri build --target universal-apple-darwin` on
+  #     macos-15 — but ONLY after auditing the Python wheels we depend
+  #     on (cryptography, pydantic-core, etc.) ship universal2 wheels,
+  #     otherwise PyInstaller's --target-arch=universal2 fails to lipo.
+  macos-intel:
+    runs-on: macos-15-intel      # x86_64 native; available through Aug 2027
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: flags
+        shell: bash
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+        run: |
+          [[ -n "$GCP_SA_KEY" ]] && echo "has_gcp=true" >> "$GITHUB_OUTPUT" || echo "has_gcp=false" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+
+      - uses: actions/cache@v4
+        with:
           path: |
-            desktop/build-out/linux/deb/*.deb
-            desktop/build-out/linux/appimage/*.AppImage
+            ~/.cargo/registry
+            ~/.cargo/git
+            desktop/src-tauri/target
+          key: cargo-macos-intel-${{ hashFiles('desktop/src-tauri/Cargo.lock') }}
+
+      - name: Install create-dmg + Pillow
+        run: |
+          brew install create-dmg
+          python3 -m pip install --quiet Pillow
+
+      - if: steps.flags.outputs.has_gcp == 'true'
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - if: steps.flags.outputs.has_gcp == 'true'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Stage backend/.env so release.sh --local-env picks up Clerk + cloud-target keys
+        shell: bash
+        env:
+          CLERK_PUBLISHABLE_KEY_PROD: ${{ secrets.CLERK_PUBLISHABLE_KEY_PROD }}
+          CLERK_SECRET_KEY_PROD:      ${{ secrets.CLERK_SECRET_KEY_PROD }}
+        run: |
+          mkdir -p desktop/backend
+          {
+            echo "CLERK_PUBLISHABLE_KEY_PROD=$CLERK_PUBLISHABLE_KEY_PROD"
+            echo "CLERK_SECRET_KEY_PROD=$CLERK_SECRET_KEY_PROD"
+            echo "PI_CLOUD_API_BASE=https://digi-setu.com"
+            echo "PI_RELAY_BASE=https://api.digi-setu.com"
+            echo "CLERK_TENANT=prod"
+          } > desktop/backend/.env
+          chmod 0600 desktop/backend/.env
+
+      - name: Build mac DMG (release.sh --mac --local-env --no-upload)
+        env:
+          APP_VERSION: ${{ env.APP_VERSION }}
+        run: |
+          # release.sh detects host arch via `uname -m` → x86_64 here →
+          # produces Digi-Setu-<v>-x86_64.dmg. The PyInstaller sidecar
+          # is built on the same Intel runner, so it's a true native
+          # x86_64 binary (no Rosetta needed at runtime).
+          bash desktop/scripts/release.sh --mac --local-env --no-upload
+
+      - name: Upload .dmg to digi-setu.com (only if SA key provided)
+        if: steps.flags.outputs.has_gcp == 'true'
+        env:
+          GCP_PROJECT: ${{ secrets.GCP_PROJECT || 'digi-setu-dev' }}
+          GCP_VM:      ${{ secrets.GCP_VM      || 'digi-setu-live' }}
+          GCP_ZONE:    ${{ secrets.GCP_ZONE    || 'us-central1-a' }}
+        run: |
+          DMG="/tmp/Digi-Setu-${APP_VERSION}-x86_64.dmg"
+          if [[ -f "$DMG" ]]; then
+            bash deploy/scripts/upload-installer.sh "$DMG"
+          else
+            echo "::warning::no x86_64 .dmg produced at $DMG"
+            ls -la /tmp/Digi-Setu-* || true
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-intel-dmg
+          path: /tmp/Digi-Setu-*-x86_64.dmg
