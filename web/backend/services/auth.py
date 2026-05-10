@@ -34,6 +34,7 @@ Why a thin wrapper over the SDK and not the SDK directly:
 from __future__ import annotations
 
 import sys
+from dataclasses import dataclass
 from typing import Optional
 
 from fastapi import HTTPException, Request, WebSocket, status
@@ -372,3 +373,170 @@ def is_admin_user(user_id: str) -> bool:
             file=sys.stderr,
         )
     return is_admin
+
+
+# ── relay-principal (LLM relay only) ──────────────────────────────────
+#
+# The LLM relay (routes/llm_relay.py) is the cloud-facing edge of the
+# desktop "local pi, cloud auth" path: a desktop laptop spawns
+# pi-coding-agent in-process so file ops happen on the user's disk, but
+# every Anthropic / Vertex call gets re-routed through api.digi-setu.com
+# so we never ship Application Default Credentials to the laptop.
+#
+# That edge needs a leaner auth contract than the SPA's `require_user`:
+#   - bearer-only (no cookies — the desktop pi-proxy talks pure HTTP)
+#   - returns plan + admin in one shot so the relay can fan out to
+#     plan-gating and budget checks without re-querying Clerk
+#   - returns the JWT's `jti` so we can later add a replay cache without
+#     rewriting the dependency
+#
+# We keep the old verifier untouched — `require_user` is still the
+# right tool for cookie-bearing SPA traffic, and `optional_user` for
+# the rate-limit hook on /api/usage. This is just a sibling.
+
+@dataclass(frozen=True)
+class RelayPrincipal:
+    """Resolved identity for one /v1/relay/* call.
+
+    `plan` is materialised here (not lazy-looked-up later) so a
+    constant-time `principal.plan` access in the relay's hot loop never
+    touches the SQLite billing DB more than once. `admin` short-circuits
+    plan-gating + budget checks for operators.
+    """
+
+    user_id: str
+    plan: str
+    admin: bool
+    jti: Optional[str]
+    exp: Optional[int]
+
+
+def _bearer_from_request(request: Request) -> Optional[str]:
+    """Extract the JWT from `Authorization: Bearer <token>`.
+
+    The relay deliberately ignores cookies — it's called from the
+    desktop pi-proxy (services/relay_bridge.py on the desktop side),
+    which is just an HTTP forwarder and has no browser context.
+    Cookie-only requests must go through the SPA path (`require_user`).
+    """
+    raw = request.headers.get("authorization") or request.headers.get("Authorization") or ""
+    if not raw:
+        return None
+    # Tolerate `Bearer  <jwt>` (extra space) and `bearer <jwt>` (lowercase).
+    parts = raw.strip().split(None, 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return None
+    token = parts[1].strip()
+    return token or None
+
+
+def _verify_clerk_payload(request: Request) -> Optional[dict]:
+    """Run Clerk's `authenticate_request` and return the full claims
+    payload, or None if the JWT is missing / invalid / expired.
+
+    Lifted from `_get_verifier` and `optional_session` — this returns
+    the WHOLE payload (not just `sub`) because the relay needs `jti`
+    + `exp` for future replay caching.
+    """
+    try:
+        from clerk_backend_api import (  # type: ignore
+            authenticate_request,
+            AuthenticateRequestOptions,
+        )
+    except ImportError:
+        return None
+
+    opts = AuthenticateRequestOptions(secret_key=CLERK_SECRET_KEY)
+    try:
+        state = authenticate_request(request, opts)
+    except Exception as exc:  # pragma: no cover — defensive
+        print(f"[auth.relay] clerk verify raised: {exc}", file=sys.stderr)
+        return None
+    if not state.is_signed_in:
+        reason = getattr(state, "reason", None) or "unknown"
+        print(
+            f"[auth.relay] clerk verify rejected: reason={reason!r}",
+            file=sys.stderr,
+        )
+        return None
+    payload = state.payload or {}
+    return dict(payload) if isinstance(payload, dict) else None
+
+
+def verify_relay_jwt(request: Request) -> RelayPrincipal:
+    """FastAPI dependency for /v1/relay/* endpoints.
+
+    Verifies the bearer JWT, materialises the user's plan + admin flag,
+    and returns the structured `RelayPrincipal`. Raises 401 on missing
+    / invalid / expired tokens.
+
+    Use as:
+        @router.post("/v1/relay/anthropic/...")
+        async def fwd(principal: RelayPrincipal = Depends(verify_relay_jwt)):
+            ...
+
+    Notes:
+      * `_bearer_from_request` is only used in dev mode for the empty-
+        bearer fast-fail. In prod we still let `_verify_clerk_payload`
+        do the full extraction (Clerk's SDK accepts both bearer and
+        cookie shapes; we want bearer-only here, so we pre-check).
+      * In dev (`AUTH_REQUIRED=False`) we synthesise a permissive
+        principal with the dev plan default — exactly mirrors the
+        existing dev-loop short-circuit in `optional_user`.
+    """
+    if not AUTH_REQUIRED:
+        from services.billing import CreditLedger  # local import (cycle)
+
+        plan = CreditLedger.instance().get_plan_id(DEV_USER_ID)
+        return RelayPrincipal(
+            user_id=DEV_USER_ID,
+            plan=plan,
+            admin=True,
+            jti=None,
+            exp=None,
+        )
+
+    if _bearer_from_request(request) is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="missing bearer token",
+            headers={"WWW-Authenticate": 'Bearer realm="relay"'},
+        )
+
+    payload = _verify_clerk_payload(request)
+    if payload is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="invalid or expired session",
+            headers={"WWW-Authenticate": 'Bearer realm="relay"'},
+        )
+
+    sub = payload.get("sub")
+    if not (isinstance(sub, str) and sub):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="missing subject claim",
+        )
+
+    jti = payload.get("jti") if isinstance(payload.get("jti"), str) else None
+    exp = payload.get("exp") if isinstance(payload.get("exp"), (int, float)) else None
+
+    # Resolve plan via the billing ledger (Stripe webhook is its source
+    # of truth). Admins are forced to enterprise here so the relay's
+    # plan-gating + budget checks treat them identically to a paying
+    # power user — same code path, just unconstrained.
+    admin = is_admin_user(sub)
+    if admin:
+        plan = "enterprise"
+    else:
+        from services.billing import CreditLedger  # local import (cycle)
+
+        plan = CreditLedger.instance().get_plan_id(sub)
+
+    return RelayPrincipal(
+        user_id=sub,
+        plan=plan,
+        admin=admin,
+        jti=jti,
+        exp=int(exp) if exp is not None else None,
+    )

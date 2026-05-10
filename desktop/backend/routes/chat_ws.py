@@ -350,33 +350,45 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
                 )
 
     # ── Dispatch: local pi vs cloud relay vs sign-in modal ──────────
-    # Three branches in priority order:
+    # Four branches in priority order:
     #
     #   1. BYOK_MODE on AND the picked model has a BYOK route
-    #      → fall through to the existing local pi spawn below.
+    #      → spawn local pi with the user's own keys. Cheapest +
+    #        fastest, files persist locally. Existing path.
     #
-    #   2. The picked model has no BYOK route (either because we're
-    #      not in BYOK mode at all, or because BYOK is on but the
-    #      user has no key compatible with this model's family)
-    #      → if the user has a cached Clerk session, hand off to the
-    #        cloud relay (`api.digi-setu.com/v1/ws/desktop-relay`)
-    #        and return — the relay owns the WS lifetime from there.
-    #      → if the user is NOT signed in, close with a clear
-    #        sign-in / upgrade message. Frontend ModelPicker gates
-    #        this client-side too, but we keep the backend check as
-    #        belt-and-braces defence.
+    #   2. Signed in (cached Clerk session) AND the picked model has
+    #      a relay route (anthropic / google)
+    #      → spawn LOCAL pi but configure it to call our localhost
+    #        proxy (routes/llm_proxy.py), which JWT-injects and
+    #        forwards to ${PI_CLOUD_API_BASE}/v1/relay/*. Files
+    #        persist locally because pi runs on the laptop; ADC
+    #        stays on the VM because pi never sees it. This is the
+    #        new default for non-BYOK signed-in users.
     #
-    # The relay branch is what turns "no Vertex creds on a stranger's
-    # laptop" into "log in, pay subscription, chat works". See
-    # docs/desktop-architecture.md §2 for the full architecture.
+    #   3. Signed in but the picked model has no relay route (future
+    #      provider types — none today)
+    #      → fall back to the cloud-relay WebSocket
+    #        (`api.digi-setu.com/v1/ws/desktop-relay`). Pi runs on
+    #        the VM in this branch, so files won't persist locally —
+    #        same caveat as before commit 3.
+    #
+    #   4. Not signed in AND no BYOK route → close with a clear
+    #      sign-in / upgrade message. Frontend ModelPicker gates
+    #      this client-side too, but we keep the backend check as
+    #      belt-and-braces defence.
+    use_cloud_relay = False
     if active_model_spec is not None:
         from services.byok import byok_provider_for as _byok_pf  # noqa: E402
 
         has_byok_route = BYOK_MODE and _byok_pf(active_model_spec) is not None
 
         if not has_byok_route:
-            # Picked model can't be served locally. Route to relay.
+            # Picked model can't be served by a local BYOK key. Pick
+            # between local-pi-via-relay and the WS-relay fallback.
             from routes.desktop_auth import get_cached_desktop_session  # noqa: E402
+            from services.relay_spawn import (  # noqa: E402
+                cloud_relay_provider_for,
+            )
 
             cached = get_cached_desktop_session()
             if cached is None:
@@ -401,33 +413,50 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
                 await ws.close(code=4402 if BYOK_MODE else 4401)
                 return
 
-            bearer_token, _cached_user = cached
-            try:
-                from services.relay_bridge import proxy_to_relay  # noqa: E402
-
-                await proxy_to_relay(
-                    ws,
-                    bearer_token=bearer_token,
-                    user_id=user_id,
-                )
-            except Exception as exc:
-                # Last-resort guard: if the bridge itself blew up
-                # (uncommon — proxy_to_relay catches its own errors),
-                # surface a clean error rather than a 1011 close. The
-                # raw exception is logged; the UI sees only "network".
-                log_error(
-                    "network",
-                    session_id=session_id,
-                    user_id=user_id,
-                    exc=exc,
-                    where="cloud_relay",
-                )
+            relay_provider = cloud_relay_provider_for(active_model_spec)
+            if relay_provider is not None:
+                # NEW: spawn pi LOCALLY but route LLM calls through
+                # the cloud relay over HTTP. PiSession will set
+                # ANTHROPIC_BASE_URL / GOOGLE_GEMINI_BASE_URL to the
+                # localhost proxy and strip ADC hints from the env;
+                # the proxy injects the cached JWT before forwarding.
+                # Files end up on the user's local disk because pi's
+                # cwd is workspace_path on this machine.
+                use_cloud_relay = True
+                # Fall through to the local pi spawn below — do NOT
+                # return.
+            else:
+                # No relay route for this model's provider (future
+                # provider types). Last-resort: WS relay where pi
+                # runs on the VM. Files won't persist locally on this
+                # branch, but at least the chat works.
+                bearer_token, _cached_user = cached
                 try:
-                    await ws.send_json(bridge_error("network"))
-                    await ws.close(code=1011)
-                except Exception:
-                    pass
-            return
+                    from services.relay_bridge import proxy_to_relay  # noqa: E402
+
+                    await proxy_to_relay(
+                        ws,
+                        bearer_token=bearer_token,
+                        user_id=user_id,
+                    )
+                except Exception as exc:
+                    # Last-resort guard: if the bridge itself blew up
+                    # (uncommon — proxy_to_relay catches its own errors),
+                    # surface a clean error rather than a 1011 close. The
+                    # raw exception is logged; the UI sees only "network".
+                    log_error(
+                        "network",
+                        session_id=session_id,
+                        user_id=user_id,
+                        exc=exc,
+                        where="cloud_relay",
+                    )
+                    try:
+                        await ws.send_json(bridge_error("network"))
+                        await ws.close(code=1011)
+                    except Exception:
+                        pass
+                return
 
     permission_mode = user_prefs().get_permission_mode(user_id, plan_id=plan_id)
     # Materialise the per-user live file before spawn so the extension's
@@ -442,6 +471,7 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
         permission_mode=permission_mode,
         permission_mode_file=permission_mode_file,
         user_id=user_id,
+        use_cloud_relay=use_cloud_relay,
     )
 
     # Tell the SPA which model actually got loaded (may differ from

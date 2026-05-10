@@ -444,6 +444,45 @@ function isValidThoughtSignature(signature) {
   );
 }
 
+// ── 11. google-vertex.js: honour GOOGLE_VERTEX_BASE_URL when set ────────
+//
+// The ``@google/genai`` SDK natively respects ``GOOGLE_VERTEX_BASE_URL``
+// — but ONLY when ``httpOptions.baseUrl`` isn't supplied to the
+// constructor. pi-ai's ``google-vertex.js`` wrapper passes a hardcoded
+// ``model.baseUrl`` (e.g. ``"https://aiplatform.googleapis.com"``)
+// from ``models.generated.js``, which silently overrides the env var.
+//
+// For the desktop "local pi via cloud relay" path
+// (``services/relay_spawn.py``) we need to redirect pi's Vertex SDK at
+// our localhost JWT-injecting proxy. Patching the wrapper to prefer
+// the env var when set is the smallest possible change — model
+// registry stays identical, and the env var is a no-op everywhere
+// else (cloud build doesn't set it, BYOK doesn't set it).
+//
+// ``@anthropic-ai/vertex-sdk`` already honours
+// ``ANTHROPIC_VERTEX_BASE_URL`` natively because pi-ai's
+// ``anthropic-vertex.js`` wrapper does NOT pass a baseURL — so no
+// equivalent patch is needed for the Anthropic side.
+{
+  const f = join(PI_AI, "dist/providers/google-vertex.js");
+  patch(
+    f,
+    `function buildHttpOptions(model, optionsHeaders) {
+    const httpOptions = {};
+    const baseUrl = resolveCustomBaseUrl(model.baseUrl);`,
+    `function buildHttpOptions(model, optionsHeaders) {
+    const httpOptions = {};
+    // Patched (digi-setu/patches §11): GOOGLE_VERTEX_BASE_URL wins
+    // over model.baseUrl. Used by the desktop local-pi-via-relay path
+    // so the SDK posts to our localhost proxy instead of Vertex
+    // directly. Without this patch the env var is silently shadowed.
+    const envBaseUrl = (process.env.GOOGLE_VERTEX_BASE_URL || "").trim();
+    const baseUrl = envBaseUrl || resolveCustomBaseUrl(model.baseUrl);`,
+    "google-vertex: prefer GOOGLE_VERTEX_BASE_URL env over model.baseUrl",
+    "GOOGLE_VERTEX_BASE_URL wins over model.baseUrl",
+  );
+}
+
 // ── 10. google-shared.js: one-line debug log when a signature is dropped.
 //       Quiet by default, gated on PI_VERTEX_GEMINI_DEBUG. ───────────────
 {

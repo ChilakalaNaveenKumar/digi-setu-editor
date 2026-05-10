@@ -221,6 +221,51 @@ def is_allowed(model_id: str, plan_id: str) -> bool:
     return _PLAN_RANK.get(plan_id, 0) >= _PLAN_RANK.get(spec.min_plan, 99)
 
 
+def assert_model_allowed_for_plan(model_id: str, plan_id: str) -> None:
+    """Plan-gating helper for the LLM relay's edge endpoints.
+
+    Raises HTTPException 403 with a structured detail when:
+      * `model_id` is not in our catalogue at all (defense-in-depth —
+        the relay must not forward arbitrary model strings to Vertex,
+        otherwise a malicious client could ask for `claude-opus-9.0`
+        and we'd faithfully proxy + bill the call).
+      * `plan_id` is below the model's `min_plan`.
+
+    Returns None on success. Lifted into its own helper so the relay
+    route handler can call it inline (`assert_model_allowed_for_plan(...)`)
+    without each route reinventing the error shape.
+    """
+    from fastapi import HTTPException  # local — keeps import cost down
+
+    spec = _BY_ID.get(model_id)
+    if spec is None:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "model_not_found",
+                "model": model_id,
+                "message": (
+                    f"Model {model_id!r} is not in the relay catalogue. "
+                    "Pick one of the supported ids from /api/models."
+                ),
+            },
+        )
+    if not is_allowed(model_id, plan_id):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "plan_too_low",
+                "model": model_id,
+                "min_plan": spec.min_plan,
+                "your_plan": plan_id,
+                "message": (
+                    f"{spec.name} requires the {spec.min_plan} plan or higher; "
+                    f"you're on {plan_id}."
+                ),
+            },
+        )
+
+
 def pick_default_for_plan(plan_id: str) -> str:
     """Return the cheapest model id allowed on `plan_id`. Used at
     session-spawn time when the session record predates model selection

@@ -732,6 +732,16 @@ class CreditLedger:
             rec = self._bucket(user_id)
             return float(rec["spent_usd"]) < plan.monthly_credit_usd
 
+    def remaining_credit_usd(self, user_id: str) -> float:
+        """Cents-precision headroom left this month. Negative-clamped so
+        an over-spent user reads as 0 instead of "you owe us $0.01"."""
+        if _is_admin_user(user_id):
+            return float("inf")
+        with self._lock:
+            plan = plan_for(self._plan.get(user_id, self._fallback_plan_locked()))
+            rec = self._bucket(user_id)
+            return max(0.0, plan.monthly_credit_usd - float(rec["spent_usd"]))
+
     def note_cost(
         self,
         user_id: str,
@@ -894,3 +904,52 @@ class CreditLedger:
             "prompts": int(rec.get("prompts", 0)),
             "stripe_customer_id": self._stripe_customer.get(user_id),
         }
+
+
+# ── module-level convenience for the LLM relay ─────────────────────
+def check_relay_budget(user_id: str, plan: str, est_cents: int = 5) -> None:
+    """Pre-call gate for /v1/relay/* endpoints.
+
+    Raises 402 (Payment Required) with a JSON-friendly detail when the
+    user has already burnt their monthly credit AND the projected cost
+    of this call would push them further into the red.
+
+    `est_cents` is a coarse upper-bound per request; we use it to add a
+    little slack so a user landing exactly at $20.00 of $20 credit
+    isn't allowed to fire one more $5 Sonnet turn that puts them at
+    $20.05 spent. Default 5¢ matches the median Sonnet turn.
+
+    Why a separate gate (vs. just `note_cost` after the call): once we
+    start the upstream stream we've already paid Vertex AI for the
+    request, even if we drop the bytes on the floor. Better to refuse
+    cheaply at the front door.
+
+    Admins / unmetered plans are short-circuited (`remaining_credit_usd`
+    returns inf for admins). Returns None on success, raises HTTPException
+    on denial.
+    """
+    # Quick exit for admins and the dev loop. We re-check via the ledger
+    # so a flag flip from `is_admin_user` is honoured live (no caching).
+    if _is_admin_user(user_id):
+        return
+
+    remaining = CreditLedger.instance().remaining_credit_usd(user_id)
+    needed = max(0.0, float(est_cents) / 100.0)
+    if remaining < needed:
+        # Build a structured detail so the desktop sidecar can surface a
+        # plan-aware "you've used 100% of your March credits" toast
+        # instead of a raw 402.
+        from fastapi import HTTPException
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "code": "credit_exhausted",
+                "plan": plan,
+                "remaining_usd": round(remaining, 4),
+                "needed_usd": round(needed, 4),
+                "message": (
+                    "Monthly credit exhausted on the "
+                    f"{plan} plan — upgrade or wait for the next billing cycle."
+                ),
+            },
+        )

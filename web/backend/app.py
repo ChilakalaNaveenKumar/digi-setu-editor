@@ -68,6 +68,7 @@ from routes import (
     files,
     fs,
     health,
+    llm_relay,
     models as models_route,
     prefs,
     sessions,
@@ -155,6 +156,11 @@ def create_app() -> FastAPI:
     # Requires services/auth's subprotocol-bearer support to be wired,
     # which it is (see _WsRequestish + _bearer_from_subprotocol).
     app.include_router(desktop_relay.router)
+    # LLM relay — HTTP edge for desktop "local pi, cloud auth" mode.
+    # Forwards Anthropic / Vertex calls with ADC injection, plan
+    # gating, rate limiting, and per-call billing. See
+    # routes/llm_relay.py for the full threat model.
+    app.include_router(llm_relay.router)
 
     # Public (unauth) auth-side endpoints: webhook + feedback.
     # auth_webhook is Clerk-signature-verified; feedback requires a

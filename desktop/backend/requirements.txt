@@ -26,5 +26,12 @@ svix==1.92.2
 cryptography==45.0.6
 google-auth==2.42.1
 
+# httpx is the streaming HTTP client used by routes/llm_proxy.py to
+# forward locally-spawned pi's LLM calls to the cloud relay. Already
+# arrives transitively via clerk-backend-api but we pin it explicitly
+# so a future Clerk SDK bump can't accidentally break the localhost
+# proxy.
+httpx==0.28.1
+
 # Test runner. Only needed for `pytest`; not pulled into the prod image.
 pytest==9.0.3

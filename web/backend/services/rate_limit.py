@@ -71,6 +71,15 @@ _BUCKETS: dict[str, tuple[int, float]] = {
     # User prompts within a session.
     "chat.message": (_int_env("RL_CHAT_MSG_CAPACITY", 20),
                      _int_env("RL_CHAT_MSG_PER_MIN", 30) / 60.0),
+    # LLM-relay messages (desktop local-pi cloud auth path). Separate
+    # from `chat.message` because the relay is a different transport:
+    # one chat WS may fan out to many provider calls (multi-step agents,
+    # retries, sub-LLM tools), and we don't want a 30-msg/min ceiling on
+    # the WS to silently throttle a perfectly normal multi-tool turn.
+    # 60-burst / 120-per-min matches an aggressive but realistic agent
+    # loop (one turn ≈ 5–10 provider calls; sustained 12 turns/min).
+    "relay.message": (_int_env("RL_RELAY_CAPACITY", 60),
+                      _int_env("RL_RELAY_PER_MIN", 120) / 60.0),
     # Feedback submissions (anti-spam).
     "feedback":    (_int_env("RL_FEEDBACK_CAPACITY", 3),
                     _int_env("RL_FEEDBACK_PER_HOUR", 5) / 3600.0),
@@ -319,3 +328,20 @@ class RateLimiter:
                 "messages_today": int(rec.get("messages", 0)),
                 "limits": limits,
             }
+
+
+# ── module-level convenience for the LLM relay ─────────────────────
+def consume_user_quota(user_id: str) -> None:
+    """Charge one slot of the `relay.message` bucket for `user_id`.
+
+    Raises 429 if the bucket is empty (with `Retry-After`). Admins are
+    NOT bypassed at the bucket layer because a runaway script holding
+    an admin JWT could DOS the VM regardless of paying status — the
+    rate limiter is a system-protection measure, not a billing gate
+    (the credit gate sits in billing.check_relay_budget).
+
+    Defined as a module-level function (not a `RateLimiter` method) so
+    the relay route handler can inject it as a `Depends(...)` straight
+    out of the import — same shape the SPA uses for its own check.
+    """
+    RateLimiter.instance().check(user_id, "relay.message")

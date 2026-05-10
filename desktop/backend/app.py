@@ -67,6 +67,7 @@ from routes import (
     files,
     fs,
     health,
+    llm_proxy,
     models as models_route,
     prefs,
     sessions,
@@ -178,6 +179,12 @@ def create_app() -> FastAPI:
     app.include_router(models_route.router)
     app.include_router(billing.router)
     app.include_router(prefs.router)
+    # Localhost LLM proxy — JWT-injecting forwarder for non-BYOK
+    # signed-in users running pi locally. Targets the cloud relay at
+    # ${PI_CLOUD_API_BASE}/v1/relay/* (see web/backend/routes/llm_relay.py).
+    # Bound to 127.0.0.1 by the sidecar's listen address; not reachable
+    # from the network.
+    app.include_router(llm_proxy.router)
 
     return app
 

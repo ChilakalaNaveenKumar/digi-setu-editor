@@ -413,7 +413,22 @@ class PiSession:
         permission_mode: str = "ask",
         permission_mode_file: Optional[Path] = None,
         user_id: Optional[str] = None,
+        use_cloud_relay: bool = False,
     ):
+        # `use_cloud_relay` is the third spawn flavour (alongside BYOK
+        # and the operator's local-Vertex dev loop). The dispatcher in
+        # routes/chat_ws.py sets it to True when:
+        #   * the user has a cached Clerk session (signed-in), AND
+        #   * the picked model has no BYOK route on this laptop.
+        # In that case _build_subprocess_cmd KEEPS the existing
+        # ``anthropic-vertex`` / ``google-vertex`` provider (no
+        # registry changes needed) and just redirects the SDK base URL
+        # at our localhost JWT-injecting proxy (routes/llm_proxy.py),
+        # which forwards to a Vertex-shape passthrough endpoint on the
+        # cloud relay. The flag is plumbed here (rather than detected
+        # inside _build_subprocess_cmd) so unit tests + the dispatcher
+        # have one explicit toggle to control.
+        self._use_cloud_relay = bool(use_cloud_relay)
         self.session_id = session_id
         # user_id is ATTRIBUTION ONLY for the docker label set —
         # services/container_pool.py uses it to enforce the per-user
@@ -700,6 +715,7 @@ class PiSession:
 
         active_provider = self._provider
         spec = get_model(self._model)
+        byok_chosen = False
         if BYOK_MODE and spec is not None:
             pick = byok_provider_for(spec)
             if pick is not None:
@@ -709,6 +725,33 @@ class PiSession:
                 # arg list, _container_env if it ever ran in this
                 # branch) see the updated value too. Subprocess is
                 # the only path that hits this in desktop today.
+                self._provider = active_provider
+                byok_chosen = True
+
+        # ── Cloud-relay-via-HTTP rerouting ───────────────────────────
+        # When the dispatcher tagged this session for cloud-relay AND
+        # we didn't end up on a BYOK route (which always wins — the
+        # user's own keys are cheaper than our subsidised relay), swap
+        # the provider for the direct Anthropic / Google SDK and point
+        # its base URL at our localhost JWT-injecting proxy. The proxy
+        # forwards to ${PI_CLOUD_API_BASE}/v1/relay/* which validates
+        # the user's Clerk JWT, enforces plan + budget gates, and
+        # injects ADC before talking to Vertex.
+        #
+        # Critical invariant: when this branch runs the spawned pi
+        # NEVER has access to GOOGLE_APPLICATION_CREDENTIALS or any
+        # Vertex routing flags — see relay_spawn.cloud_relay_subprocess_env.
+        # ADC stays on the VM. Always.
+        if self._use_cloud_relay and spec is not None and not byok_chosen:
+            from services.relay_spawn import (  # noqa: E402
+                cloud_relay_provider_for,
+                cloud_relay_subprocess_env,
+            )
+
+            relay_provider = cloud_relay_provider_for(spec)
+            if relay_provider is not None:
+                env = cloud_relay_subprocess_env(spec, env)
+                active_provider = relay_provider
                 self._provider = active_provider
 
         # Per-session overrides win over env.sh defaults.
