@@ -35,6 +35,7 @@ import { useUiStore } from "../stores/ui";
 import { useWorkspaceStore } from "../stores/workspace";
 import { downloadFile as apiDownloadFile } from "../api/files";
 import { highlightLines, langForPath } from "../lib/highlighter";
+import { useFloatingMenu } from "../lib/floating-menu";
 import DiffView from "./tools/DiffView.vue";
 import CodeEditor from "./CodeEditor.vue";
 import EditorTabs from "./EditorTabs.vue";
@@ -100,6 +101,15 @@ const editorPrefs = useEditorPrefsStore();
 const { autoSave, autoSaveDelayMs } = storeToRefs(editorPrefs);
 const showAutoSaveMenu = ref(false);
 
+// Trigger button + popover refs feed useFloatingMenu so the popover
+// teleports to <body>, anchors fixed to the trigger, flips up when
+// the editor pane is squashed against the bottom of the window, and
+// caps maxHeight so the delay input never disappears off-screen.
+const autoSaveTriggerRef = ref<HTMLButtonElement | null>(null);
+const autoSavePopoverRef = ref<HTMLDivElement | null>(null);
+const { menuStyle: autoSaveMenuStyle, reposition: repositionAutoSaveMenu } =
+  useFloatingMenu(autoSaveTriggerRef, { width: 224, height: 280, align: "right" });
+
 const autoSaveLabel = computed(() => {
   switch (autoSave.value) {
     case "afterDelay":
@@ -116,12 +126,21 @@ function setAutoSaveMode(mode: AutoSaveMode): void {
 }
 
 function toggleAutoSaveMenu(): void {
+  if (!showAutoSaveMenu.value) {
+    repositionAutoSaveMenu();
+  }
   showAutoSaveMenu.value = !showAutoSaveMenu.value;
 }
 
 function closeAutoSaveMenu(): void {
   showAutoSaveMenu.value = false;
 }
+
+watch(showAutoSaveMenu, async (v) => {
+  if (!v) return;
+  await nextTick();
+  repositionAutoSaveMenu();
+});
 
 function onDirty(next: boolean): void {
   dirty.value = next;
@@ -233,7 +252,15 @@ function onKeydown(e: KeyboardEvent): void {
 }
 function onClickOutsideAutoSave(e: MouseEvent): void {
   if (!showAutoSaveMenu.value) return;
-  const target = e.target as HTMLElement | null;
+  // The popover is now teleported to <body>, so checking the editor-
+  // header alone would close the menu the moment the user clicked any
+  // option inside it. Allow clicks on the trigger AND the teleported
+  // popover; close on anything else.
+  const targetNode = e.target as Node | null;
+  if (!targetNode) return;
+  if (autoSaveTriggerRef.value && autoSaveTriggerRef.value.contains(targetNode)) return;
+  if (autoSavePopoverRef.value && autoSavePopoverRef.value.contains(targetNode)) return;
+  const target = targetNode as HTMLElement;
   // The popover and its toggle live in the editor header; if the click
   // was anywhere else, close. We rely on the popover stopping its own
   // click events (see @click.stop on the menu) so internal clicks
@@ -528,6 +555,7 @@ watch(
              via useEditorPrefsStore. -->
         <div v-if="isEditableMode" class="relative">
           <button
+            ref="autoSaveTriggerRef"
             type="button"
             class="flex items-center gap-1 rounded-sm border border-border bg-background px-1.5 py-0.5 font-mono text-caption text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
             :title="`Auto-save: ${autoSaveLabel}. Click to change.`"
@@ -540,17 +568,25 @@ watch(
             <span class="hide-on-narrow">{{ autoSaveLabel }}</span>
             <Icon icon="codicon:chevron-down" class="h-3 w-3 opacity-60" />
           </button>
-          <Transition
-            enter-active-class="transition duration-100 ease-out"
-            enter-from-class="opacity-0 -translate-y-1"
-            leave-active-class="transition duration-75 ease-in"
-            leave-to-class="opacity-0 -translate-y-1"
-          >
-            <div
-              v-if="showAutoSaveMenu"
-              class="absolute right-0 top-full z-30 mt-1 w-56 rounded-md border border-border bg-popover py-1 text-popover-foreground shadow-lg"
-              @click.stop
+          <!-- Teleport so the popover escapes the editor-pane's
+               overflow:hidden box (the editor body uses overflow-auto
+               for syntax highlighting) and stays clickable on tiny
+               windows. Position + flip + maxHeight come from
+               useFloatingMenu via autoSaveMenuStyle. -->
+          <Teleport to="body">
+            <Transition
+              enter-active-class="transition duration-100 ease-out"
+              enter-from-class="opacity-0 -translate-y-1"
+              leave-active-class="transition duration-75 ease-in"
+              leave-to-class="opacity-0 -translate-y-1"
             >
+              <div
+                v-if="showAutoSaveMenu"
+                ref="autoSavePopoverRef"
+                :style="autoSaveMenuStyle"
+                class="z-50 max-h-[calc(100vh-16px)] overflow-y-auto overflow-x-hidden rounded-md border border-border bg-popover py-1 text-popover-foreground shadow-lg"
+                @click.stop
+              >
               <div class="px-3 py-1.5 text-caption uppercase tracking-wide text-muted-foreground">
                 Auto-save
               </div>
@@ -589,8 +625,9 @@ watch(
                   />
                 </label>
               </div>
-            </div>
-          </Transition>
+              </div>
+            </Transition>
+          </Teleport>
         </div>
 
         <span v-if="currentFile" class="hide-on-narrow font-mono uppercase tracking-wide">

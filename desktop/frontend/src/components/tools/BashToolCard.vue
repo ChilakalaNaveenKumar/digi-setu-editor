@@ -21,10 +21,11 @@
     • Open in Terminal Pane
 -->
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { useChatStore } from "../../stores/chat";
 import { isBackgroundCommand, useTerminalsStore } from "../../stores/terminals";
 import { getHighlighter } from "../../lib/highlighter";
+import { useFloatingMenu } from "../../lib/floating-menu";
 import type { ToolCall } from "../../types/rpc";
 
 const props = defineProps<{ call: ToolCall }>();
@@ -185,11 +186,28 @@ const hiddenLineCount = computed(() => {
   return Math.max(0, outputLines.value.length - PREVIEW_LINES);
 });
 
-// ── … menu ──────────────────────────────────────────────────────────────
+// ── ⋯ menu ──────────────────────────────────────────────────────────────
+//
+// The menu used to be `<div class="absolute right-0 top-6 z-20 w-48">`,
+// which clipped at the bottom of the chat scroll on tool cards rendered
+// near the viewport edge — users couldn't see "Copy output" / "Re-run"
+// / "Open in Terminal Pane". Now it teleports to <body>, positions
+// itself fixed via useFloatingMenu, and flips up automatically when
+// there's no room below the trigger.
 const menuOpen = ref(false);
 const menuRef = ref<HTMLDivElement | null>(null);
+const menuTriggerRef = ref<HTMLButtonElement | null>(null);
+const menuPopoverRef = ref<HTMLDivElement | null>(null);
+
+const { menuStyle, reposition: repositionMenu } = useFloatingMenu(
+  menuTriggerRef,
+  { width: 192, height: 160, align: "right" },
+);
 
 function toggleMenu(): void {
+  if (!menuOpen.value) {
+    repositionMenu();
+  }
   menuOpen.value = !menuOpen.value;
 }
 
@@ -197,9 +215,18 @@ function closeMenu(): void {
   menuOpen.value = false;
 }
 
+watch(menuOpen, async (v) => {
+  if (!v) return;
+  await nextTick();
+  repositionMenu();
+});
+
 function onDocClick(e: MouseEvent): void {
-  if (!menuRef.value) return;
-  if (!menuRef.value.contains(e.target as Node)) closeMenu();
+  const target = e.target as Node;
+  if (menuTriggerRef.value && menuTriggerRef.value.contains(target)) return;
+  if (menuPopoverRef.value && menuPopoverRef.value.contains(target)) return;
+  if (menuRef.value && menuRef.value.contains(target)) return;
+  closeMenu();
 }
 
 onMounted(() => document.addEventListener("click", onDocClick));
@@ -309,48 +336,57 @@ const runtimeBadge = computed(() => {
       <!-- ⋯ MENU TRIGGER -->
       <div ref="menuRef" class="relative">
         <button
+          ref="menuTriggerRef"
           type="button"
           class="flex h-5 w-5 items-center justify-center rounded-sm text-muted-foreground hover:bg-accent hover:text-foreground"
           :title="menuOpen ? 'Close menu' : 'More actions'"
           @click.stop="toggleMenu"
         >⋯</button>
 
-        <div
-          v-if="menuOpen"
-          class="absolute right-0 top-6 z-20 w-48 overflow-hidden rounded-md border border-border bg-card shadow-lg"
-          @click.stop
-        >
-          <button
-            type="button"
-            class="flex w-full items-center justify-between px-3 py-1.5 text-left text-body text-foreground hover:bg-accent"
-            :disabled="!command"
-            @click="copyCommand"
+        <!-- Teleport so the popover escapes the chat scroll's
+             overflow:hidden box and can render anywhere on the
+             viewport without being clipped. Position + flip + maxHeight
+             come from useFloatingMenu via menuStyle. -->
+        <Teleport to="body">
+          <div
+            v-if="menuOpen"
+            ref="menuPopoverRef"
+            :style="menuStyle"
+            class="z-50 max-h-[calc(100vh-16px)] overflow-y-auto overflow-x-hidden rounded-md border border-border bg-card shadow-lg"
+            @click.stop
           >
-            <span>Copy command</span>
-            <span v-if="copiedFlash === 'command'" class="text-success text-caption">copied ✓</span>
-          </button>
-          <button
-            type="button"
-            class="flex w-full items-center justify-between px-3 py-1.5 text-left text-body text-foreground hover:bg-accent"
-            :disabled="!output"
-            @click="copyOutput"
-          >
-            <span>Copy output</span>
-            <span v-if="copiedFlash === 'output'" class="text-success text-caption">copied ✓</span>
-          </button>
-          <div class="border-t border-border" />
-          <button
-            type="button"
-            class="block w-full px-3 py-1.5 text-left text-body text-foreground hover:bg-accent"
-            :disabled="!command || isStreaming"
-            @click="rerun"
-          >Re-run command</button>
-          <button
-            type="button"
-            class="block w-full px-3 py-1.5 text-left text-body text-foreground hover:bg-accent"
-            @click="openInTerminal"
-          >Open in Terminal Pane</button>
-        </div>
+            <button
+              type="button"
+              class="flex w-full items-center justify-between px-3 py-1.5 text-left text-body text-foreground hover:bg-accent"
+              :disabled="!command"
+              @click="copyCommand"
+            >
+              <span>Copy command</span>
+              <span v-if="copiedFlash === 'command'" class="text-success text-caption">copied ✓</span>
+            </button>
+            <button
+              type="button"
+              class="flex w-full items-center justify-between px-3 py-1.5 text-left text-body text-foreground hover:bg-accent"
+              :disabled="!output"
+              @click="copyOutput"
+            >
+              <span>Copy output</span>
+              <span v-if="copiedFlash === 'output'" class="text-success text-caption">copied ✓</span>
+            </button>
+            <div class="border-t border-border" />
+            <button
+              type="button"
+              class="block w-full px-3 py-1.5 text-left text-body text-foreground hover:bg-accent"
+              :disabled="!command || isStreaming"
+              @click="rerun"
+            >Re-run command</button>
+            <button
+              type="button"
+              class="block w-full px-3 py-1.5 text-left text-body text-foreground hover:bg-accent"
+              @click="openInTerminal"
+            >Open in Terminal Pane</button>
+          </div>
+        </Teleport>
       </div>
     </div>
 

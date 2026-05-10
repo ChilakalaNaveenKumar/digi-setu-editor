@@ -107,14 +107,15 @@ function openOverflowMenu(e: MouseEvent): void {
   e.preventDefault();
   e.stopPropagation();
   const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-  // Anchor under the button, right-aligned.
-  menu.value = {
-    open: true,
-    x: rect.right - 240,
-    y: rect.bottom + 2,
-    path: null,
-    overflow: true,
-  };
+  // Anchor under the button, right-aligned. Clamp Y inside the
+  // viewport so a deep overflow list (lots of open tabs) doesn't run
+  // off the bottom of the screen — the menu's `max-h-[calc(100vh-…)]
+  // overflow-y-auto` then turns the rest into a scroll region.
+  const menuW = 240;
+  const menuH = 320;
+  const x = Math.max(8, Math.min(rect.right - menuW, window.innerWidth - menuW - 8));
+  const y = Math.max(8, Math.min(rect.bottom + 2, window.innerHeight - menuH - 8));
+  menu.value = { open: true, x, y, path: null, overflow: true };
 }
 
 function pickFromOverflow(path: string): void {
@@ -125,7 +126,14 @@ function pickFromOverflow(path: string): void {
 function openMenu(e: MouseEvent, path: string): void {
   e.preventDefault();
   e.stopPropagation();
-  menu.value = { open: true, x: e.clientX, y: e.clientY, path, overflow: false };
+  // Clamp the right-click position so the menu doesn't disappear off
+  // the bottom-right of the viewport on edge-row right-clicks. The
+  // menu is short (3-5 items), so 220×180 is a safe natural size.
+  const menuW = 220;
+  const menuH = 180;
+  const x = Math.max(8, Math.min(e.clientX, window.innerWidth - menuW - 8));
+  const y = Math.max(8, Math.min(e.clientY, window.innerHeight - menuH - 8));
+  menu.value = { open: true, x, y, path, overflow: false };
 }
 
 function closeMenu(): void {
@@ -245,8 +253,8 @@ const hasTabs = computed(() => openTabs.value.length > 0);
     <Teleport to="body">
       <div
         v-if="menu.open"
-        class="fixed z-[60] min-w-[200px] max-w-[320px] overflow-hidden rounded-md border border-border bg-card shadow-lg"
-        :style="{ left: `${Math.max(menu.x, 8)}px`, top: `${menu.y}px` }"
+        class="fixed z-[60] min-w-[200px] max-w-[320px] max-h-[calc(100vh-16px)] overflow-y-auto overflow-x-hidden rounded-md border border-border bg-card shadow-lg"
+        :style="{ left: `${menu.x}px`, top: `${menu.y}px` }"
         @click.stop
         @contextmenu.prevent
       >
