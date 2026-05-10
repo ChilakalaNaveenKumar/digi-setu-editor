@@ -421,14 +421,9 @@ sudo systemctl restart pi.service
 sleep 5
 sudo systemctl status --no-pager pi.service | sed -n '1,12p'
 
-# Caddyfile is bind-mounted — '\''up -d'\'' does NOT detect that change on
-# its own. Reload Caddy in-place so config edits go live without
+# Caddyfile is bind-mounted; compose up does NOT detect that change
+# on its own. Reload Caddy in-place so config edits go live without
 # dropping in-flight TLS connections.
-# (Using single-quotes around 'up -d' instead of backticks — the
-#  whole heredoc is a bash double-quoted string, and backticks would
-#  get expanded as command substitution by the local shell BEFORE
-#  the payload is sent over ssh, which previously blew up with
-#  "up: command not found" on the runner.)
 if sudo docker ps --format '{{.Names}}' | grep -q '^pi-caddy$'; then
   sudo docker exec pi-caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile || \\
     sudo docker compose --env-file ${REMOTE_ROOT}/stack.env -f ${REMOTE_ROOT}/docker-compose.yml restart caddy
