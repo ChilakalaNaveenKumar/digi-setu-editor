@@ -48,7 +48,13 @@ const errMsg = ref("");
 
 const redirectUrl = computed(() => {
   const next = route.query.next;
-  return typeof next === "string" && next.startsWith("/") ? next : "/";
+  if (typeof next === "string" && next.startsWith("/")) return next;
+  // Default landing after sign-in: /start auto-resolves the user's
+  // most recent chat (or mints one for first-time accounts) and
+  // replaces itself with /chat/<sid>?wsid=<wsid>. That cuts the
+  // post-sign-in click depth from "land on / → click 'Continue' →
+  // land on /sessions → click a chat" down to zero.
+  return "/start";
 });
 
 async function handoff(): Promise<void> {

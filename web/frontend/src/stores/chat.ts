@@ -116,6 +116,144 @@ export const useChatStore = defineStore("chat", () => {
   const connState = ref<ConnState>("idle");
   const isStreaming = ref(false);
   const lastError = ref<string | null>(null);
+  // Stable error code that produced `lastError`. Lets the UI render a
+  // dedicated card for terminal codes (`session_kicked`, `too_many_chats`)
+  // rather than the bottom strip used for transient ones.
+  const lastErrorCode = ref<string | null>(null);
+
+  // ── Transient error suppression ────────────────────────────────────
+  //
+  // The bridge calls onState("error", code) the INSTANT a WS attempt
+  // fails — but the bridge ALSO immediately schedules an exponential-
+  // backoff reconnect (see chat-bridge.ts). For most transient codes
+  // (network blip, momentary unreachable, send-failed during a half-
+  // closed socket) the next attempt succeeds within 1-3 seconds, so
+  // surfacing a giant "Connection lost" card right away just makes
+  // the UI flash red for one second and then disappear when the
+  // reconnect lands. Users called this out as flickering ("man and
+  // when an error occured and even if you reload or refresh
+  // flickering occurs").
+  //
+  // We absorb that flicker by quarantining transient codes for a
+  // grace window: the chat store keeps the error pending in
+  // `_transientPending` and shows a small "Reconnecting…" pill
+  // instead. If `connState` flips back to "open" before the window
+  // expires we silently drop the pending error and the user sees
+  // nothing. Otherwise it escalates to the full error card.
+  //
+  // Terminal codes (auth, quota, kicked, …) skip the grace and
+  // surface the card immediately — there's no point absorbing them
+  // because no auto-retry will fix them.
+  const TRANSIENT_CODES: ReadonlySet<string> = new Set([
+    "network",
+    "ws_unreachable",
+    "ws_error",
+    "ws_send_failed",
+    "not_connected",
+    "capacity",
+    "internal", // catch-all backend errors during reconnect handshake
+  ]);
+  const TRANSIENT_GRACE_MS = 3000;
+  const _transientPending = ref<string | null>(null);
+  let _transientPendingTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function _cancelTransientPending(): void {
+    if (_transientPendingTimer) {
+      clearTimeout(_transientPendingTimer);
+      _transientPendingTimer = null;
+    }
+    _transientPending.value = null;
+  }
+
+  function _setError(code: string | null): void {
+    if (!code) {
+      _cancelTransientPending();
+      lastError.value = null;
+      lastErrorCode.value = null;
+      return;
+    }
+    if (TRANSIENT_CODES.has(code)) {
+      // Don't replace an already-shown HARD error with a transient
+      // pending — terminal cards win. (Edge case: backend sends
+      // `quota_exceeded`, then the WS closes and the bridge fires
+      // a `network` close right after. We want the quota card to
+      // stay put.)
+      if (lastErrorCode.value && !TRANSIENT_CODES.has(lastErrorCode.value)) {
+        return;
+      }
+      _transientPending.value = code;
+      if (_transientPendingTimer) clearTimeout(_transientPendingTimer);
+      _transientPendingTimer = setTimeout(() => {
+        _transientPendingTimer = null;
+        // Promote pending → real card (only if still pending and
+        // we're still not connected).
+        if (_transientPending.value && connState.value !== "open") {
+          const promoted = _transientPending.value;
+          _transientPending.value = null;
+          lastErrorCode.value = promoted;
+          lastError.value = _localiseError(promoted);
+        } else {
+          _transientPending.value = null;
+        }
+      }, TRANSIENT_GRACE_MS);
+      return;
+    }
+    // Terminal code — surface immediately and clear any transient
+    // pending so the card replaces the pill.
+    _cancelTransientPending();
+    lastErrorCode.value = code;
+    lastError.value = _localiseError(code);
+  }
+  function clearError(): void {
+    _setError(null);
+  }
+
+  // Reactive watcher on connState — when the bridge reports "open"
+  // again, drop any pending transient error so the pill disappears
+  // before its grace timer would have fired.
+  watch(connState, (state) => {
+    if (state === "open") _cancelTransientPending();
+  });
+
+  // Pi auto-compaction status (`compaction_start` / `compaction_end`
+  // RPC events from pi-mono — see pi-mono/.../agent-session.ts). The
+  // summary is persisted to pi's session JSONL and used as context
+  // for the next prompt automatically; this state object only drives
+  // the UI affordance ("Summarising long history…" pill while in
+  // flight, "History summarised" toast for ~8s after).
+  //
+  // `null` = idle (no compaction has fired in this lifetime, or the
+  // post-success toast has timed out). The post-success window keeps
+  // `active: false` so the UI can render the success badge without
+  // the spinner.
+  interface CompactionState {
+    active: boolean;
+    reason: string;
+    finishedAt: number | null;
+    succeeded: boolean | null;
+    errorMessage: string | null;
+  }
+  const compactionState = ref<CompactionState | null>(null);
+  function dismissCompaction(): void {
+    compactionState.value = null;
+  }
+
+  // Computed view exposed to the chat UI: are we mid-reconnect on a
+  // transient failure? Used by the connection pill so the user gets a
+  // soft "Reconnecting…" affordance instead of the full error card
+  // flickering on/off during a 1-2s WS retry.
+  const isReconnecting = computed(
+    () => _transientPending.value !== null
+      || (connState.value === "connecting" && messages.value.length > 0),
+  );
+
+  // Computed view: is this the very first connect for an empty chat?
+  // The chat surface renders a centred "Connecting…" loader instead
+  // of an empty MessageList while we wait for the first WS open.
+  const isInitialConnecting = computed(
+    () => connState.value === "connecting" && messages.value.length === 0
+      && !lastErrorCode.value,
+  );
   // Set by `abort()`, cleared by the connect()-side bridge state handler
   // when the WS subsequently closes. Used to silently respawn pi after
   // a user-driven abort instead of stranding the chat in "Connection
@@ -383,7 +521,7 @@ export const useChatStore = defineStore("chat", () => {
     messages.value = [];
     session.value = { id: sessionId };
     isStreaming.value = false;
-    lastError.value = null;
+    _setError(null);
     _resetDisplayTotals();
     queuedMessages.value = [];
     pendingAttachments.value = [];
@@ -404,8 +542,11 @@ export const useChatStore = defineStore("chat", () => {
     const parked = parkedSessions.get(sessionId);
     if (parked) {
       parkedSessions.delete(sessionId);
-      _restoreFromParked(parked);
-      return;
+      if (parked.bridge.isOpen) {
+        _restoreFromParked(parked);
+        return;
+      }
+      // Bridge already dead (e.g. duplicate tab claimed the session).
     }
 
     try {
@@ -431,7 +572,7 @@ export const useChatStore = defineStore("chat", () => {
         // The bridge sends a STABLE CODE (matching errors.<code> in
         // the locale file), never user-facing text. Translate here so
         // the rest of the app — and locales — get a friendly sentence.
-        if (state === "error" && error) lastError.value = _localiseError(error);
+        if (state === "error" && error) _setError(error);
         if (state === "closed" || state === "error") isStreaming.value = false;
         // After a client-driven abort the backend closes the WS with code
         // 4410, which the bridge surfaces as a normal "closed" state. We
@@ -541,7 +682,7 @@ export const useChatStore = defineStore("chat", () => {
       onState: (state, error) => {
         if (bridge !== restoredBridge) return;
         connState.value = state;
-        if (state === "error" && error) lastError.value = _localiseError(error);
+        if (state === "error" && error) _setError(error);
         if (state === "closed" || state === "error") isStreaming.value = false;
         if (state === "closed" && _abortedAwaitingReconnect) {
           _abortedAwaitingReconnect = false;
@@ -772,6 +913,49 @@ export const useChatStore = defineStore("chat", () => {
     if (evt.type === "agent_start" || evt.type === "turn_start") isStreaming.value = true;
     else if (evt.type === "agent_end") isStreaming.value = false;
 
+    // Pi auto-compaction: pi-mono summarises the conversation when
+    // context approaches `contextWindow - reserveTokens` (default
+    // ~16k). The compaction summary IS persisted to pi's session
+    // jsonl AND is what gets sent on subsequent prompts. We surface
+    // these events via a transient banner so the user can see when
+    // history is summarised — otherwise they'd never know it
+    // happened (and might worry that earlier context was lost).
+    if (evt.type === "compaction_start") {
+      const reason = String((evt as { reason?: string }).reason || "threshold");
+      compactionState.value = {
+        active: true,
+        reason,
+        finishedAt: null,
+        succeeded: null,
+        errorMessage: null,
+      };
+      return;
+    }
+    if (evt.type === "compaction_end") {
+      const aborted = Boolean((evt as { aborted?: boolean }).aborted);
+      const errorMessage =
+        typeof (evt as { errorMessage?: string }).errorMessage === "string"
+          ? ((evt as { errorMessage?: string }).errorMessage as string)
+          : null;
+      const succeeded = !aborted && !errorMessage;
+      compactionState.value = {
+        active: false,
+        reason: compactionState.value?.reason ?? "threshold",
+        finishedAt: Date.now(),
+        succeeded,
+        errorMessage,
+      };
+      // Auto-clear the post-compaction badge after 8s so it doesn't
+      // sit forever on the chat once acknowledged.
+      window.setTimeout(() => {
+        const cs = compactionState.value;
+        if (cs && cs.finishedAt && Date.now() - cs.finishedAt >= 7500) {
+          compactionState.value = null;
+        }
+      }, 8000);
+      return;
+    }
+
     if (evt.type === "session" && session.value) {
       session.value = { id: session.value.id, cwd: String(evt.cwd ?? "") };
     }
@@ -847,7 +1031,7 @@ export const useChatStore = defineStore("chat", () => {
         // eslint-disable-next-line no-console
         console.warn(`[chat] bridge_error code=${code} (raw, suppressed in UI):`, evt.message);
       }
-      lastError.value = _localiseError(code);
+      _setError(code);
 
       if (code === "quota_exceeded") {
         useBillingStore().noteExhausted(null);
@@ -893,7 +1077,7 @@ export const useChatStore = defineStore("chat", () => {
         tail.error = _localiseError(tail.errorCode);
         // Mirror to the bottom banner unless something more specific
         // already claimed it (e.g. the _bridge_error branch above).
-        if (!lastError.value) lastError.value = tail.error;
+        if (!lastError.value) _setError(tail.errorCode);
       }
     }
 
@@ -904,7 +1088,10 @@ export const useChatStore = defineStore("chat", () => {
   // ── outbound ───────────────────────────────────────────────────────
   function sendPrompt(text: string): void {
     if (!bridge || !bridge.isOpen) {
-      lastError.value = _localiseError("not_connected");
+      _setError("not_connected");
+      // Bridge is dead — kick off a reconnect attempt so the next
+      // user retry has a chance of landing on a live socket.
+      void reconnect();
       return;
     }
     // Wrap with attachments if any are pending. The wrapping is done
@@ -914,9 +1101,22 @@ export const useChatStore = defineStore("chat", () => {
     const wrapped = _wrapWithAttachments(text);
     if (!wrapped.trim()) return;
     const reqId = `req-${Date.now()}`;
+    // Send FIRST, only mutate UI state on success. The bridge can
+    // silently fail when the WS closed in the gap between `isOpen`
+    // returning true and `send()` actually writing to the socket
+    // (kicked tab, autoscaler swap, transient proxy disconnect…).
+    // The previous order — push bubble → send → mark streaming —
+    // left the UI stuck on "Stop" with no assistant response when
+    // that race fired. Sending first means the local state stays
+    // consistent with what actually went over the wire.
+    const ok = bridge.send({ id: reqId, type: "prompt", message: wrapped });
+    if (!ok) {
+      _setError("ws_send_failed");
+      void reconnect();
+      return;
+    }
     pushUserMessage(router, wrapped, reqId);
     messages.value = [...router.messages];
-    bridge.send({ id: reqId, type: "prompt", message: wrapped });
     isStreaming.value = true;
     // Attachments are one-shot: cleared after the prompt that included
     // them is sent. The agent's `read` call against the path will work
@@ -925,6 +1125,15 @@ export const useChatStore = defineStore("chat", () => {
   }
 
   function abort(): void {
+    // Always free the local UI immediately. If we relied on the
+    // backend to send `agent_end` / `message_end` to flip the spinner
+    // back, a stuck-streaming UI (e.g. when the prompt was silently
+    // dropped on a half-closed WS — see bridge.send notes) would
+    // never recover even after the user clicked Stop. Resetting
+    // locally first means Stop ALWAYS unsticks the chat from the
+    // user's point of view; the backend abort is a best-effort
+    // courtesy on top of that.
+    isStreaming.value = false;
     if (!bridge || !bridge.isOpen) return;
     // Arm the auto-reconnect flag *before* we send the frame. The
     // backend closes the WS very fast (the abort handler sends one
@@ -945,15 +1154,24 @@ export const useChatStore = defineStore("chat", () => {
   // messages have different attachment lists without leaking.
   function _sendQueuedItem(item: QueuedMessage): void {
     if (!bridge || !bridge.isOpen) {
-      lastError.value = _localiseError("not_connected");
+      _setError("not_connected");
+      void reconnect();
       return;
     }
     const body = _wrapWithAttachments(item.text, item.attachments);
     if (!body.trim()) return;
     const reqId = `req-${Date.now()}`;
+    // Send first, then mutate UI — see sendPrompt() for the full
+    // rationale. Without this order a queued item silently dropped on
+    // a stale WS would push a user bubble that pi never received.
+    const ok = bridge.send({ id: reqId, type: "prompt", message: body });
+    if (!ok) {
+      _setError("ws_send_failed");
+      void reconnect();
+      return;
+    }
     pushUserMessage(router, body, reqId);
     messages.value = [...router.messages];
-    bridge.send({ id: reqId, type: "prompt", message: body });
     isStreaming.value = true;
   }
 
@@ -1076,6 +1294,12 @@ export const useChatStore = defineStore("chat", () => {
     connState,
     isStreaming,
     lastError,
+    lastErrorCode,
+    clearError,
+    isReconnecting,
+    isInitialConnecting,
+    compactionState,
+    dismissCompaction,
     totals,
     pendingAttachments,
     queuedMessages,

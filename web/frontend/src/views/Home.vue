@@ -46,8 +46,13 @@ onMounted(async () => {
 // blocks below pick the actual variant when auth IS required.
 const authOff = computed(() => !cfg.authRequired);
 
+// Signed-in users who already chose to stay on the marketing surface
+// still want one click to "back to chatting" — so the CTA points at
+// /start (auto-resolves to their most recent chat) rather than the
+// picker. The picker stays a click away from the global header for
+// users who genuinely want to browse the list.
 function goToSessions(): void {
-  router.push({ name: "sessions" });
+  router.push({ name: "start" });
 }
 
 function goToLogin(): void {

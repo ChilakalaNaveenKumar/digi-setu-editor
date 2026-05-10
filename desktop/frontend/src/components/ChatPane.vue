@@ -29,10 +29,11 @@ import { useConfigStore } from "../stores/config";
 import { useUiStore } from "../stores/ui";
 import { useWorkspaceStore } from "../stores/workspace";
 import type { SessionRecord } from "../api/types";
-import ChatErrorBanner from "./ChatErrorBanner.vue";
+import CompactionPill from "./CompactionPill.vue";
 import Composer from "./Composer.vue";
 import CreditChip from "./CreditChip.vue";
 import MessageList from "./MessageList.vue";
+import SessionDisconnectedCard from "./SessionDisconnectedCard.vue";
 import UpgradeModal from "./UpgradeModal.vue";
 
 const chat = useChatStore();
@@ -43,8 +44,25 @@ const ws = useWorkspaceStore();
 const ui = useUiStore();
 const router = useRouter();
 
-const { messages, lastError } = storeToRefs(chat);
-const { exhausted, wantsAutoUpgrade, enabled: billingEnabled } = storeToRefs(billing);
+const {
+  messages,
+  lastErrorCode,
+  isReconnecting,
+  isInitialConnecting,
+} = storeToRefs(chat);
+// Single source of truth for "do we render the error overlay" — any
+// chat-state error renders as the prominent card. The previous design
+// kept a bottom strip for non-terminal codes; users complained the
+// strip was easy to miss and looked like "another toolbar". One
+// surface = no ambiguity. We bind to `lastErrorCode` (the STABLE
+// code: ws_kicked, ws_send_failed, provider_rate_limit, …) rather
+// than the localised `lastError` string so the card's switch-on-code
+// machinery picks the right kind, icon, and primary action. Binding
+// to the localised string (the previous behaviour) silently fell
+// through to the generic "Something went wrong" + "Try again" card
+// for every error type.
+const errorCard = computed<string | null>(() => lastErrorCode.value || null);
+const { wantsAutoUpgrade, enabled: billingEnabled } = storeToRefs(billing);
 const { sessions, activeId: activeSessionId } = storeToRefs(chatSession);
 const { mode } = storeToRefs(cfg);
 
@@ -90,14 +108,32 @@ async function newChat(): Promise<void> {
 }
 
 /**
- * Wired to <ChatErrorBanner @reconnect>. Clears the inline error and
- * asks the chat store to drop the dead WebSocket and re-spawn pi for
- * the active session. Idempotent — chat.reconnect() no-ops when no
- * session is loaded.
+ * Wired to <SessionDisconnectedCard @reconnect>. Clears the inline
+ * error and asks the chat store to drop the dead WebSocket and
+ * re-spawn pi for the active session. Idempotent — chat.reconnect()
+ * no-ops when no session is loaded.
  */
 async function onReconnect(): Promise<void> {
-  chat.lastError = null;
+  chat.clearError();
   await chat.reconnect();
+}
+
+function onSignIn(): void {
+  chat.clearError();
+  void router.push({ name: "login" });
+}
+
+function onUpgrade(): void {
+  chat.clearError();
+  // Flips wantsAutoUpgrade so the existing <UpgradeModal> renders.
+  billing.requestUpgrade();
+}
+
+function onReload(): void {
+  // On desktop "Reload page" really means reload the renderer
+  // process. window.location.reload() works inside Tauri / Electron
+  // shells too because the renderer IS a webview.
+  window.location.reload();
 }
 
 async function renameCurrent(): Promise<void> {
@@ -180,7 +216,7 @@ function pickFromHistory(s: SessionRecord): void {
 
 <template>
   <aside
-    class="flex h-full w-full min-w-0 flex-col border-l border-border bg-sidebar text-sidebar-foreground"
+    class="relative flex h-full w-full min-w-0 flex-col border-l border-border bg-sidebar text-sidebar-foreground"
   >
     <!-- ── DESKTOP HEADER ──────────────────────────────────────────
          Tabs row + quick-action icons, then a thin status row.
@@ -385,7 +421,52 @@ function pickFromHistory(s: SessionRecord): void {
       </header>
     </template>
 
-    <MessageList :messages="messages" />
+    <!--
+      Initial-connect skeleton — replaces the empty MessageList with a
+      centred spinner so the very first WS handshake (after login or
+      session switch) doesn't read as a stuck/blank surface for the
+      300-1500 ms it takes to open the socket and replay history.
+    -->
+    <div
+      v-if="isInitialConnecting"
+      class="flex flex-1 flex-col items-center justify-center gap-3 text-sm text-muted-foreground"
+    >
+      <Icon
+        icon="codicon:loading"
+        class="h-5 w-5 animate-spin"
+        aria-hidden="true"
+      />
+      <span>Connecting…</span>
+    </div>
+    <MessageList v-else :messages="messages" />
+
+    <!--
+      Reconnecting pill — slim, non-modal indicator that the bridge
+      noticed a WS hiccup and is actively retrying. Sits above the
+      composer so it doesn't push the message column around, and
+      disappears the moment the bridge reaches "open" again. No flicker
+      because the pill is a soft transition, not a giant red card.
+    -->
+    <Transition
+      enter-active-class="transition-opacity duration-200"
+      leave-active-class="transition-opacity duration-200"
+      enter-from-class="opacity-0"
+      leave-to-class="opacity-0"
+    >
+      <div
+        v-if="isReconnecting && !errorCard"
+        class="flex items-center justify-center gap-2 border-t border-sidebar-border/60 bg-sidebar/80 px-3 py-1.5 text-xs text-muted-foreground"
+        role="status"
+        aria-live="polite"
+      >
+        <Icon
+          icon="codicon:loading"
+          class="h-3 w-3 animate-spin"
+          aria-hidden="true"
+        />
+        <span>Reconnecting…</span>
+      </div>
+    </Transition>
 
     <!-- Setup gate: when the user has neither signed in nor dropped a
          BYOK key (cfg.requires_setup), there's no usable AI backend.
@@ -418,14 +499,18 @@ function pickFromHistory(s: SessionRecord): void {
       </div>
     </div>
 
+    <CompactionPill />
+
     <Composer />
 
-    <ChatErrorBanner
-      v-if="lastError"
-      :message="lastError"
-      :credit-exhausted="exhausted"
-      @dismiss="lastError = null"
+    <SessionDisconnectedCard
+      v-if="errorCard"
+      :code="errorCard"
+      @dismiss="chat.clearError()"
       @reconnect="onReconnect"
+      @sign-in="onSignIn"
+      @upgrade="onUpgrade"
+      @reload="onReload"
     />
 
     <!-- Auto-pop the upgrade modal once when the user first crosses

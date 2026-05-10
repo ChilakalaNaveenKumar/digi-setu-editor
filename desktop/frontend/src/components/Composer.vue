@@ -20,12 +20,21 @@
   (left side of the toolbar) so the input is self-contained, the way
   Cursor / Claude Code / ChatGPT all render their composers.
 
-  Behaviour (unchanged from the old composer):
-    Enter            → newline
-    Cmd/Ctrl + Enter → submit (or queue when pi is busy)
+  Behaviour:
+    Enter            → submit (or queue when pi is busy) — matches
+                       ChatGPT / Cursor / Claude conventions so the
+                       overwhelming majority of users get the result
+                       they expect on the very first keystroke.
+    Shift + Enter    → newline (multi-line composition)
+    Cmd/Ctrl + Enter → submit (kept as a power-user alias so users
+                       who learnt the old binding don't get surprised)
     Cmd/Ctrl + V     → paste text (default), OR paste image/file → upload as attachment
     Drag-drop        → upload to workspace/uploads/, add chip
     Paperclip button → native file picker
+
+  IME composition (CJK / accented input methods) suppresses Enter-to-
+  send so confirming a candidate word doesn't accidentally fire the
+  message — same guard ChatGPT and Slack use.
 
   When attachments are pending, the chip strip above the textarea shows
   one chip per file with a remove (×) button. On submit, the chat
@@ -98,12 +107,12 @@ const focused = ref(false);
 
 const placeholder = computed(() => {
   if (pendingAttachments.value.length > 0) {
-    return "Add a question about your attached files…  (⌘/Ctrl + ↵ to send)";
+    return "Add a question about your attached files…  (↵ to send, ⇧↵ for newline)";
   }
   if (chat.messages.length > 0) {
-    return "Add a follow-up…  (⌘/Ctrl + ↵ to send)";
+    return "Add a follow-up…  (↵ to send, ⇧↵ for newline)";
   }
-  return "Plan, search, build anything…  (⌘/Ctrl + ↵ to send)";
+  return "Plan, search, build anything…  (↵ to send, ⇧↵ for newline)";
 });
 
 // Color of the connection indicator dot in the toolbar.
@@ -153,10 +162,21 @@ function submit(): void {
 }
 
 function onKeydown(e: KeyboardEvent): void {
-  if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-    e.preventDefault();
-    submit();
-  }
+  if (e.key !== "Enter") return;
+  // Don't intercept Enter while the user is committing an IME
+  // composition (CJK, accent menus, autocorrect popups). `isComposing`
+  // is the modern signal; `keyCode === 229` is the legacy fallback
+  // some browsers / IMEs still emit even when isComposing is false.
+  if (e.isComposing || e.keyCode === 229) return;
+  // Shift+Enter inserts a newline (default textarea behaviour) — we
+  // bail out so the browser handles it.
+  if (e.shiftKey) return;
+  // Plain Enter, or the legacy Cmd/Ctrl+Enter alias, both submit.
+  // Alt+Enter is left as a soft newline so users who reach for that
+  // muscle memory still get a line break instead of a send.
+  if (e.altKey) return;
+  e.preventDefault();
+  submit();
 }
 
 // ── attachment ingress: paste, drop, picker ────────────────────────────
@@ -435,7 +455,7 @@ const inputDisabled = computed(() => connState.value !== "open");
             isUploading
           "
           class="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-primary text-primary-foreground transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-30"
-          title="Send (⌘/Ctrl + ↵)"
+          title="Send (↵ — use ⇧↵ for a newline)"
           @click="submit"
         >
           <Icon icon="codicon:send" class="h-3.5 w-3.5" />
@@ -443,7 +463,7 @@ const inputDisabled = computed(() => connState.value !== "open");
 
         <!-- Queue button — visually distinct from Send (different icon,
              explicit "Queue" label, count badge) so users notice that
-             ⌘/Ctrl+Enter while pi is streaming enqueues rather than sends. -->
+             Enter while pi is streaming enqueues rather than sends. -->
         <button
           v-else
           type="button"
@@ -453,7 +473,7 @@ const inputDisabled = computed(() => connState.value !== "open");
             isUploading
           "
           class="flex h-7 min-w-[3.5rem] shrink-0 items-center justify-center gap-1 rounded-md border border-primary/60 bg-primary/25 px-2 text-primary transition-colors hover:bg-primary/35 disabled:cursor-not-allowed disabled:opacity-30"
-          :title="`Queue (⌘/Ctrl + ↵) — pi will run this after the current turn. ${queuedMessages.length} already queued.`"
+          :title="`Queue (↵) — pi will run this after the current turn. ${queuedMessages.length} already queued.`"
           @click="submit"
         >
           <Icon icon="mdi:playlist-plus" class="h-4 w-4" />

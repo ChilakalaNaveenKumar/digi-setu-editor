@@ -21,6 +21,38 @@
 
 set -euo pipefail
 
+# macOS has `shasum`; Linux CI and Windows Git Bash typically have
+# `sha256sum` and/or `openssl`. Prefer the widest portable chain.
+sha256_file() {
+  local f="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$f" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$f" | awk '{print $1}'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "$f" | awk '{print $NF}'
+  else
+    _py=""
+    if command -v python3 >/dev/null 2>&1; then
+      _py=python3
+    elif command -v python >/dev/null 2>&1; then
+      _py=python
+    else
+      echo "$0: need sha256sum, shasum, openssl, or python for SHA-256" >&2
+      exit 127
+    fi
+    "$_py" - "$f" <<'PY'
+import hashlib, sys
+path = sys.argv[1]
+h = hashlib.sha256()
+with open(path, "rb") as fp:
+    for chunk in iter(lambda: fp.read(1 << 20), b""):
+        h.update(chunk)
+print(h.hexdigest())
+PY
+  fi
+}
+
 PROJECT="${GCP_PROJECT:-digi-setu-dev}"
 ZONE="${GCP_ZONE:-us-central1-a}"
 VM="${GCP_VM:-digi-setu-live}"
@@ -40,7 +72,7 @@ fi
 # Default the remote name to the local basename with spaces → dashes.
 REMOTE_NAME="${2:-$(basename "$LOCAL" | tr ' ' '-')}"
 
-LOCAL_SHA="$(shasum -a 256 "$LOCAL" | awk '{print $1}')"
+LOCAL_SHA="$(sha256_file "$LOCAL")"
 LOCAL_SIZE_MB="$(du -m "$LOCAL" | awk '{print $1}')"
 
 echo "[upload] Local:   $LOCAL"

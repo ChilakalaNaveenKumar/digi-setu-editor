@@ -57,7 +57,8 @@ npm run dev
 ```
 
 Open http://localhost:5173. Click **+ New session**, type a prompt
-(e.g. `List the 4 custom Typst tools, names only`), Cmd/Ctrl+Enter to send.
+(e.g. `List the 4 custom Typst tools, names only`), press Enter to send
+(Shift+Enter for a newline; Cmd/Ctrl+Enter still works as an alias).
 You should see streamed text + thinking + tool call cards, with token usage
 chips per assistant turn.
 
@@ -94,7 +95,7 @@ web/
 │           ├── ThinkingBlock.vue       collapsible italic gray block
 │           ├── ToolCallCard.vue        tool-execution.ts mirror (text-only Step 1)
 │           ├── UsageChip.vue           per-message ↑in ↓out cR cW $cost
-│           └── Composer.vue            textarea + Cmd/Ctrl+Enter send
+│           └── Composer.vue            textarea + Enter-to-send (Shift+Enter newline)
 └── sessions/                           created on first session, persisted JSONL
 ```
 

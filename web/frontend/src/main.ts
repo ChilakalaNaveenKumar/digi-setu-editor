@@ -75,7 +75,12 @@ async function boot(): Promise<void> {
       // No `appearance` override on purpose: per user instruction we
       // ship Clerk's default styling unmodified for SignIn and
       // UserButton.
-      signInFallbackRedirectUrl: "/",
+      // Land sign-ins on /start so the user is dropped straight into
+      // their most recent chat (or a freshly minted one). See
+      // views/Start.vue for the auto-resolve flow. Fallback is used
+      // when Clerk doesn't have an explicit redirect target, e.g.
+      // OAuth provider that doesn't preserve query state.
+      signInFallbackRedirectUrl: "/start",
       signUpFallbackRedirectUrl: "/",
     });
 

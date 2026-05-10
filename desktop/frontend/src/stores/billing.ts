@@ -202,6 +202,17 @@ export const useBillingStore = defineStore("billing", () => {
   }
 
   /**
+   * Pop the upgrade modal on demand (e.g. user clicked "Upgrade" on
+   * the chat error card after hitting a quota / billing error). This
+   * resets the one-shot guard so the modal can re-open even if it
+   * was previously dismissed in this session.
+   */
+  function requestUpgrade(): void {
+    _shownAutoUpgrade.value = false;
+    _maybeAutoOpenUpgrade();
+  }
+
+  /**
    * Open digi-setu.com/pricing?plan=... in the user's system
    * browser. Stripe Checkout runs there inside their Clerk-
    * authenticated browser session — this app process is never
@@ -251,6 +262,7 @@ export const useBillingStore = defineStore("billing", () => {
     refreshUsage,
     noteExhausted,
     dismissAutoUpgrade,
+    requestUpgrade,
     startCheckout,
     openPortal,
   };

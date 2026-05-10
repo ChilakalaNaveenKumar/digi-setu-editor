@@ -642,12 +642,31 @@ class PiSession:
 
         # ── pi argv (passed as CMD, image's ENTRYPOINT prepends
         # tini + entrypoint-session.sh which drops to uid 1000) ────
+        #
+        # `--continue` is critical for chat continuity across pi
+        # respawns. Every time the user clicks Stop OR the WS
+        # disconnects mid-turn we kill pi (see chat_ws.py — pi has no
+        # in-band "abort current turn" frame in RPC mode, so we have
+        # to terminate the process). The next user prompt then spawns
+        # a fresh pi container. Without `--continue`, that fresh pi
+        # calls SessionManager.create() and starts a brand-new
+        # session JSONL — every prior user message and assistant
+        # response becomes invisible to the model. Symptom users
+        # hit: "I sent a message, hit Stop, sent another, then asked
+        # 'what have we discussed' → pi has no memory of the first
+        # message at all." `--continue` swaps that for
+        # SessionManager.continueRecent() which resumes the most-
+        # recent valid session file in /session, so pi sees every
+        # committed prior turn (pi writes user messages immediately
+        # on receipt, so even the prompt that triggered the Stop is
+        # in there).
         pi_argv = [
             "pi",
             "--mode", "rpc",
             "--provider", self._provider,
             "--model", self._model,
             "--session-dir", "/session",
+            "--continue",
             "--extension", "/opt/pi-session/extensions/typst-tools.ts",
             "--extension", "/opt/pi-session/extensions/permission.ts",
         ]
@@ -855,6 +874,12 @@ class PiSession:
                 "--provider", self._provider,
                 "--model", self._model,
                 "--session-dir", str(self.session_dir),
+                # `--continue` resumes the most recent session file
+                # in --session-dir on respawn, so the model keeps
+                # full conversation context after Stop / disconnect
+                # (where we kill pi). See the docker-mode block
+                # above for the full rationale.
+                "--continue",
             ]
             if _ext_typst.exists():
                 cmd += ["--extension", str(_ext_typst)]
@@ -894,6 +919,8 @@ class PiSession:
             "--provider", self._provider,
             "--model", self._model,
             "--session-dir", str(self.session_dir),
+            # See the docker-mode `--continue` rationale above.
+            "--continue",
             "--extension", "./extensions/typst-tools.ts",
             "--extension", "./extensions/permission.ts",
         ]

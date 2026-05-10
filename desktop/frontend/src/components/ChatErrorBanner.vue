@@ -161,7 +161,7 @@ const primaryBtnClass = computed(() => {
     role="alert"
   >
     <Icon :icon="icon" class="mt-0.5 h-3.5 w-3.5 shrink-0 opacity-80" />
-    <span class="flex-1 leading-snug">{{ text }}</span>
+    <span class="flex-1 whitespace-pre-line leading-snug">{{ text }}</span>
     <div class="flex shrink-0 items-center gap-1.5">
       <button
         v-if="kind === 'credit'"

@@ -323,3 +323,42 @@ def test_persist_is_idempotent(chats_dir: Path) -> None:
     assert a is True
     assert b is False
     assert len(_aborted_files(chats_dir)) == 1
+
+
+def test_bg_output_chunks_included_in_persisted_text(chats_dir: Path) -> None:
+    """Background-process stdout is not part of pi's message_update stream;
+    `note_bg_output` must fold it into the partial snapshot."""
+    from services.partial_turn import PartialTurnTracker
+
+    t = PartialTurnTracker(chats_dir=chats_dir, session_id="sess-bg")
+    t.observe(_agent_start())
+    t.observe(_text_delta("Running script…\n"))
+    t.note_bg_output("stdout", "line1\n")
+    t.note_bg_output("stdout", "line2\n")
+    assert t.persist_if_in_flight(reason="disconnect") is True
+    lines = _read_jsonl(_aborted_files(chats_dir)[0])
+    msg = lines[0]["message"]["content"]
+    text_part = next(c for c in msg if c["type"] == "text")
+    assert "Running script" in text_part["text"]
+    assert "line1" in text_part["text"] and "line2" in text_part["text"]
+
+
+def test_tool_only_abort_includes_banner_for_history(chats_dir: Path) -> None:
+    """Stop/disconnect during bash with no assistant prose yet — without a
+    text part, load_history still had tool cards but users saw a 'missing'
+    turn; we always persist an explanation paragraph."""
+    from services.history import load_history
+    from services.partial_turn import PartialTurnTracker
+
+    t = PartialTurnTracker(chats_dir=chats_dir, session_id="sess-tool-banner")
+    t.observe(_agent_start())
+    t.observe(_toolcall_start("tc-1", "bash"))
+    t.observe(_toolcall_delta("tc-1", "bash", {"command": "sleep 9"}))
+    assert t.persist_if_in_flight(reason="user_stop") is True
+
+    hist = load_history(chats_dir)
+    assistants = [m for m in hist if m["kind"] == "assistant"]
+    assert len(assistants) == 1
+    texts = [p["text"] for p in assistants[0]["parts"] if p["kind"] == "text"]
+    assert texts, "expected a text part with stop explanation"
+    assert "stopped" in texts[0].lower() or "partial" in texts[0].lower()

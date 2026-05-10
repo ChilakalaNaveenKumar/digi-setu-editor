@@ -169,6 +169,17 @@ export const useBillingStore = defineStore("billing", () => {
     wantsAutoUpgrade.value = false;
   }
 
+  /**
+   * Pop the upgrade modal on demand (e.g. user clicked "Upgrade" on
+   * the chat error card after hitting a quota / billing error). This
+   * resets the one-shot guard so the modal can re-open even if it
+   * was previously dismissed in this session.
+   */
+  function requestUpgrade(): void {
+    _shownAutoUpgrade.value = false;
+    _maybeAutoOpenUpgrade();
+  }
+
   async function startCheckout(planId: string): Promise<void> {
     const r = await apiStartCheckout(planId);
     window.location.href = r.url;
@@ -198,6 +209,7 @@ export const useBillingStore = defineStore("billing", () => {
     refreshUsage,
     noteExhausted,
     dismissAutoUpgrade,
+    requestUpgrade,
     startCheckout,
     openPortal,
   };

@@ -36,6 +36,8 @@ from typing import Optional
 
 from fastapi import WebSocket
 
+from services.error_codes import bridge_error
+
 
 # Custom WS close code for "kicked by a newer tab". 4xxx is reserved
 # for application use by the WS spec; 4409 mirrors HTTP 409 Conflict
@@ -72,6 +74,10 @@ class _SessionLocks:
             app_state = getattr(getattr(old, "application_state", None), "name", "")
             if client_state in ("DISCONNECTED",) or app_state in ("DISCONNECTED",):
                 return
+            try:
+                await old.send_json(bridge_error("session_kicked"))
+            except (RuntimeError, Exception):
+                pass
             try:
                 await old.close(code=KICKED_BY_NEWER_TAB)
             except (RuntimeError, Exception) as exc:

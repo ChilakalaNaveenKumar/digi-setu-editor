@@ -21,7 +21,7 @@ const showUpgrade = ref(false);
   <div
     class="flex items-start justify-between gap-2 border-t border-destructive/30 bg-destructive/10 px-3 py-1.5 text-caption text-destructive"
   >
-    <span class="flex-1 leading-snug">{{ message }}</span>
+    <span class="flex-1 whitespace-pre-line leading-snug">{{ message }}</span>
     <div class="flex shrink-0 items-center gap-2">
       <button
         v-if="creditExhausted"

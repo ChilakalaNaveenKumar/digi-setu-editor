@@ -32,7 +32,9 @@ export function deleteSession(sid: string): Promise<{ ok: true; session: Session
  * paint old turns before opening a fresh WS.
  */
 export function fetchSessionHistory(sid: string): Promise<{ messages: ChatMessage[] }> {
-  return apiJson(`/api/sessions/${encodeURIComponent(sid)}/history`);
+  return apiJson(`/api/sessions/${encodeURIComponent(sid)}/history`, {
+    cache: "no-store",
+  });
 }
 
 // ── Storage rolling 90-day cycle (auto-cleanup) ──────────────────────────

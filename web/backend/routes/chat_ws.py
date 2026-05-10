@@ -52,7 +52,13 @@ from services.models_registry import (
 )
 from services.audit import record as audit_record
 from services.error_codes import bridge_error, log_error
-from services.partial_turn import PartialTurnTracker
+from services.partial_turn import (
+    PartialTurnTracker,
+    find_recent_unconsumed_aborted,
+    load_aborted_summary,
+    mark_aborted_consumed,
+    render_partial_context_block,
+)
 from services.pi_session import PiSession
 from services.policy import check_bash, scrub_secrets
 from services.sandbox_layout import stamp_sandbox_dir
@@ -533,6 +539,35 @@ async def run_session_loop(
         chats_dir=chats_dir, session_id=session_id
     )
 
+    # Pending partial-turn context to splice into the FIRST user prompt
+    # of this connection. Populated synchronously below by scanning the
+    # session's chats_dir for an un-consumed `*-aborted.jsonl` from the
+    # previous (interrupted) WS lifetime. Cleared after the first prompt
+    # forwards so subsequent prompts in the same WS land normally.
+    #
+    # Why this exists: pi --continue resumes the most recent session
+    # JSONL but only sees what pi itself wrote — the partial assistant
+    # response that vanished when we SIGTERM-ed pi never made it onto
+    # disk in pi's format. Without this hand-off the new pi instance
+    # has no memory of "I had read these 5 files and was about to
+    # write the 6th" — it only sees a dangling user message followed
+    # by the user's NEW prompt. Wrapping the first new prompt with a
+    # `<context-from-interrupted-turn>` block restores that continuity.
+    #
+    # Stored in a dict so the inner ws_to_pi closure can mutate without
+    # tripping Python's "first assignment promotes to local" rule (the
+    # rest of this scope uses the same dict-wrapper pattern — see
+    # turn_started_at, aborted, timed_out above).
+    _initial_partial_path = find_recent_unconsumed_aborted(chats_dir)
+    pending_partial: dict[str, Any] = {
+        "path": _initial_partial_path,
+        "summary": (
+            load_aborted_summary(_initial_partial_path)
+            if _initial_partial_path is not None
+            else None
+        ),
+    }
+
     # Background title-generation state. We only ever fire this once per
     # session (the first time we see a non-empty user prompt). Storing
     # the task handle lets us a) avoid double-firing on subsequent
@@ -967,6 +1002,22 @@ async def run_session_loop(
     # was streamed.
     BG_DRAIN_TIMEOUT_S = 180
 
+    def _absorb_bg_queue() -> None:
+        """Move any pending ``bg_output`` messages into ``partial_turn`` so
+        snapshots include terminal bytes already received but not yet sent
+        on the (dead) WebSocket."""
+        while True:
+            try:
+                msg = bg_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if not isinstance(msg, dict) or msg.get("type") != "bg_output":
+                continue
+            stream = msg.get("stream")
+            chunk = msg.get("chunk")
+            if isinstance(stream, str) and isinstance(chunk, str):
+                partial_turn.note_bg_output(stream, chunk)
+
     async def _bg_drain_to_message_end() -> None:
         """Consume pi.events() in the background until message_end fires
         or the timeout expires, running the same handler chain pi_to_ws
@@ -982,6 +1033,7 @@ async def run_session_loop(
         try:
             async for evt in pi.events():
                 partial_turn.observe(evt)
+                _absorb_bg_queue()
                 # Same per-event accounting we'd have done in pi_to_ws.
                 # Skip permission-interception + WS send (no SPA).
                 try:
@@ -1013,6 +1065,11 @@ async def run_session_loop(
                 file=sys.stderr,
             )
             partial_turn.persist_if_in_flight(reason="bg_error")
+        finally:
+            _absorb_bg_queue()
+            # Iterator exhaustion without message_end (or any path that
+            # forgot an explicit persist) must still snapshot streamed text.
+            partial_turn.persist_if_in_flight(reason="bg_cleanup")
 
     async def _close_pi_after_drain() -> None:
         """Wrapper task started from the WS cleanup path. Drains pi to
@@ -1022,6 +1079,14 @@ async def run_session_loop(
         try:
             await _bg_drain_to_message_end()
         finally:
+            _absorb_bg_queue()
+            try:
+                bg_registry.unsubscribe(bg_queue)
+            except Exception as exc:
+                print(
+                    f"[ws {session_id}] bg unsubscribe after drain: {exc!r}",
+                    file=sys.stderr,
+                )
             try:
                 await pi.close()
             except Exception as exc:
@@ -1089,6 +1154,12 @@ async def run_session_loop(
             except asyncio.CancelledError:
                 return
             try:
+                st = msg.get("type")
+                if st == "bg_output":
+                    stream = msg.get("stream")
+                    chunk = msg.get("chunk")
+                    if isinstance(stream, str) and isinstance(chunk, str):
+                        partial_turn.note_bg_output(stream, chunk)
                 await ws.send_text(json.dumps(msg, ensure_ascii=False))
             except Exception as exc:
                 print(f"[ws {session_id}] bg send failed: {exc}", file=sys.stderr)
@@ -1384,6 +1455,44 @@ async def run_session_loop(
                             _upgrade_title_via_llm(msg, heuristic),
                             name=f"title_gen[{session_id}]",
                         )
+
+                # If the previous WS lifetime ended mid-turn (Stop /
+                # disconnect / timeout), prepend a context block that
+                # tells pi what it had been doing. Pi only sees its own
+                # session JSONL; without this it would resume blind to
+                # the partial response the user already saw streaming.
+                # Splice happens once, only on the first prompt of the
+                # new connection — subsequent prompts land verbatim.
+                if pending_partial["summary"] is not None and isinstance(msg, str):
+                    try:
+                        ctx_block = render_partial_context_block(
+                            pending_partial["summary"]
+                        )
+                        wrapped = f"{ctx_block}\n\n{msg}"
+                        # Mutate the command we're about to forward so
+                        # everything downstream (title heuristic already
+                        # ran above on the raw user text — we don't want
+                        # the context block leaking into chat titles)
+                        # sees the wrapped version.
+                        command = dict(command)
+                        command["message"] = wrapped
+                    except Exception as exc:
+                        # Best-effort: a render failure should NOT break
+                        # the prompt forwarding. Log and forward the raw
+                        # user message — worst case, pi resumes blind to
+                        # the partial (the pre-fix behavior).
+                        log_error(
+                            "internal",
+                            session_id=session_id,
+                            user_id=user_id,
+                            exc=exc,
+                            where="render_partial_context",
+                        )
+                    finally:
+                        if pending_partial["path"] is not None:
+                            mark_aborted_consumed(pending_partial["path"])
+                        pending_partial["summary"] = None
+                        pending_partial["path"] = None
                 reg.touch_session(session_id)
                 # Arm the per-prompt wall-clock watchdog. Cleared in
                 # _maybe_charge_usage when message_end fires.
@@ -1419,7 +1528,6 @@ async def run_session_loop(
         task.cancel()
 
     fs_watcher.unsubscribe(fs_queue)
-    bg_registry.unsubscribe(bg_queue)
     await WatcherRegistry.instance().release(workspace_path)
 
     # Decide whether to close pi NOW or detach it to finish the turn
@@ -1456,6 +1564,8 @@ async def run_session_loop(
     else:
         # Synchronous path: snapshot anything streamed (idempotent if
         # an abort/timeout handler already persisted), then close pi.
+        _absorb_bg_queue()
+        bg_registry.unsubscribe(bg_queue)
         partial_turn.persist_if_in_flight(reason="disconnect")
         await pi.close()
     # Release the multi-tab guard. Idempotent — if a newer tab took

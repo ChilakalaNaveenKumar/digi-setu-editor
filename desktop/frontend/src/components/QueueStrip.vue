@@ -117,10 +117,15 @@ function onEditKeydown(e: KeyboardEvent, id: string): void {
   if (e.key === "Escape") {
     e.preventDefault();
     cancelEdit();
-  } else if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-    e.preventDefault();
-    commitEdit(id);
+    return;
   }
+  if (e.key !== "Enter") return;
+  // Mirror the composer's Enter-to-send rules so editing a queued
+  // message feels identical to typing a new one.
+  if (e.isComposing || e.keyCode === 229) return;
+  if (e.shiftKey || e.altKey) return;
+  e.preventDefault();
+  commitEdit(id);
 }
 
 async function pushNow(id: string): Promise<void> {
@@ -252,7 +257,7 @@ function humanSize(bytes: number): string {
               v-if="editingId === item.id"
               class="mt-1 flex items-center gap-2 font-mono text-caption text-muted-foreground"
             >
-              <span>⌘/Ctrl + ↵ to save</span>
+              <span>↵ to save · ⇧↵ for newline</span>
               <span>·</span>
               <span>Esc to cancel</span>
               <span>·</span>

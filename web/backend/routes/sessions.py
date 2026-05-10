@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Response
 
 from models.workspace import SessionCreate, SessionModelUpdate, SessionRename
 from routes._helpers import session_for_user_or_404, workspace_for_user_or_404
@@ -141,7 +141,9 @@ async def delete_session(
 
 @router.get("/api/sessions/{sid}/history")
 async def get_session_history(
-    sid: str, user_id: str = Depends(require_user)
+    sid: str,
+    response: Response,
+    user_id: str = Depends(require_user),
 ) -> dict[str, Any]:
     """Return the rendered chat-message stream for `sid` (used on resume).
 
@@ -150,6 +152,9 @@ async def get_session_history(
     transformation step. See services/history.py for the projection rules.
     """
     session_for_user_or_404(sid, user_id)
+    # Partial-turn snapshots land milliseconds before this GET (after Stop
+    # / disconnect). Never serve a stale cached body from a CDN or browser.
+    response.headers["Cache-Control"] = "no-store"
     return {"messages": load_history(Registry.instance().session_chat_dir(sid))}
 
 

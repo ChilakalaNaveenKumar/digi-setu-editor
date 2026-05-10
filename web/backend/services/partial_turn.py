@@ -89,6 +89,7 @@ no-ops, because pi already wrote the canonical record.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 import uuid
@@ -115,6 +116,7 @@ class PartialTurnTracker:
         "_message_id",
         "_text",
         "_thinking",
+        "_bg_stream",
         "_tool_calls",
         "_tool_call_order",
         "_stream_path",
@@ -129,6 +131,7 @@ class PartialTurnTracker:
         self._message_id = ""
         self._text = ""
         self._thinking = ""
+        self._bg_stream = ""
         # tc_id → {id, name, arguments, arguments_partial_json,
         #          execution_status, result_text, is_error}
         # `arguments` is replaced (not appended) on each toolcall_delta
@@ -164,6 +167,7 @@ class PartialTurnTracker:
             self._message_id = ""
             self._text = ""
             self._thinking = ""
+            self._bg_stream = ""
             self._tool_calls = {}
             self._tool_call_order = []
             return
@@ -261,6 +265,16 @@ class PartialTurnTracker:
                         tc["arguments"] = args
             return
 
+    def note_bg_output(self, stream: str, chunk: str) -> None:
+        """Accumulate ``bg_output`` chunks (background bash / daemons) so
+        disconnect / background-drain snapshots include terminal bytes the
+        client already saw. Also tees a synthetic ``bg_output`` record into
+        the per-turn inflight JSONL."""
+        if not self._active or not isinstance(chunk, str) or not chunk:
+            return
+        self._tee({"type": "bg_output", "stream": stream, "chunk": chunk})
+        self._bg_stream += chunk
+
     # ── helpers ─────────────────────────────────────────────────────
 
     def _ensure_tool_call(self, tc_id: str, *, name: Any = None) -> dict[str, Any]:
@@ -335,6 +349,7 @@ class PartialTurnTracker:
         self._message_id = ""
         self._text = ""
         self._thinking = ""
+        self._bg_stream = ""
         self._tool_calls = {}
         self._tool_call_order = []
 
@@ -424,7 +439,14 @@ class PartialTurnTracker:
         text = self._text
         thinking = self._thinking
         tool_calls = [self._tool_calls[i] for i in self._tool_call_order]
-        if not text and not thinking and not tool_calls:
+        combined_text = text
+        if self._bg_stream:
+            bg = self._bg_stream.rstrip()
+            if combined_text:
+                combined_text = combined_text + "\n\n" + bg
+            else:
+                combined_text = bg
+        if not text and not thinking and not tool_calls and not self._bg_stream:
             # Nothing to preserve — pi never streamed any content for
             # this turn (maybe abort fired before the first delta).
             self._active = False
@@ -444,12 +466,17 @@ class PartialTurnTracker:
         # here (history.py:_flatten_assistant_content just passes the
         # text through).
         banner = self._banner_for(reason)
-        if text:
-            content.append({"type": "text", "text": text + banner})
+        if combined_text:
+            content.append({"type": "text", "text": combined_text + banner})
         elif not tool_calls:
             # No streamed text but we did capture thinking — surface a
             # standalone banner part so the turn isn't completely empty
             # in the rendered transcript.
+            content.append({"type": "text", "text": banner.lstrip()})
+        else:
+            # Tool call(s) already visible (bash queued / running) but no
+            # assistant prose yet — without a text part, reload looks like
+            # the turn vanished. Mirror the banner we append when text exists.
             content.append({"type": "text", "text": banner.lstrip()})
 
         # Append every tool call we tracked. The history loader
@@ -514,6 +541,11 @@ class PartialTurnTracker:
             with out.open("a", encoding="utf-8") as f:
                 for line in lines:
                     f.write(json.dumps(line, ensure_ascii=False) + "\n")
+                try:
+                    f.flush()
+                    os.fsync(f.fileno())
+                except OSError:
+                    pass
         except Exception as exc:
             # Persistence is best-effort — never let a disk error tear
             # down the abort handler.
@@ -552,6 +584,10 @@ class PartialTurnTracker:
             return "\n\n_(prompt timeout — partial response saved)_"
         if reason == "disconnect":
             return "\n\n_(connection closed — partial response saved)_"
+        if reason in ("bg_cleanup", "bg_error"):
+            return "\n\n_(connection closed — partial response saved)_"
+        if reason == "bg_timeout":
+            return "\n\n_(streaming timed out — partial response saved)_"
         return f"\n\n_(stopped: {reason} — partial response saved)_"
 
     @staticmethod
@@ -578,3 +614,264 @@ class PartialTurnTracker:
             f"Aborted: {reason}. {tool_name} did not finish. Arguments "
             f"above are the latest snapshot pi streamed."
         )
+
+
+# ── partial-context replay helpers ──────────────────────────────────────
+#
+# Why this lives here (and not in chat_ws.py):
+# pi-mono's session JSONL only contains entries pi itself wrote. The
+# user's previous turn made it onto disk (pi writes user msgs on
+# arrival), but the partial assistant text + tool calls live in the
+# `*-aborted.jsonl` we created above — pi never sees that file when
+# `--continue` resumes the session (it requires a `{type:"session"}`
+# header which our synthetic file deliberately omits).
+#
+# That means after Stop+resume, pi has no memory of WHAT it had been
+# saying or about to do — it sees a dangling user msg followed by the
+# user's NEW prompt. For most chats the LLM handles this fine, but it
+# loses important context (e.g. "I had read 5 files and was about to
+# refactor a sixth"). The user complained: "I am sure if you want test
+# it send a message in the middle send stop and with same session send
+# a continuous message it's fucked up no history".
+#
+# The fix: when the WS reconnects, scan chats_dir for the most recent
+# UN-CONSUMED `*-aborted.jsonl`, rehydrate its text + tool-calls into
+# a context block, and prepend it to the FIRST prompt the user sends
+# in the new connection. We then rename the file to
+# `*-aborted-consumed.jsonl` so we don't double-inject on subsequent
+# prompts. The rendered transcript still loads from BOTH files (the
+# load_history reader globs `*-aborted*.jsonl`) so the user still sees
+# their partial bubble in the UI — only pi's *side-channel context*
+# changes.
+
+
+def find_recent_unconsumed_aborted(
+    chats_dir: Path, *, max_age_seconds: float = 3600.0
+) -> Path | None:
+    """Return the path of the newest `*-aborted.jsonl` in ``chats_dir``
+    that hasn't been marked consumed and isn't too old to bother
+    rehydrating. Returns ``None`` if there's nothing to inject.
+
+    The age cap is a safety net — if the user closed their laptop for
+    a week and we'd silently inject stale "I was about to write…"
+    context into a new conversation, that would be far more confusing
+    than the dangling user msg pi naturally sees. One hour is well
+    inside the WS reconnect / "I'll come back after lunch" window.
+    """
+    try:
+        if not chats_dir.exists():
+            return None
+        candidates: list[tuple[float, Path]] = []
+        for p in chats_dir.iterdir():
+            name = p.name
+            if not name.endswith("-aborted.jsonl"):
+                continue
+            try:
+                mtime = p.stat().st_mtime
+            except OSError:
+                continue
+            if mtime < time.time() - max_age_seconds:
+                continue
+            candidates.append((mtime, p))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1]
+    except Exception:
+        return None
+
+
+def load_aborted_summary(path: Path) -> dict[str, Any] | None:
+    """Parse a `*-aborted.jsonl` file into a flattened summary dict
+    suitable for prepending to the next user prompt::
+
+        {
+            "text":     "<assistant prose, banner stripped>",
+            "thinking": "<thinking blocks, joined>",
+            "tools":    [
+                {"name": "...", "arguments": {...}, "status": "..."},
+                ...
+            ],
+            "reason":   "user_stop" | "timeout" | "disconnect" | ...,
+        }
+
+    Returns ``None`` on any parse failure. Caller is responsible for
+    rendering the summary into a context block AND for marking the
+    file consumed once the prepend has been forwarded to pi.
+    """
+    if not path.exists():
+        return None
+    text_parts: list[str] = []
+    thinking_parts: list[str] = []
+    tools: list[dict[str, Any]] = []
+    reason: str = ""
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    line = json.loads(raw)
+                except Exception:
+                    continue
+                if not isinstance(line, dict):
+                    continue
+                msg = line.get("message")
+                if not isinstance(msg, dict):
+                    continue
+                if msg.get("role") == "assistant":
+                    if not reason and isinstance(msg.get("stopReason"), str):
+                        reason = msg["stopReason"]
+                    content = msg.get("content")
+                    if isinstance(content, list):
+                        for block in content:
+                            if not isinstance(block, dict):
+                                continue
+                            bt = block.get("type")
+                            if bt == "text":
+                                t = block.get("text")
+                                if isinstance(t, str):
+                                    # Strip the trailing _(stopped …)_ banner
+                                    # we appended in `_banner_for` so the
+                                    # injected context reads cleanly.
+                                    cleaned = t
+                                    for marker in (
+                                        "\n\n_(stopped",
+                                        "\n\n_(prompt timeout",
+                                        "\n\n_(connection closed",
+                                        "\n\n_(streaming timed out",
+                                    ):
+                                        idx = cleaned.find(marker)
+                                        if idx >= 0:
+                                            cleaned = cleaned[:idx]
+                                            break
+                                    cleaned = cleaned.rstrip()
+                                    if cleaned:
+                                        text_parts.append(cleaned)
+                            elif bt == "thinking":
+                                tk = block.get("thinking")
+                                if isinstance(tk, str) and tk:
+                                    thinking_parts.append(tk.rstrip())
+                            elif bt == "toolCall":
+                                tools.append({
+                                    "name": str(block.get("name") or "tool"),
+                                    "arguments": block.get("arguments") if isinstance(block.get("arguments"), dict) else {},
+                                    "status": "pending",
+                                })
+                elif msg.get("role") == "toolResult":
+                    # Match the toolResult to its parent toolCall by index
+                    # (we wrote them in order) so the rehydrated summary
+                    # captures success vs. abort distinctly.
+                    if tools:
+                        last = tools[-1]
+                        last["status"] = (
+                            "error" if msg.get("isError") else "success"
+                        )
+    except Exception:
+        return None
+    return {
+        "text": "\n\n".join(text_parts),
+        "thinking": "\n\n".join(thinking_parts),
+        "tools": tools,
+        "reason": reason or "interrupted",
+    }
+
+
+def render_partial_context_block(summary: dict[str, Any]) -> str:
+    """Format a flattened aborted-turn summary into a context block we
+    prepend to the next user prompt. The block is wrapped in
+    pseudo-XML tags so the LLM sees it as out-of-band context rather
+    than a literal user instruction.
+
+    Output is intentionally compact — we trim long tool-call argument
+    blobs to a sensible maximum so a single Stop in the middle of a
+    huge `write` doesn't blow our context budget on the next prompt.
+    """
+    text = (summary.get("text") or "").strip()
+    tools = summary.get("tools") or []
+    reason = str(summary.get("reason") or "interrupted")
+
+    reason_blurb = {
+        "user_stop": "the user pressed Stop",
+        "timeout": "the request timed out",
+        "disconnect": "the connection dropped",
+        "bg_cleanup": "the connection dropped",
+        "bg_error": "a background process error fired",
+        "bg_timeout": "a background process timed out",
+    }.get(reason, f"the previous turn was interrupted ({reason})")
+
+    parts: list[str] = []
+    parts.append(
+        f"You started answering the user's previous message but {reason_blurb} "
+        "before you could finish. The user has now sent the message that "
+        "appears AFTER this block. Use this snapshot of your interrupted "
+        "work to keep continuity — do NOT re-ask anything you already "
+        "knew, and do NOT redo work you already finished:"
+    )
+
+    if text:
+        parts.append("Partial reply you had streamed (verbatim):")
+        # Cap at ~4k chars so a runaway write/print doesn't dominate the
+        # injected context. We keep the tail because that's where the
+        # most-recent thought lives.
+        snippet = text if len(text) <= 4000 else "…" + text[-4000:]
+        parts.append(snippet)
+
+    if tools:
+        parts.append(
+            "Tool calls that were in progress (NOT yet successfully "
+            "completed unless marked success):"
+        )
+        for tc in tools:
+            name = tc.get("name") or "tool"
+            status = tc.get("status") or "pending"
+            args = tc.get("arguments") or {}
+            try:
+                arg_blob = json.dumps(args, ensure_ascii=False)
+            except Exception:
+                arg_blob = str(args)
+            if len(arg_blob) > 1500:
+                arg_blob = arg_blob[:1500] + "…(truncated)"
+            parts.append(f"- [{status}] {name}({arg_blob})")
+
+    if not text and not tools:
+        parts.append(
+            "(You hadn't streamed any visible content yet — just "
+            "acknowledge that the previous attempt was cut short and "
+            "respond to the new message below.)"
+        )
+
+    body = "\n\n".join(parts)
+    return (
+        "<context-from-interrupted-turn>\n"
+        f"{body}\n"
+        "</context-from-interrupted-turn>"
+    )
+
+
+def mark_aborted_consumed(path: Path) -> None:
+    """Rename ``*-aborted.jsonl`` → ``*-aborted-consumed.jsonl`` so we
+    don't re-inject the same partial on every subsequent prompt of the
+    new connection. Best-effort; failure is silent because the
+    duplicate-injection risk is bounded (a second prompt arriving
+    before the rename completes simply gets the same context twice,
+    which the LLM tolerates).
+
+    The renamed file remains in chats_dir so `load_history` still
+    surfaces the partial bubble in the rendered transcript — only pi
+    sees it as "already replayed".
+    """
+    if not path.exists():
+        return
+    try:
+        target = path.with_name(path.stem + "-consumed.jsonl")
+        path.rename(target)
+    except Exception:
+        # Last-ditch: try to delete so we don't loop on the same file
+        # forever. The bubble is gone from history but the side-channel
+        # context already landed in the previous prompt.
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass

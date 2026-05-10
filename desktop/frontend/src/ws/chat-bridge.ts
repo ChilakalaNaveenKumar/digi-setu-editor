@@ -64,6 +64,7 @@ export class ChatBridge {
   private ws: WebSocket | null = null;
   private opts: BridgeOpts;
   private explicitlyClosed = false;
+  private tabSuperseded = false;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private heartbeatTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -82,6 +83,7 @@ export class ChatBridge {
 
   open(): void {
     this.explicitlyClosed = false;
+    this.tabSuperseded = false;
     this.cancelReconnect();
     this.bindWakeListeners();
     this.opts.onState("connecting");
@@ -126,12 +128,24 @@ export class ChatBridge {
     }
   }
 
-  send(payload: unknown): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+  /**
+   * Try to write `payload` to the underlying WebSocket.
+   *
+   * Returns `true` when the frame was actually queued on the socket,
+   * `false` when the socket is missing / not in OPEN state / threw on
+   * write. Callers MUST honour the return value — silently dropping
+   * payloads (the previous behaviour) leads to "Stop" pill stuck on
+   * forever with no assistant response: the local store thinks the
+   * prompt is in flight, but pi never received it.
+   */
+  send(payload: unknown): boolean {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
     try {
       this.ws.send(JSON.stringify(payload));
+      return true;
     } catch {
       this.opts.onState("error", "ws_send_failed");
+      return false;
     }
   }
 
@@ -172,11 +186,24 @@ export class ChatBridge {
       this.clearHeartbeatTimeout();
       return;
     }
+    if (
+      parsed
+      && typeof parsed === "object"
+      && (parsed as { type?: unknown }).type === "_bridge_error"
+      && (parsed as { code?: unknown }).code === "session_kicked"
+    ) {
+      this.tabSuperseded = true;
+    }
     this.opts.onEvent(parsed);
   }
 
   private handleClose(e: CloseEvent): void {
     this.stopHeartbeat();
+    if (this.tabSuperseded) {
+      this.tabSuperseded = false;
+      this.opts.onState("error", "ws_kicked");
+      return;
+    }
     // 4401 = "auth required"; surface it as an error so the route
     // guard can bounce the user to /login. NOT auto-reconnected —
     // the JWT is the problem; reconnecting would loop.

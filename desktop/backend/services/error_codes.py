@@ -59,6 +59,10 @@ _MESSAGES: Final[dict[str, str]] = {
     "workspace_missing":
         "This folder is no longer available.",
 
+    "session_kicked":
+        "Another tab has this chat — reload this page to reconnect. "
+        "(Only one live connection per chat is allowed so your session stays consistent.)",
+
     # ── Network / runtime ─────────────────────────────────────────
     "network":
         "Connection lost. Please try again.",
@@ -109,6 +113,56 @@ def bridge_error(code: str, **extra: Any) -> dict[str, Any]:
     return payload
 
 
+# Codes that are normal user / session lifecycle events, NOT operational
+# problems. They were previously logged via `log_error` (`[err]` prefix),
+# which made dev / prod stderr look like the system was constantly on
+# fire — every Stop button press surfaced as `[err] code=aborted`,
+# every duplicate-tab refresh as `[err] code=session_kicked`. Logging
+# them as `[info]` keeps the audit trail intact (we still see them when
+# debugging) but they don't pollute error dashboards or trigger alert
+# thresholds. The user explicitly called this out as "soo many errors
+# spawning on the chat" / "even when reloading … flickering occurs"
+# despite the actual session being healthy.
+_LIFECYCLE_CODES: Final[frozenset[str]] = frozenset({
+    "aborted",
+    "session_kicked",
+})
+
+
+def _emit(level: str, code: str, ctx: dict[str, Any], exc: BaseException | None) -> None:
+    """Shared formatter for `log_info` / `log_error` — single grep-able
+    one-liner with consistent field ordering."""
+    bits: list[str] = [f"ts={int(time.time())}", f"code={code}"]
+    for k in ("session_id", "user_id", "where"):
+        v = ctx.pop(k, None)
+        if v is None:
+            continue
+        short = "session" if k == "session_id" else ("user" if k == "user_id" else k)
+        bits.append(f"{short}={v}")
+    if exc is not None:
+        bits.append(f"exc={type(exc).__name__}({exc!r})")
+    for k, v in ctx.items():
+        bits.append(f"{k}={v!r}")
+    print(f"[{level}] {' '.join(bits)}", file=sys.stderr)
+
+    if exc is not None:
+        traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
+
+
+def log_info(
+    code: str,
+    *,
+    session_id: str | None = None,
+    user_id: str | None = None,
+    where: str | None = None,
+    **ctx: Any,
+) -> None:
+    """Emit a routine lifecycle event — same one-liner shape as
+    `log_error` but tagged `[info]` so dashboards / alerting that key
+    on `[err]` ignore it."""
+    _emit("info", code, dict(ctx, session_id=session_id, user_id=user_id, where=where), None)
+
+
 def log_error(
     code: str,
     *,
@@ -125,25 +179,12 @@ def log_error(
 
     When `exc` is given, the full traceback is appended on the next
     lines so we don't have to chase repro steps later.
-    """
-    bits: list[str] = [
-        f"ts={int(time.time())}",
-        f"code={code}",
-    ]
-    if session_id:
-        bits.append(f"session={session_id}")
-    if user_id:
-        bits.append(f"user={user_id}")
-    if where:
-        bits.append(f"where={where}")
-    if exc is not None:
-        bits.append(f"exc={type(exc).__name__}({exc!r})")
-    for k, v in ctx.items():
-        bits.append(f"{k}={v!r}")
-    print(f"[err] {' '.join(bits)}", file=sys.stderr)
 
-    if exc is not None:
-        # Full traceback on subsequent lines so log grouping by `[err]`
-        # picks up the headline without repeating the stack for every
-        # similar failure.
-        traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
+    Routine lifecycle codes (`aborted`, `session_kicked`, …) are
+    auto-demoted to `[info]` so dashboards keying on `[err]` don't
+    light up on every Stop button press. See `_LIFECYCLE_CODES`.
+    """
+    if code in _LIFECYCLE_CODES and exc is None:
+        log_info(code, session_id=session_id, user_id=user_id, where=where, **ctx)
+        return
+    _emit("err", code, dict(ctx, session_id=session_id, user_id=user_id, where=where), exc)

@@ -42,15 +42,18 @@ import { createRouter, createWebHistory, type RouteRecordRaw } from "vue-router"
 
 import { useConfigStore } from "./stores/config";
 
-// Routes that bypass the Clerk auth guard. Home / Picker stay public
-// because:
+// Routes that bypass the Clerk auth guard. Home / Picker / Start stay
+// public because:
 //
-//   1. Clerk's hosted sign-in redirects to /sessions right after
-//      sign-in, but the auth cookie hasn't necessarily been written
-//      by the time the guard runs (race window during the OAuth
-//      round-trip). If the guard 401-bounces in that window we end
-//      up in a redirect loop: /sessions → /login → Clerk → /sessions
-//      → /login → ...
+//   1. Clerk's hosted sign-in redirects to /start (or /sessions) right
+//      after sign-in, but the auth cookie hasn't necessarily been
+//      written by the time the guard runs (race window during the
+//      OAuth round-trip). If the guard 401-bounces in that window we
+//      end up in a redirect loop: /start → /login → Clerk → /start →
+//      /login → … Letting the destination view itself read auth state
+//      avoids the loop entirely; the underlying API calls /start makes
+//      will 401 if the cookie is genuinely missing, surfacing a clean
+//      error rather than ping-ponging the user.
 //   2. The Home page itself is the marketing landing — it MUST be
 //      reachable without auth or new visitors hit a sign-in wall
 //      with no context.
@@ -66,6 +69,7 @@ const PUBLIC_ROUTES = new Set([
   "home",
   "login",
   "sessions",
+  "start",
   "privacy",
   "terms",
   "pricing",
@@ -90,13 +94,24 @@ const routes: RouteRecordRaw[] = [
     meta: { header: "full", footer: true },
   },
   {
-    // Picker — the first authenticated surface. Clerk's Account
-    // Portal sends users to /sessions after sign-in / sign-up, so
-    // the route name is fixed.
+    // Picker — the workspace/chat list. Reachable manually from the
+    // header link or as the post-sign-in surface for users who don't
+    // want auto-resolution.
     path: "/sessions",
     name: "sessions",
     component: () => import("./views/Picker.vue"),
     meta: { header: "full", footer: true },
+  },
+  {
+    // Auto-router: opens the user's most recent chat (or mints one
+    // for brand-new accounts) and replaces itself with /chat/<sid>.
+    // This is the post-sign-in landing page so users skip the picker
+    // step entirely on the common path. See views/Start.vue for the
+    // resolution rules and fallback behaviour.
+    path: "/start",
+    name: "start",
+    component: () => import("./views/Start.vue"),
+    meta: { header: "compact", footer: false },
   },
   {
     path: "/chat/:sid",

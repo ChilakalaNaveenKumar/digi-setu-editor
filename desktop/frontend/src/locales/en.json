@@ -178,7 +178,7 @@
       "ws_error": "Lost connection to the chat backend. Reconnect to keep going.",
       "ws_unauthorized": "Your session expired. Sign in again to keep chatting.",
       "ws_forbidden": "Your session was rejected. Sign in again, or check that your subscription is active.",
-      "ws_kicked": "This chat was opened in another window. Reconnect here to take it back.",
+      "ws_kicked": "This window was disconnected — the same chat is open elsewhere.\n\nOnly one Digi Setu window can control a chat at a time. That keeps your history, files, and running tools consistent.\n\nUse Reconnect when you want this window to take over (or close the other window).",
       "ws_too_many_chats": "You already have 5 chats open. Close one of your other Digi Setu windows before starting another.",
       "ws_rate_limited": "You're connecting too fast. Wait a few seconds and try again.",
       "ws_send_failed": "Couldn't send your message. Reconnect and retry.",

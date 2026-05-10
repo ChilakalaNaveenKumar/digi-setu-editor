@@ -94,6 +94,129 @@ export const useChatStore = defineStore("chat", () => {
   const connState = ref<ConnState>("idle");
   const isStreaming = ref(false);
   const lastError = ref<string | null>(null);
+  // Stable error code that produced `lastError`. Lets the error-card
+  // component (`SessionDisconnectedCard`) pick the right kind / icon /
+  // primary action via its switch statement instead of falling through
+  // to the generic "Something went wrong" path. See web mirror for the
+  // same pattern. Distinct from `lastError` (the localised string)
+  // because the card only matches against codes, not localised copy.
+  const lastErrorCode = ref<string | null>(null);
+
+  // ── Transient error suppression ────────────────────────────────────
+  //
+  // Mirrors web/frontend/src/stores/chat.ts. The bridge fires
+  // onState("error", code) on every WS hiccup and immediately
+  // schedules an exponential-backoff reconnect. For network-y codes
+  // the next attempt usually succeeds within 1-3 s, so painting the
+  // full "Connection lost" card right away just gives the user a
+  // 1-second flash of red — exactly the flicker users complained
+  // about ("when an error occured and even if you reload or refresh
+  // flickering occurs").
+  //
+  // Quarantine those codes for `TRANSIENT_GRACE_MS`; if connState
+  // returns to "open" before the timer fires we silently drop the
+  // pending error and the user only ever saw a small "Reconnecting…"
+  // pill (rendered by ChatPane.vue off `isReconnecting`). Otherwise
+  // we promote into the full card after the grace window.
+  //
+  // Terminal codes (auth, quota, kicked, …) bypass the grace —
+  // there's no auto-retry that fixes them, so showing the card
+  // immediately is the right move.
+  const TRANSIENT_CODES: ReadonlySet<string> = new Set([
+    "network",
+    "ws_unreachable",
+    "ws_error",
+    "ws_send_failed",
+    "not_connected",
+    "capacity",
+    "internal",
+  ]);
+  const TRANSIENT_GRACE_MS = 3000;
+  const _transientPending = ref<string | null>(null);
+  let _transientPendingTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function _cancelTransientPending(): void {
+    if (_transientPendingTimer) {
+      clearTimeout(_transientPendingTimer);
+      _transientPendingTimer = null;
+    }
+    _transientPending.value = null;
+  }
+
+  function _setError(code: string | null): void {
+    if (!code) {
+      _cancelTransientPending();
+      lastError.value = null;
+      lastErrorCode.value = null;
+      return;
+    }
+    if (TRANSIENT_CODES.has(code)) {
+      // Don't overwrite an already-shown HARD error with a transient
+      // pending — terminal cards win until the user explicitly
+      // dismisses or recovers.
+      if (lastErrorCode.value && !TRANSIENT_CODES.has(lastErrorCode.value)) {
+        return;
+      }
+      _transientPending.value = code;
+      if (_transientPendingTimer) clearTimeout(_transientPendingTimer);
+      _transientPendingTimer = setTimeout(() => {
+        _transientPendingTimer = null;
+        if (_transientPending.value && connState.value !== "open") {
+          const promoted = _transientPending.value;
+          _transientPending.value = null;
+          lastErrorCode.value = promoted;
+          lastError.value = _localiseError(promoted);
+        } else {
+          _transientPending.value = null;
+        }
+      }, TRANSIENT_GRACE_MS);
+      return;
+    }
+    _cancelTransientPending();
+    lastErrorCode.value = code;
+    lastError.value = _localiseError(code);
+  }
+  function clearError(): void {
+    _setError(null);
+  }
+
+  // Pi auto-compaction status, mirrors web/.../stores/chat.ts.
+  // `null` = idle. Active=true while pi summarises; active=false +
+  // succeeded captures the post-result toast (auto-cleared after 8s).
+  interface CompactionState {
+    active: boolean;
+    reason: string;
+    finishedAt: number | null;
+    succeeded: boolean | null;
+    errorMessage: string | null;
+  }
+  const compactionState = ref<CompactionState | null>(null);
+  function dismissCompaction(): void {
+    compactionState.value = null;
+  }
+
+  // Surface to ChatPane for the slim "Reconnecting…" pill rendered
+  // during the grace window (and any subsequent auto-reconnect
+  // attempts before the bridge gives up). Independent of `errorCard`
+  // so the pill and card never both show.
+  const isReconnecting = computed(
+    () => _transientPending.value !== null
+      || (connState.value === "connecting" && messages.value.length > 0),
+  );
+
+  // First-connect skeleton state — true while the bridge is opening
+  // its first WS for an empty (history-less) chat surface.
+  const isInitialConnecting = computed(
+    () => connState.value === "connecting" && messages.value.length === 0
+      && !lastErrorCode.value,
+  );
+
+  // Drop pending transient error the moment we re-open. Guards
+  // against the weird case where the grace timer fires AFTER a
+  // successful reopen (race with setTimeout's macrotask ordering).
+  watch(connState, (state) => {
+    if (state === "open") _cancelTransientPending();
+  });
   // Set by `abort()`, cleared by the connect()-side bridge state handler
   // when the WS subsequently closes. Used to silently respawn pi after
   // a user-driven abort instead of stranding the chat in "Connection
@@ -122,6 +245,13 @@ export const useChatStore = defineStore("chat", () => {
     router: RouterState;
     isStreaming: boolean;
     lastError: string | null;
+    // Mirrors `lastErrorCode` on the active store; round-trips through
+    // park → restore so the error card on a restored session resolves
+    // its kind / icon / action correctly. Without this the restored
+    // card always falls through to the generic "Something went wrong"
+    // path because it can't match a localised string against the
+    // code-keyed switch.
+    lastErrorCode: string | null;
     connState: ConnState;
     cwd: string | undefined;
     queuedMessages: QueuedMessage[];
@@ -356,7 +486,7 @@ export const useChatStore = defineStore("chat", () => {
     messages.value = [];
     session.value = { id: sessionId };
     isStreaming.value = false;
-    lastError.value = null;
+    clearError();
     _resetDisplayTotals();
     queuedMessages.value = [];
     pendingAttachments.value = [];
@@ -377,8 +507,10 @@ export const useChatStore = defineStore("chat", () => {
     const parked = parkedSessions.get(sessionId);
     if (parked) {
       parkedSessions.delete(sessionId);
-      _restoreFromParked(parked);
-      return;
+      if (parked.bridge.isOpen) {
+        _restoreFromParked(parked);
+        return;
+      }
     }
 
     try {
@@ -401,7 +533,11 @@ export const useChatStore = defineStore("chat", () => {
       onState: (state, error) => {
         if (bridge !== newBridge) return;
         connState.value = state;
-        if (state === "error" && error) lastError.value = error;
+        // The bridge passes us a STABLE error code (ws_kicked,
+        // ws_unreachable, ws_send_failed, …) — feed it through
+        // _setError so the card binding (lastErrorCode) and the
+        // localised label (lastError) stay in lock-step.
+        if (state === "error" && error) _setError(error);
         if (state === "closed" || state === "error") isStreaming.value = false;
         // After a client-driven abort the backend closes the WS with code
         // 4410, which the bridge surfaces as a normal "closed" state. We
@@ -444,6 +580,7 @@ export const useChatStore = defineStore("chat", () => {
       router,
       isStreaming: isStreaming.value,
       lastError: lastError.value,
+      lastErrorCode: lastErrorCode.value,
       connState: connState.value,
       cwd: session.value.cwd,
       queuedMessages: queuedMessages.value.slice(),
@@ -465,7 +602,10 @@ export const useChatStore = defineStore("chat", () => {
       sessionId: sid,
       onState: (state, error) => {
         parked.connState = state;
-        if (state === "error" && error) parked.lastError = error;
+        if (state === "error" && error) {
+          parked.lastErrorCode = error;
+          parked.lastError = _localiseError(error);
+        }
         if (state === "closed" || state === "error") parked.isStreaming = false;
       },
       onEvent: (raw) => {
@@ -490,6 +630,7 @@ export const useChatStore = defineStore("chat", () => {
     session.value = { id: parked.sid, cwd: parked.cwd };
     isStreaming.value = parked.isStreaming;
     lastError.value = parked.lastError;
+    lastErrorCode.value = parked.lastErrorCode;
     connState.value = parked.connState;
 
     queuedMessages.value = parked.queuedMessages;
@@ -509,7 +650,7 @@ export const useChatStore = defineStore("chat", () => {
       onState: (state, error) => {
         if (bridge !== restoredBridge) return;
         connState.value = state;
-        if (state === "error" && error) lastError.value = error;
+        if (state === "error" && error) _setError(error);
         if (state === "closed" || state === "error") isStreaming.value = false;
         if (state === "closed" && _abortedAwaitingReconnect) {
           _abortedAwaitingReconnect = false;
@@ -572,6 +713,7 @@ export const useChatStore = defineStore("chat", () => {
 
     if (evt.type === "_bridge_error") {
       const code = String(evt.code ?? "internal");
+      parked.lastErrorCode = code;
       parked.lastError = _localiseError(code);
       parked.isStreaming = false;
       return;
@@ -744,6 +886,46 @@ export const useChatStore = defineStore("chat", () => {
     if (evt.type === "agent_start" || evt.type === "turn_start") isStreaming.value = true;
     else if (evt.type === "agent_end") isStreaming.value = false;
 
+    // Pi auto-compaction: pi-mono summarises the conversation when
+    // context approaches `contextWindow - reserveTokens` (default
+    // ~16k). Summary IS persisted to pi's session jsonl AND IS what
+    // gets sent on subsequent prompts. Pill exposes this so the user
+    // sees that history is being summarised — otherwise the feature
+    // is invisible and users worry earlier context was lost.
+    if (evt.type === "compaction_start") {
+      const reason = String((evt as { reason?: string }).reason || "threshold");
+      compactionState.value = {
+        active: true,
+        reason,
+        finishedAt: null,
+        succeeded: null,
+        errorMessage: null,
+      };
+      return;
+    }
+    if (evt.type === "compaction_end") {
+      const aborted = Boolean((evt as { aborted?: boolean }).aborted);
+      const errorMessage =
+        typeof (evt as { errorMessage?: string }).errorMessage === "string"
+          ? ((evt as { errorMessage?: string }).errorMessage as string)
+          : null;
+      const succeeded = !aborted && !errorMessage;
+      compactionState.value = {
+        active: false,
+        reason: compactionState.value?.reason ?? "threshold",
+        finishedAt: Date.now(),
+        succeeded,
+        errorMessage,
+      };
+      window.setTimeout(() => {
+        const cs = compactionState.value;
+        if (cs && cs.finishedAt && Date.now() - cs.finishedAt >= 7500) {
+          compactionState.value = null;
+        }
+      }, 8000);
+      return;
+    }
+
     if (evt.type === "session" && session.value) {
       session.value = { id: session.value.id, cwd: String(evt.cwd ?? "") };
     }
@@ -817,11 +999,10 @@ export const useChatStore = defineStore("chat", () => {
       // The backend's English message is human-readable but it's
       // still server-side language ("Cloud relay rejected the
       // connection (HTTP 403)") that we don't want surfacing to
-      // end users. _localiseError falls back to the generic
-      // "Something went wrong" if the code has no entry yet —
-      // that's a strictly better UX than leaking raw text.
-      const localised = _localiseError(code);
-      lastError.value = localised;
+      // end users. _setError stamps both the localised label
+      // AND the stable code so the error card can resolve its
+      // kind / icon / action from the code switch.
+      _setError(code);
 
       if (code === "quota_exceeded") {
         useBillingStore().noteExhausted(null);
@@ -884,13 +1065,21 @@ export const useChatStore = defineStore("chat", () => {
       tailMsg.error = _localiseError(tailMsg.errorCode);
     }
 
-    // Mirror the now-localised error to the bottom banner so the
+    // Mirror the now-localised error to the error card so the
     // failure is visible no matter where the user is scrolled.
     // Skip if a previous tick already populated lastError — the
     // _bridge_error path sets it in its own branch above.
-    if (evt.type === "message_end" && !lastError.value) {
-      if (tailMsg && tailMsg.kind === "assistant" && tailMsg.error) {
-        lastError.value = tailMsg.error;
+    if (evt.type === "message_end" && !lastErrorCode.value) {
+      if (
+        tailMsg &&
+        tailMsg.kind === "assistant" &&
+        tailMsg.errorCode &&
+        tailMsg.error
+      ) {
+        // Prefer the stable code (so the card resolves the right
+        // kind/icon/action). The localised string was already stamped
+        // on the bubble — _setError will re-localise from the code.
+        _setError(tailMsg.errorCode);
         isStreaming.value = false;
       }
     }
@@ -914,7 +1103,10 @@ export const useChatStore = defineStore("chat", () => {
   // ── outbound ───────────────────────────────────────────────────────
   function sendPrompt(text: string): void {
     if (!bridge || !bridge.isOpen) {
-      lastError.value = "Not connected";
+      _setError("ws_unreachable");
+      // Bridge is dead — kick off a reconnect attempt so the next
+      // user retry has a chance of landing on a live socket.
+      void reconnect();
       return;
     }
     // Wrap with attachments if any are pending. The wrapping is done
@@ -924,9 +1116,22 @@ export const useChatStore = defineStore("chat", () => {
     const wrapped = _wrapWithAttachments(text);
     if (!wrapped.trim()) return;
     const reqId = `req-${Date.now()}`;
+    // Send FIRST, only mutate UI state on success. The bridge can
+    // silently fail when the WS closed in the gap between `isOpen`
+    // returning true and `send()` actually writing to the socket
+    // (kicked tab, network blip, transient proxy disconnect…). The
+    // previous order — push bubble → send → mark streaming — left
+    // the UI stuck on "Stop" with no assistant response when that
+    // race fired. Sending first means the local state stays
+    // consistent with what actually went over the wire.
+    const ok = bridge.send({ id: reqId, type: "prompt", message: wrapped });
+    if (!ok) {
+      _setError("ws_send_failed");
+      void reconnect();
+      return;
+    }
     pushUserMessage(router, wrapped, reqId);
     messages.value = [...router.messages];
-    bridge.send({ id: reqId, type: "prompt", message: wrapped });
     isStreaming.value = true;
     // Attachments are one-shot: cleared after the prompt that included
     // them is sent. The agent's `read` call against the path will work
@@ -935,6 +1140,15 @@ export const useChatStore = defineStore("chat", () => {
   }
 
   function abort(): void {
+    // Always free the local UI immediately. If we relied on the
+    // backend to send `agent_end` / `message_end` to flip the spinner
+    // back, a stuck-streaming UI (e.g. when the prompt was silently
+    // dropped on a half-closed WS — see bridge.send notes) would
+    // never recover even after the user clicked Stop. Resetting
+    // locally first means Stop ALWAYS unsticks the chat from the
+    // user's point of view; the backend abort is a best-effort
+    // courtesy on top of that.
+    isStreaming.value = false;
     if (!bridge || !bridge.isOpen) return;
     // Arm the auto-reconnect flag *before* we send the frame. The
     // backend closes the WS very fast (the abort handler sends one
@@ -955,15 +1169,24 @@ export const useChatStore = defineStore("chat", () => {
   // messages have different attachment lists without leaking.
   function _sendQueuedItem(item: QueuedMessage): void {
     if (!bridge || !bridge.isOpen) {
-      lastError.value = "Not connected";
+      _setError("ws_unreachable");
+      void reconnect();
       return;
     }
     const body = _wrapWithAttachments(item.text, item.attachments);
     if (!body.trim()) return;
     const reqId = `req-${Date.now()}`;
+    // Send first, then mutate UI — see sendPrompt() for the full
+    // rationale. Without this order a queued item silently dropped on
+    // a stale WS would push a user bubble that pi never received.
+    const ok = bridge.send({ id: reqId, type: "prompt", message: body });
+    if (!ok) {
+      _setError("ws_send_failed");
+      void reconnect();
+      return;
+    }
     pushUserMessage(router, body, reqId);
     messages.value = [...router.messages];
-    bridge.send({ id: reqId, type: "prompt", message: body });
     isStreaming.value = true;
   }
 
@@ -1086,6 +1309,12 @@ export const useChatStore = defineStore("chat", () => {
     connState,
     isStreaming,
     lastError,
+    lastErrorCode,
+    clearError,
+    isReconnecting,
+    isInitialConnecting,
+    compactionState,
+    dismissCompaction,
     totals,
     pendingAttachments,
     queuedMessages,

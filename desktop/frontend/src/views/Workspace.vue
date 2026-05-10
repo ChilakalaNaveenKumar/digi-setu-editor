@@ -89,7 +89,7 @@ watch(() => props.sid, open);
  * has no active session (e.g. user clicked Reconnect on a stale tab).
  */
 async function onReconnect(): Promise<void> {
-  chat.lastError = null;
+  chat.clearError();
   await chat.reconnect();
 }
 
