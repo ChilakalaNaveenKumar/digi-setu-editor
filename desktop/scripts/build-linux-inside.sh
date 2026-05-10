@@ -39,7 +39,19 @@ echo "[linux-build] rust: $(rustc --version)  python: $(python3 --version)"
 echo
 echo "[linux-build] === sidecar (PyInstaller, in-container venv) ==="
 SIDECAR_VENV="/tmp/sidecar-venv"
-python3 -m venv "$SIDECAR_VENV"
+# Prefer python3.11 if installed (deadsnakes PPA in CI, Homebrew on
+# laptops). Falling back to plain `python3` is the path that bit us
+# on Bitbucket: ubuntu:22.04's default python3 is 3.10, and that
+# image doesn't ship `python3.10-venv`, so `python3 -m venv` failed
+# with "ensurepip is not available". The Dockerfile.linux-build
+# image always has 3.11; the YAML's apt-get installs 3.11 + venv.
+if command -v python3.11 >/dev/null 2>&1; then
+    PY=python3.11
+else
+    PY=python3
+fi
+echo "[linux-build] sidecar python: $($PY --version)"
+"$PY" -m venv "$SIDECAR_VENV"
 # shellcheck disable=SC1091
 source "$SIDECAR_VENV/bin/activate"
 python -m pip install --upgrade pip
