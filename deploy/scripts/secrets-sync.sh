@@ -200,6 +200,40 @@ seed_iam() {
             warn "${k}: secret missing, skip"
         fi
     done
+
+    # Vertex AI is the actual LLM provider for both Claude (anthropic-vertex)
+    # and Gemini sub-routers (typst-tools, title generation). Without
+    # roles/aiplatform.user the VM SA's ADC tokens are valid OAuth but the
+    # principal has no Vertex permission → Vertex returns 401
+    # ACCESS_TOKEN_TYPE_UNSUPPORTED on every :rawPredict / :streamRawPredict
+    # / :generateContent call, which the SPA surfaces as the misleading
+    # "Your sign-in needs a refresh" toast.
+    #
+    # Grant on every project the runtime might target. GOOGLE_CLOUD_PROJECT
+    # in stack.env decides which project Vertex requests bill to (today
+    # frontend-472812 because that's where the publisher agreements were
+    # accepted first). Adding additional projects here is harmless if the
+    # SA already has the role — the binding is idempotent.
+    local vertex_projects=(
+        "${PROJECT}"
+        "${VERTEX_PROJECT_EXTRA:-frontend-472812}"
+    )
+    local p
+    for p in "${vertex_projects[@]}"; do
+        [[ -z "$p" ]] && continue
+        if gcloud projects describe "$p" >/dev/null 2>&1; then
+            log "granting roles/aiplatform.user on ${p} to ${VM_SA}"
+            gcloud projects add-iam-policy-binding "$p" \
+                --member "serviceAccount:${VM_SA}" \
+                --role roles/aiplatform.user \
+                --condition=None \
+                --quiet >/dev/null 2>&1 \
+                && log "${p}: aiplatform.user granted" \
+                || warn "${p}: aiplatform.user grant failed"
+        else
+            warn "${p}: project not accessible, skip Vertex IAM"
+        fi
+    done
 }
 
 # ─────────────────────────────────────────────────────────────────────
