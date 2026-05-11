@@ -95,16 +95,61 @@ REMOTE_DIR="/srv/pi/downloads"
 # `--tunnel-through-iap` gcloud bypasses plink entirely and uses its
 # own Python-based tunneller, which has no interactive prompts AND
 # also removes the need for the runner to have inbound SSH from the
-# public internet. Belt-and-suspenders: pass `-o StrictHostKeyChecking=
-# accept-new` so even on the rare path that still goes through ssh/
-# plink, the host key is auto-accepted on first use.
+# public internet. The `--strict-host-key-checking=no` belt-and-
+# suspenders auto-accepts the host key on any path that still goes
+# through ssh/plink (e.g. if IAP is unavailable for some reason).
+#
+# `gcloud compute scp` and `gcloud compute ssh` accept the SAME
+# transport flags. Earlier we tried `--ssh-flag=…` here but scp
+# rejects it ("unrecognized arguments") since it has its own
+# `--scp-flag`. Stick to flags both subcommands speak.
 SSH_COMMON_ARGS=(
   --tunnel-through-iap
-  --ssh-flag="-o StrictHostKeyChecking=accept-new"
-  --ssh-flag="-o UserKnownHostsFile=/dev/null"
-  --ssh-flag="-o GlobalKnownHostsFile=/dev/null"
-  --ssh-flag="-o BatchMode=yes"
+  --strict-host-key-checking=no
 )
+
+# ── OS Login key-bloat prune ───────────────────────────────────────
+# CI service accounts accumulate one SSH key per `gcloud compute
+# ssh` call. Google's OS Login caps the profile at 32 KiB:
+#
+#     ERROR: (gcloud.compute.ssh) FAILED_PRECONDITION:
+#     Login profile size exceeds 32 KiB.
+#
+# Once that triggers, EVERY subsequent ssh/scp from the same SA
+# fails until the keys are pruned. We prune defensively here on
+# every CI run (no-op if there are 0-3 keys; saves the day when
+# there are hundreds left over from prior runs). Failures are
+# swallowed because:
+#   - locally there's no OS Login profile to prune (developer's
+#     personal keys live in their own account, not the CI SA);
+#   - older gcloud versions don't have `os-login ssh-keys list`
+#     (use the REST fallback or skip).
+#
+# Belt-and-suspenders: also restrict the prune to keys older than
+# 1 hour so a parallel CI job's freshly-added key isn't yanked
+# from under it.
+prune_oslogin_keys() {
+  local cutoff_seconds="${1:-3600}"
+  if ! command -v gcloud >/dev/null 2>&1; then return 0; fi
+  local now keys
+  now="$(date +%s)"
+  keys="$(gcloud compute os-login ssh-keys list \
+    --format='value(key.fingerprint,key.expirationTimeUsec)' 2>/dev/null || true)"
+  if [[ -z "${keys}" ]]; then return 0; fi
+  while IFS=$'\t' read -r fp exp; do
+    [[ -z "${fp}" ]] && continue
+    # If we can't parse the timestamp, prune anyway — stale entries
+    # are the whole reason this function exists.
+    local age=999999
+    if [[ -n "${exp}" && "${exp}" =~ ^[0-9]+$ ]]; then
+      age=$(( now - exp / 1000000 ))
+    fi
+    if (( age > cutoff_seconds )); then
+      gcloud compute os-login ssh-keys remove --key="${fp}" >/dev/null 2>&1 || true
+    fi
+  done <<< "${keys}"
+}
+prune_oslogin_keys 3600
 
 if [[ $# -lt 1 ]]; then
   echo "Usage: $0 PATH_TO_DMG [REMOTE_FILENAME]" >&2
