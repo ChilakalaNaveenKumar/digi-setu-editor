@@ -48,6 +48,12 @@ fi
 # thaw is identical from the API surface (same blob, same name); the
 # only difference is a slightly higher per-operation fee, which is
 # trivial since each thaw is a one-shot read.
+#
+# IMPORTANT: we apply via `gsutil lifecycle set` not
+# `gcloud storage buckets update --lifecycle-file`. The latter
+# silently no-ops on some gcloud versions (the field shows as null
+# when read back via gcloud OR via gsutil). gsutil is the source of
+# truth here. Independently re-verified via the JSON API below.
 log "applying lifecycle rule (COLDLINE → ARCHIVE @ 365d)"
 TMPF=$(mktemp)
 trap 'rm -f "${TMPF}"' EXIT
@@ -61,9 +67,7 @@ cat > "${TMPF}" <<'JSON'
   ]
 }
 JSON
-gcloud storage buckets update "gs://${BUCKET}" \
-  --project="${PROJECT}" \
-  --lifecycle-file="${TMPF}"
+gsutil lifecycle set "${TMPF}" "gs://${BUCKET}"
 
 # ── 3. Versioning + 7-day soft-delete on noncurrent objects ────────
 # So an operator's `gsutil rm` (or a buggy reaper) can be undone
@@ -103,6 +107,41 @@ gcloud compute resource-policies create snapshot-schedule "${POLICY}" \
 gcloud compute disks add-resource-policies "${VM}" \
   --project="${PROJECT}" --zone="${ZONE}" \
   --resource-policies="${POLICY}" 2>&1 | grep -v "already" || true
+
+# ── 6. Verify (the gcloud client lies about lifecycle, hit the API) ─
+# We talk to the JSON API directly because:
+#   * `gcloud storage buckets describe` reports lifecycle as null
+#     even when it's set (client serialization bug).
+#   * `gsutil lifecycle get` returns the raw rules but doesn't show
+#     versioning/soft-delete in one call.
+# A 200 with the expected fields proves all four configurations
+# (storage class, lifecycle, versioning, soft-delete) actually stuck.
+log "verifying bucket configuration via JSON API"
+TOKEN=$(gcloud auth print-access-token)
+RESP=$(curl -s -H "Authorization: Bearer ${TOKEN}" \
+  "https://storage.googleapis.com/storage/v1/b/${BUCKET}?fields=lifecycle,storageClass,versioning,softDeletePolicy")
+python3 - <<PYEOF
+import json, sys
+b = json.loads('''${RESP}''')
+ok = True
+def need(cond, msg):
+    global ok
+    if not cond:
+        print(f"  ✗ {msg}", file=sys.stderr); ok = False
+    else:
+        print(f"  ✓ {msg}")
+need(b.get('storageClass') == 'COLDLINE', 'storage class = COLDLINE')
+rules = (b.get('lifecycle') or {}).get('rule') or []
+need(any(r.get('action', {}).get('storageClass') == 'ARCHIVE' and
+         r.get('condition', {}).get('age') == 365
+         for r in rules),
+     'lifecycle: SetStorageClass→ARCHIVE @ age 365')
+need((b.get('versioning') or {}).get('enabled') is True,
+     'object versioning enabled')
+need((b.get('softDeletePolicy') or {}).get('retentionDurationSeconds') == '604800',
+     'soft-delete retention = 7 days')
+sys.exit(0 if ok else 1)
+PYEOF
 
 log "done"
 echo

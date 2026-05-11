@@ -304,6 +304,15 @@ class SessionRuntime:
             if self._pi is not None:
                 return
 
+            # NB: no `use_cloud_relay` — web's pi process talks to Vertex
+            # DIRECTLY via the VM's attached service-account ADC. The relay
+            # is a desktop-only construct (sidecar can't ship ADC, so the
+            # local llm-proxy injects a Clerk JWT and a cloud relay swaps
+            # in ADC). The `self.use_cloud_relay` attribute remains on
+            # SessionRuntime for signature parity with the desktop mirror,
+            # but never reaches PiSession on web — the web PiSession
+            # constructor doesn't accept it (passing here used to TypeError
+            # on every prompt POST).
             self._pi = PiSession(
                 session_id=self.session_id,
                 workspace_path=self.workspace_path,
@@ -313,7 +322,6 @@ class SessionRuntime:
                 permission_mode=self.permission_mode,
                 permission_mode_file=self.permission_mode_file,
                 user_id=self.user_id,
-                use_cloud_relay=self.use_cloud_relay,
             )
             try:
                 await self._pi.start()

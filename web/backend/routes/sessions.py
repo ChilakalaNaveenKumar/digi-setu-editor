@@ -14,19 +14,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Response
 
 from models.workspace import SessionCreate, SessionModelUpdate, SessionRename
 from routes._helpers import session_for_user_or_404, workspace_for_user_or_404
 from services.auth import require_user
 from services.billing import CreditLedger
-from services.chat_storage import (
-    cleanup_for_user as _cleanup_for_user,
-    cycle_status_for_user as _cycle_status_for_user,
-    default_keep as _default_keep,
-    run_cycle_for_user as _run_cycle_for_user,
-    stats_for_user as _stats_for_user,
-)
 from services.history import load_history
 from services.models_registry import is_allowed
 from services.registry import Registry
@@ -159,77 +152,58 @@ async def get_session_history(
 
 
 # ── Storage cleanup (account-wide) ─────────────────────────────────
-# Web policy: a rolling 90-day cycle automatically sweeps every
-# user-removable artifact (chats, audits, uploads) older than the
-# cycle window. The SPA shows a banner 5 days before each sweep.
+# Web has NO automatic cleanup. The 90-day rolling sweep that used
+# to live here was retired once cold-archive landed: idle workspaces
+# are now transparently moved to GCS Coldline (see
+# services/cold_archive.py + the pi-cold-archive systemd timer)
+# instead of being deleted. Disk pressure on the VM is solved
+# without ever destroying user data.
 #
-# Routes:
-#   GET  /api/storage/cycle      → cycle status (banner data + pending counts)
-#   POST /api/storage/cycle/run  → force-run the cycle now (the
-#                                  "Clean now" button)
+# Old endpoints kept as thin 410 responders so any cached SPA
+# bundle in the wild stops asking after one page load:
+#   GET  /api/storage/cycle             → 410 Gone
+#   POST /api/storage/cycle/run         → 410 Gone
+#   GET  /api/workspaces/{wsid}/storage → 410 Gone
+#   POST /api/workspaces/{wsid}/storage/cleanup → 410 Gone
 #
-# The legacy keep-newest-100 endpoints below are retained so older
-# SPA versions in the wild keep working during rollout. Once the new
-# UI is everywhere we can drop them.
+# Per-session deletion (DELETE /api/sessions/{sid}) remains the only
+# user-initiated way to remove a chat, and it has always been
+# explicit (single chat, click delete, confirm).
+_GONE_BODY = {
+    "error": "endpoint_removed",
+    "detail": (
+        "Web auto-cleanup was removed; idle workspaces now move to "
+        "cold storage automatically and are restored on next open. "
+        "To remove a single chat, use DELETE /api/sessions/{sid}."
+    ),
+}
+
+
 @router.get("/api/storage/cycle")
-async def get_storage_cycle(
-    background: BackgroundTasks,
+async def get_storage_cycle_gone(
     user_id: str = Depends(require_user),
 ) -> dict[str, Any]:
-    """Cycle state for the SPA banner.
-
-    Side effect: if the cycle is past due and the SPA-rendered
-    banner has already been visible for ``banner_lead_days``, we
-    schedule the actual sweep as a background task so it runs
-    AFTER the response is sent. This is how "auto-cleanup at 90
-    days" is implemented without a cron / scheduler — every page
-    load nudges the cycle forward when due.
-
-    The user already had at least ``banner_lead_days`` of warning
-    (status returned ``show_banner: True`` for that whole window),
-    so the actual sweep at day 90 is the documented behavior, not
-    a surprise.
-    """
-    status = _cycle_status_for_user(user_id)
-    if status["days_until_cycle"] == 0 and status["last_cycle_at"] is not None:
-        # Past-due and not a fresh account → auto-sweep in the
-        # background. Brand-new accounts (last_cycle_at is None)
-        # never auto-sweep — they get a full window first.
-        background.add_task(_run_cycle_for_user, user_id, force=False)
-    return status
+    raise HTTPException(status_code=410, detail=_GONE_BODY)
 
 
 @router.post("/api/storage/cycle/run")
-async def run_storage_cycle(
-    payload: dict[str, Any] | None = None,
+async def run_storage_cycle_gone(
     user_id: str = Depends(require_user),
 ) -> dict[str, Any]:
-    """Run the 90-day sweep now.
-
-    Body shape:
-      ``{"force": true}``  → manual "Clean now" — runs immediately
-                             even if the cycle isn't due.
-      ``{"force": false}`` → only run if the cycle is actually due
-                             (e.g. used by a periodic background
-                             task running on each request).
-    """
-    force = bool((payload or {}).get("force", False))
-    return _run_cycle_for_user(user_id, force=force)
+    raise HTTPException(status_code=410, detail=_GONE_BODY)
 
 
-# Legacy: keep-newest-100 endpoints. Used by older SPA bundles still
-# in user caches; the new banner-driven flow uses /api/storage/cycle.
 @router.get("/api/workspaces/{wsid}/storage")
-async def get_workspace_storage(
+async def get_workspace_storage_gone(
     wsid: str, user_id: str = Depends(require_user)
 ) -> dict[str, Any]:
     workspace_for_user_or_404(wsid, user_id)
-    return _stats_for_user(user_id, keep=_default_keep())
+    raise HTTPException(status_code=410, detail=_GONE_BODY)
 
 
 @router.post("/api/workspaces/{wsid}/storage/cleanup")
-async def cleanup_workspace_storage(
+async def cleanup_workspace_storage_gone(
     wsid: str, user_id: str = Depends(require_user)
 ) -> dict[str, Any]:
     workspace_for_user_or_404(wsid, user_id)
-    return _cleanup_for_user(user_id, keep=_default_keep())
+    raise HTTPException(status_code=410, detail=_GONE_BODY)
