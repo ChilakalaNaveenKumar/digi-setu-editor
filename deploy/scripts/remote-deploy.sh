@@ -72,6 +72,19 @@ run() {
   fi
 }
 
+# ── OS Login key-bloat prune ───────────────────────────────────────
+# Without this, every Bitbucket pipeline run leaks one SSH key onto
+# the CI service account's OS Login profile. After ~30 runs the
+# profile blows past Google's 32 KiB cap and EVERY subsequent
+# `gcloud compute ssh|scp` from this account dies with
+# `FAILED_PRECONDITION: Login profile size exceeds 32 KiB`. Run the
+# prune unconditionally up front so the helper has a clean slate
+# regardless of how many prior pipelines have run since the last
+# manual cleanup. See _oslogin-prune.sh for the full design.
+# shellcheck disable=SC1091
+source "$(dirname -- "${BASH_SOURCE[0]}")/_oslogin-prune.sh"
+prune_oslogin_keys
+
 # Strict host key checking on `gcloud compute ssh` defaults to `yes`,
 # which is correct for dev laptops (we never want to silently accept
 # a new host key for an existing VM — that would mean MITM). But on a

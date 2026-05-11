@@ -109,47 +109,13 @@ SSH_COMMON_ARGS=(
 )
 
 # ── OS Login key-bloat prune ───────────────────────────────────────
-# CI service accounts accumulate one SSH key per `gcloud compute
-# ssh` call. Google's OS Login caps the profile at 32 KiB:
-#
-#     ERROR: (gcloud.compute.ssh) FAILED_PRECONDITION:
-#     Login profile size exceeds 32 KiB.
-#
-# Once that triggers, EVERY subsequent ssh/scp from the same SA
-# fails until the keys are pruned. We prune defensively here on
-# every CI run (no-op if there are 0-3 keys; saves the day when
-# there are hundreds left over from prior runs). Failures are
-# swallowed because:
-#   - locally there's no OS Login profile to prune (developer's
-#     personal keys live in their own account, not the CI SA);
-#   - older gcloud versions don't have `os-login ssh-keys list`
-#     (use the REST fallback or skip).
-#
-# Belt-and-suspenders: also restrict the prune to keys older than
-# 1 hour so a parallel CI job's freshly-added key isn't yanked
-# from under it.
-prune_oslogin_keys() {
-  local cutoff_seconds="${1:-3600}"
-  if ! command -v gcloud >/dev/null 2>&1; then return 0; fi
-  local now keys
-  now="$(date +%s)"
-  keys="$(gcloud compute os-login ssh-keys list \
-    --format='value(key.fingerprint,key.expirationTimeUsec)' 2>/dev/null || true)"
-  if [[ -z "${keys}" ]]; then return 0; fi
-  while IFS=$'\t' read -r fp exp; do
-    [[ -z "${fp}" ]] && continue
-    # If we can't parse the timestamp, prune anyway — stale entries
-    # are the whole reason this function exists.
-    local age=999999
-    if [[ -n "${exp}" && "${exp}" =~ ^[0-9]+$ ]]; then
-      age=$(( now - exp / 1000000 ))
-    fi
-    if (( age > cutoff_seconds )); then
-      gcloud compute os-login ssh-keys remove --key="${fp}" >/dev/null 2>&1 || true
-    fi
-  done <<< "${keys}"
-}
-prune_oslogin_keys 3600
+# Source the shared helper so this runs at the top of every CI step
+# that touches `gcloud compute ssh|scp`. See _oslogin-prune.sh for
+# the full rationale; tl;dr: the 32 KiB cap on the active account's
+# OS Login profile is the single most common deploy failure mode.
+# shellcheck disable=SC1091
+source "$(dirname -- "${BASH_SOURCE[0]}")/_oslogin-prune.sh"
+prune_oslogin_keys
 
 if [[ $# -lt 1 ]]; then
   echo "Usage: $0 PATH_TO_DMG [REMOTE_FILENAME]" >&2
