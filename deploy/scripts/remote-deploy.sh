@@ -255,6 +255,8 @@ push_stack() {
   scp_remote "${DEPLOY_DIR}/systemd/pi-prepare.service"          "${REMOTE_ROOT}/systemd/pi-prepare.service"
   scp_remote "${DEPLOY_DIR}/systemd/pi-firewall.service"         "${REMOTE_ROOT}/systemd/pi-firewall.service"
   scp_remote "${DEPLOY_DIR}/systemd/pi-egress-network.service"   "${REMOTE_ROOT}/systemd/pi-egress-network.service"
+  scp_remote "${DEPLOY_DIR}/systemd/pi-cold-archive.service"     "${REMOTE_ROOT}/systemd/pi-cold-archive.service"
+  scp_remote "${DEPLOY_DIR}/systemd/pi-cold-archive.timer"       "${REMOTE_ROOT}/systemd/pi-cold-archive.timer"
   scp_remote "${DEPLOY_DIR}/nftables/pi-egress.nft"              "${REMOTE_ROOT}/nftables/pi-egress.nft"
   scp_remote "${DEPLOY_DIR}/scripts/cutover-from-typst-agent.sh" "${REMOTE_ROOT}/scripts/cutover-from-typst-agent.sh"
   scp_remote "${DEPLOY_DIR}/scripts/backup-to-gcs.sh"            "${REMOTE_ROOT}/scripts/backup-to-gcs.sh"
@@ -277,6 +279,8 @@ sudo install -m 0644 ${REMOTE_ROOT}/systemd/pi.service                /etc/syste
 sudo install -m 0644 ${REMOTE_ROOT}/systemd/pi-prepare.service        /etc/systemd/system/pi-prepare.service
 sudo install -m 0644 ${REMOTE_ROOT}/systemd/pi-firewall.service       /etc/systemd/system/pi-firewall.service
 sudo install -m 0644 ${REMOTE_ROOT}/systemd/pi-egress-network.service /etc/systemd/system/pi-egress-network.service
+sudo install -m 0644 ${REMOTE_ROOT}/systemd/pi-cold-archive.service   /etc/systemd/system/pi-cold-archive.service
+sudo install -m 0644 ${REMOTE_ROOT}/systemd/pi-cold-archive.timer     /etc/systemd/system/pi-cold-archive.timer
 
 # Install nftables ruleset (drop the metadata server for uid 1100).
 sudo install -d -m 0755 /etc/nftables.d
@@ -294,6 +298,10 @@ sudo chmod +x ${REMOTE_ROOT}/scripts/backup-to-gcs.sh
 
 sudo systemctl daemon-reload
 sudo systemctl enable pi-prepare.service pi-firewall.service pi-egress-network.service pi.service
+# Cold-archive timer: enabled + started so the daily reaper picks
+# up the new schedule immediately. .service is oneshot — only the
+# .timer needs to be running.
+sudo systemctl enable --now pi-cold-archive.timer
 
 # Start the firewall + create the docker network NOW so the metadata-
 # server hole is closed and per-session containers have somewhere to
@@ -405,18 +413,23 @@ roll_stack() {
   ssh_remote "set -e
 sudo test -f ${REMOTE_ROOT}/stack.env || { echo 'ERROR: ${REMOTE_ROOT}/stack.env missing — populate it before rolling' >&2; exit 1; }
 
-# Free disk before pulling. Without this, the 96 GB root partition
-# fills up after ~30 deploys (each backend image is ~3 GB and the per-
-# session image is ~3 GB, both retained as superseded layers). When the
-# disk hits 100 % the next \`docker pull\` fails mid-extract, the systemd
-# unit exits non-zero, and Bitbucket reports the pipeline as failed even
-# though the image was pushed cleanly to Artifact Registry. Pruning
-# anything not currently in use keeps the VM healthy without any human
-# intervention. \`|| true\` because prune is a maintenance op — its
-# failure should never abort an otherwise-good deploy.
+# Free disk before pulling. Without this, the root partition fills up
+# fast (each backend image is ~3 GB and the per-session image is
+# ~3 GB, both retained as superseded layers). At 100 % the next
+# \`docker pull\` fails mid-extract, pi.service exits non-zero, and
+# Bitbucket reports the pipeline as failed even though the image was
+# pushed cleanly to Artifact Registry.
+#
+# Earlier we passed \`--filter until=72h\` to keep recent superseded
+# images for fast rollbacks. That bit us: 10 deploys/day × 6 GB
+# each within a 72h window = 180 GB of retained junk and a dead VM.
+# We now drop the filter — every dangling/unreferenced image is
+# pruned each deploy. Rollback still works (one extra \`docker pull\`
+# from AR, ~30 s), and the steady-state docker footprint stays at
+# ~10 GB (the running stack + the previous tag we just superseded).
 echo \"[roll] pruning old docker resources\"
 sudo docker container prune -f 2>&1 | tail -1 || true
-sudo docker image prune -af --filter until=72h 2>&1 | tail -1 || true
+sudo docker image prune -af 2>&1 | tail -1 || true
 sudo docker builder prune -af 2>&1 | tail -1 || true
 echo \"[roll] disk after prune: \$(df -h / | awk 'NR==2 {print \$3 \"/\" \$2 \" (\" \$5 \" used)\"}')\"
 

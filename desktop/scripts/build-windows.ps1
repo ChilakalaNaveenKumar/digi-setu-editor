@@ -130,6 +130,22 @@ if (-not $SkipSidecar) {
 
 # ── 4. Vendored Node + pi (Windows tarball) ───────────────────────────
 Log "vendoring Windows Node + pi-coding-agent..."
+# Purge cross-platform Node dirs from prior dev runs — see the
+# matching block in build-mac.sh for the rationale. Tauri ships
+# the entire vendor/ tree so a stray darwin/linux Node from a
+# full-fetch run silently bloats the .exe installer.
+$VendorRoot = Join-Path $Desktop "pi-runtime\vendor"
+foreach ($prefix in @("node-darwin-", "node-linux-")) {
+    Get-ChildItem -Path $VendorRoot -Directory -Filter "$prefix*" -ErrorAction SilentlyContinue |
+        ForEach-Object { Remove-Item -Path $_.FullName -Recurse -Force }
+}
+# Strip include\ and share\ from any node-win-* that's still
+# around from a build that pre-dates the fetch-node prune.
+Get-ChildItem -Path $VendorRoot -Directory -Filter "node-win-*" -ErrorAction SilentlyContinue |
+    ForEach-Object {
+        Remove-Item -Path (Join-Path $_.FullName "include") -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path (Join-Path $_.FullName "share")   -Recurse -Force -ErrorAction SilentlyContinue
+    }
 & powershell -ExecutionPolicy Bypass -File (Join-Path $Desktop "pi-runtime\fetch-node.ps1") -CurrentPlatformOnly
 & powershell -ExecutionPolicy Bypass -File (Join-Path $Desktop "pi-runtime\install-pi.ps1")
 

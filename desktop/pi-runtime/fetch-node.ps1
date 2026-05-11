@@ -48,6 +48,16 @@ function Fetch-Node {
         }
         New-Item -ItemType Directory -Force -Path $target | Out-Null
         Copy-Item -Path (Join-Path $tmp "$dist\*") -Destination $target -Recurse -Force
+
+        # Strip dev-only files from the vendored runtime — see the
+        # corresponding comment in fetch-node.sh. `include\` and
+        # `share\` are headers + man pages that the desktop app
+        # never touches at runtime but bloat the installer (~50 MB
+        # per platform). Keep `bin\` (node, npm, npx) and `lib\`
+        # (npm's bundled deps).
+        Remove-Item -Path (Join-Path $target "include") -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path (Join-Path $target "share")   -Recurse -Force -ErrorAction SilentlyContinue
+
         Write-Host "[pi-runtime] $Platform: ready at $target"
     } finally {
         Remove-Item -Path $tmp -Recurse -Force -ErrorAction SilentlyContinue

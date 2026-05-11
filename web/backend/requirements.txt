@@ -23,6 +23,14 @@ stripe==15.1.0
 cryptography==45.0.6
 google-auth==2.42.1
 
+# GCS client used by services/cold_archive.py to swap idle workspaces
+# in/out of gs://digi-setu-cold/. We use the native client (not gsutil)
+# so the backend container doesn't have to ship the 500 MB Cloud SDK
+# just for two object operations. Auth is ADC via the VM's attached
+# service account on prod, gcloud-ADC on a laptop. Soft-imported (no
+# crash if PI_MODE != web or COLD_BUCKET is unset).
+google-cloud-storage==3.5.0
+
 # httpx is the streaming HTTP client used by routes/llm_relay.py to
 # forward Anthropic / Vertex calls from the desktop "local pi, cloud
 # auth" path. Already arrives transitively via clerk-backend-api but

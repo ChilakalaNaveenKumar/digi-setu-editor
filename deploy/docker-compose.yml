@@ -131,6 +131,14 @@ services:
       # backend/config.py (100 MB / 900 s). See stack.env.example.
       WORKSPACE_DISK_QUOTA_MB: ${WORKSPACE_DISK_QUOTA_MB:-}
       PROMPT_TIMEOUT_SECONDS: ${PROMPT_TIMEOUT_SECONDS:-}
+
+      # Cold-tier archival: GCS bucket where workspaces idle longer
+      # than COLD_THRESHOLD_DAYS get tar+gzip'd by the nightly
+      # pi-cold-archive timer (see deploy/systemd/). The backend
+      # transparently thaws on next open via registry.workspace_path.
+      # Empty = disabled (laptop dev).
+      COLD_BUCKET: ${COLD_BUCKET:-digi-setu-cold}
+      COLD_THRESHOLD_DAYS: ${COLD_THRESHOLD_DAYS:-30}
     env_file:
       # All non-default values that came from `stack.env` get loaded
       # here. The explicit `environment:` block above wins for vars

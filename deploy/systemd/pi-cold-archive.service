@@ -1,0 +1,32 @@
+[Unit]
+# Nightly cold-archive reaper. Walks every workspace under
+# /srv/pi/data/workspaces/, identifies any whose newest file is older
+# than COLD_THRESHOLD_DAYS, tar+gzips them along with the matching
+# /srv/pi/data/shadows/<wsid>/, uploads to gs://digi-setu-cold/, and
+# leaves a `.cold.json` marker. The backend's registry thaws them on
+# the next open (see web/backend/services/registry.py:workspace_path
+# and services/cold_archive.py).
+#
+# We exec inside the backend container instead of on the host because
+# the cold_archive module imports the backend's `config` (DATA_ROOT,
+# project root, etc.) and we want a single source of truth for those
+# paths. Bonus: gsutil + python + the service module are all pinned
+# inside the image, so no host-level dependency drift.
+#
+# Pair with pi-cold-archive.timer for the daily cadence.
+Description=Cold-archive idle workspaces to gs://digi-setu-cold
+After=pi.service docker.service
+Wants=pi.service
+
+[Service]
+Type=oneshot
+# 30-min hard ceiling — protects against a runaway gsutil hang on a
+# bad network. The reaper is fully idempotent, so a kill is safe;
+# unfinished workspaces just stay hot until the next run.
+TimeoutStartSec=1800
+ExecStart=/usr/bin/docker exec pi-backend python -m services.cold_archive archive
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

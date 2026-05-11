@@ -1,0 +1,20 @@
+[Unit]
+# Daily timer for the cold-archive reaper. We run at 03:15 UTC (a
+# quiet hour for both US and EU users) with a 30-min jitter so a
+# fleet of similar VMs doesn't hammer GCS at the exact same instant.
+# Persistent=true means a missed run (VM was off / restarting) gets
+# triggered on next boot rather than skipped.
+#
+# Cadence: daily is plenty — the threshold is 30 days, so even a
+# week's missed runs only cost us at most a few extra GBs of hot
+# storage we'd have archived sooner.
+Description=Daily cold-archive reaper
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+RandomizedDelaySec=30min
+Persistent=true
+Unit=pi-cold-archive.service
+
+[Install]
+WantedBy=timers.target

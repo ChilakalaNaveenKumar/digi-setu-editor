@@ -48,6 +48,21 @@ bash "$DESKTOP/sidecar/build_sidecar.sh"
 # 3. Bundled Node + pi-coding-agent. Already idempotent; skips
 # re-download if the platform's tarball is already vendored.
 echo "[release-mac] vendoring Node + pi…"
+# Purge cross-platform Node dirs from prior dev runs so they don't
+# end up in the bundle. Tauri's resources block ships the entire
+# pi-runtime/vendor/ tree, so a stray `node-linux-x64/` from an
+# earlier full fetch silently bloats the DMG by 187 MB per platform.
+# Keep only `node-darwin-*` here; the wrong-arch Mac variant is
+# harmless (~190 MB lost is the cost of a universal binary; we
+# could trim it too if we ever build per-arch DMGs separately).
+echo "[release-mac] pruning cross-platform vendored Node dirs…"
+rm -rf "$DESKTOP/pi-runtime/vendor/node-linux-"*
+rm -rf "$DESKTOP/pi-runtime/vendor/node-win-"*
+# Also strip include/share from any node-darwin-* that's still
+# around from a build that pre-dates the fetch-node.sh prune.
+for d in "$DESKTOP/pi-runtime/vendor/node-darwin-"*; do
+  [ -d "$d" ] && rm -rf "$d/include" "$d/share"
+done
 bash "$DESKTOP/pi-runtime/fetch-node.sh" --current-platform-only
 bash "$DESKTOP/pi-runtime/install-pi.sh"
 

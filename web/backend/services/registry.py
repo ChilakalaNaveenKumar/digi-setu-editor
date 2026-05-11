@@ -552,7 +552,22 @@ class Registry:
         rec = self._data["workspaces"].get(wsid)
         if not rec:
             raise KeyError(wsid)
-        return Path(rec["path"])
+        path = Path(rec["path"])
+        # Cold-archive thaw: if a nightly reaper archived this
+        # workspace to GCS, the on-disk tree is just a marker file.
+        # Block here while we pull it back, then continue. First
+        # caller pays the latency (~5–15 s for typical workspaces);
+        # concurrent callers serialise on a per-wsid lock inside
+        # services.cold_archive. Idempotent — a no-op if not cold.
+        # We import lazily so laptop dev (no GCS bucket configured)
+        # doesn't have to install gsutil.
+        try:
+            from services.cold_archive import is_cold, thaw_workspace
+            if is_cold(wsid):
+                thaw_workspace(wsid)
+        except ImportError:
+            pass
+        return path
 
     def ensure_uploads_dir(self, wsid: str) -> Path:
         """Return (and create if missing) workspace/uploads/.

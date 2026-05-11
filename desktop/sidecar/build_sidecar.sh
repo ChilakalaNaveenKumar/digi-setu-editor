@@ -69,7 +69,17 @@ fi
 # the Rust target triple for the current host.
 TRIPLE="$(rustc -vV | sed -n 's/host: //p' | tr -d '[:space:]')"
 SUFFIXED="$DIST/pi-typst-sidecar-$TRIPLE"
-cp "$DIST/pi-typst-sidecar" "$SUFFIXED"
+
+# Hardlink (not copy) the suffixed alias. Earlier we did `cp` here,
+# which doubled disk usage by 99 MB inside the bundle (PyInstaller
+# binaries are huge). Hardlinks share the same inode so the on-disk
+# footprint stays at ~99 MB total even though both filenames exist.
+# `cp -al` is the portable hardlink-copy (Mac BSD cp + GNU cp both
+# accept it). We rm the old target first because both flavours bail
+# out if the destination already exists.
+rm -f "$SUFFIXED"
+cp -al "$DIST/pi-typst-sidecar" "$SUFFIXED" 2>/dev/null \
+  || ln    "$DIST/pi-typst-sidecar" "$SUFFIXED"
 chmod +x "$SUFFIXED"
 
 echo "[build] Wrote $DIST/pi-typst-sidecar"

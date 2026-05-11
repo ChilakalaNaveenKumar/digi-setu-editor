@@ -81,6 +81,16 @@ fetch_node() {
         cp -R "$tmp/$dist/." "$target/"
     fi
 
+    # Strip ~50 MB of dev-only files from the vendored runtime. The
+    # `include/` tree is C/C++ headers for native-module compilation
+    # (we never run `node-gyp`); `share/` holds the changelog + man
+    # pages. None of this is touched at runtime, but the entire
+    # `node-*/` directory ends up in the Tauri bundle (resources
+    # block in tauri.conf.json) so every byte counts toward the DMG
+    # size we ship to end users. Keep `bin/` (node, npm, npx) and
+    # `lib/` (npm's bundled deps).
+    rm -rf "$target/include" "$target/share"
+
     echo "[pi-runtime] $platform: ready at $target"
 }
 
