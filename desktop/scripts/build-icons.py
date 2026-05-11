@@ -44,18 +44,15 @@ FAVICON_DIRS = [
 # has more horizontal real estate).
 SVG_TIGHT = Path(__file__).resolve().parent / "_logo-tight.svg"
 
-BG_COLOR = (15, 23, 42, 255)            # slate-900 = #0F172A
+BG_COLOR = (11, 15, 25, 255)            # near-black = #0B0F19
 GLYPH_COLOR = (255, 255, 255, 255)
 MASTER_SIZE = 1024
 CORNER_RADIUS_RATIO = 0.2237            # Apple "squircle" approximation
-
-
-# We deliberately DROP the rounded-square background and let the glyph fill
-# essentially the entire canvas (98%). At 32px every pixel matters and the
-# old Apple-HIG squircle bg was eating ~30% of the available pixels for
-# decoration. macOS / Windows / Linux all render icons over the platform's
-# own dock/taskbar backdrop, so the bg layer was redundant anyway.
-GLYPH_FILL = 0.98
+# The squircle background fills the entire icon canvas and the glyph sits
+# on top at ~95% fill — i.e. the bg is BEHIND the glyph (edge-to-edge),
+# not eating into it. We deliberately reach 95% (vs the Apple-HIG 70%) so
+# every pixel of the small dock/menu-bar icons is doing work.
+GLYPH_FILL = 0.95
 
 
 def _have(cmd: str) -> bool:
@@ -114,13 +111,26 @@ def autocrop_alpha(img: Image.Image) -> Image.Image:
 def render_at(svg_path: Path, size: int) -> Image.Image:
     """Render a single icon at exactly (size x size).
 
-    Strategy: rasterise the SVG natively at the final size via rsvg-convert
-    so every pixel gets pixel-perfect anti-aliasing, then centre it on a
-    transparent (size x size) canvas. No squircle bg — every pixel goes to
-    the actual glyph. The platform (Dock, Taskbar, Activity bar) supplies
-    its own backdrop.
+    Strategy: paint a near-black squircle that fills the entire canvas
+    edge-to-edge, then composite the white glyph on top at GLYPH_FILL.
+    The bg sits BEHIND the glyph so adding it doesn't shrink the visible
+    artwork — every pixel of the canvas is covered, every pixel of the
+    glyph is the same size as a transparent-bg render would have been.
+
+    The SVG is rasterised natively at the target glyph dimension via
+    rsvg-convert so even the tiny menu-bar size gets pixel-perfect
+    anti-aliasing — never a downscaled bitmap.
     """
     canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+
+    mask = Image.new("L", (size, size), 0)
+    radius = int(size * CORNER_RADIUS_RATIO)
+    ImageDraw.Draw(mask).rounded_rectangle(
+        (0, 0, size - 1, size - 1),
+        radius=radius,
+        fill=255,
+    )
+    canvas.paste(Image.new("RGBA", (size, size), BG_COLOR), (0, 0), mask)
 
     target = max(1, int(size * GLYPH_FILL))
     glyph = rasterise_glyph(svg_path, target, target)
