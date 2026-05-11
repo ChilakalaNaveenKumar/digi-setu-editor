@@ -80,6 +80,32 @@ ZONE="${GCP_ZONE:-us-central1-a}"
 VM="${GCP_VM:-digi-setu-live}"
 REMOTE_DIR="/srv/pi/downloads"
 
+# ── SSH transport selection ────────────────────────────────────────
+# On Windows GHA runners, `gcloud compute ssh` shells out to PuTTY's
+# `plink.exe`, which prompts interactively the first time it sees a
+# new SSH host key:
+#
+#     Store key in cache? (y/n, Return cancels connection, i for more info)
+#
+# In a non-interactive runner that prompt blocks forever and the
+# job times out (or, with the timeout we set, exits non-zero with
+# `[plink.exe] exited with return code [1]`).
+#
+# Fix: route SSH through Google's Identity-Aware Proxy instead. With
+# `--tunnel-through-iap` gcloud bypasses plink entirely and uses its
+# own Python-based tunneller, which has no interactive prompts AND
+# also removes the need for the runner to have inbound SSH from the
+# public internet. Belt-and-suspenders: pass `-o StrictHostKeyChecking=
+# accept-new` so even on the rare path that still goes through ssh/
+# plink, the host key is auto-accepted on first use.
+SSH_COMMON_ARGS=(
+  --tunnel-through-iap
+  --ssh-flag="-o StrictHostKeyChecking=accept-new"
+  --ssh-flag="-o UserKnownHostsFile=/dev/null"
+  --ssh-flag="-o GlobalKnownHostsFile=/dev/null"
+  --ssh-flag="-o BatchMode=yes"
+)
+
 if [[ $# -lt 1 ]]; then
   echo "Usage: $0 PATH_TO_DMG [REMOTE_FILENAME]" >&2
   exit 64
@@ -105,11 +131,13 @@ echo
 # Step 1: scp to /tmp (where the SSH user can write without sudo).
 TMP_REMOTE="/tmp/${REMOTE_NAME}"
 gcloud compute scp "$LOCAL" "${VM}:${TMP_REMOTE}" \
-  --project "$PROJECT" --zone "$ZONE" --quiet
+  --project "$PROJECT" --zone "$ZONE" --quiet \
+  "${SSH_COMMON_ARGS[@]}"
 
 # Step 2: move into /srv/pi/downloads with sudo, chmod, chown, then
 # verify the SHA matches the one we computed locally.
-gcloud compute ssh "$VM" --project "$PROJECT" --zone "$ZONE" --quiet --command "
+gcloud compute ssh "$VM" --project "$PROJECT" --zone "$ZONE" --quiet \
+  "${SSH_COMMON_ARGS[@]}" --command "
   set -euo pipefail
   sudo install -d -m 0755 -o 0 -g 0 ${REMOTE_DIR}
   sudo install -m 0644 -o 0 -g 0 ${TMP_REMOTE} ${REMOTE_DIR}/${REMOTE_NAME}
