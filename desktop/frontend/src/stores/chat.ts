@@ -1,11 +1,27 @@
 /**
- * Chat WebSocket lifecycle + message stream + cost totals.
+ * Chat lifecycle + event dispatcher (SSE transport).
  *
- * Also acts as the central dispatcher for inbound WS events:
- *   - pi RPC events            → router.applyEvent → messages
- *                                → files.applyLiveWrite (write call mirroring)
- *   - fs_change events         → files.applyFsChange
- *   - bg_started/output/ended  → terminals.applyBgEvent
+ * Replaces the old WebSocket store. Transport is now POST + SSE
+ * (services/chat-stream.ts) and multi-tab is handled at the page
+ * layer (services/tab-claim.ts), so this file no longer carries:
+ *
+ *   - WS reconnect / heartbeat / explicit-close state machine
+ *   - parked-session bridges and snapshot restoration
+ *   - "transient error grace period" flicker absorption
+ *   - `_abortedAwaitingReconnect` race plumbing
+ *   - `tabSuperseded` / kicked-tab handling
+ *
+ * What stays identical so component callsites don't have to change:
+ *   - public surface (connect / disconnect / sendPrompt / abort /
+ *     reconnect / sendPermissionResponse / queue API / totals…)
+ *   - the `_dispatch` event reducer (router updates, billing, fs/bg
+ *     fanout, permission gate, compaction state)
+ *   - `lastError` / `lastErrorCode` shape used by the error card
+ *
+ * Compatibility shim: the bridge used to expose a 5-state union
+ * `idle | connecting | open | closed | error`. ChatStream emits
+ * 4 (no `error`) — this store synthesises `error` from `onError`
+ * so existing UI checks (`connState === 'error'`) keep working.
  */
 
 import { defineStore } from "pinia";
@@ -17,14 +33,10 @@ import {
   applyEvent,
   createRouterState,
   pushUserMessage,
-  type RouterState,
 } from "../lib/event-router";
-// `appRouter` here is Vue Router (for navigation); `router` later in
-// this module refers to the chat-message router state from
-// event-router. Aliased to avoid the name clash.
 import { router as appRouter } from "../router";
+import { ChatStream, ChatStreamError, type ChatStreamState } from "../services/chat-stream";
 import type { AssistantMessage, ChatMessage, RpcEvent, ToolCall } from "../types/rpc";
-import { ChatBridge, type ConnState } from "../ws/chat-bridge";
 
 import { useBillingStore } from "./billing";
 import { useChatSessionStore } from "./chat-session";
@@ -34,6 +46,9 @@ import { usePermissionsStore, type PermissionDecision, type PermissionMode } fro
 import { useTerminalsStore } from "./terminals";
 import { useWorkspaceStore } from "./workspace";
 
+/** Public connection state (5-state for backwards compatibility). */
+export type ConnState = ChatStreamState | "error";
+
 const DEBUG_EVENTS =
   typeof window !== "undefined" && new URLSearchParams(window.location.search).has("debug");
 
@@ -42,38 +57,15 @@ interface SessionInfo {
   cwd?: string;
 }
 
-/**
- * One file the user attached but hasn't yet sent. The fields are a
- * thin slice of `SavedAttachment` from api/attachments — only what
- * the chip strip and prompt-prefix need, plus an internal `localId`
- * so the chip's "remove" button can target the right entry without
- * relying on the backend path being unique within a tab.
- */
 export interface PendingAttachment {
   localId: string;
   name: string;
   size: number;
   mime: string;
-  /** Workspace-relative — used for thumbnails / file tree. */
   path: string;
-  /** Agent-cwd-relative — used in the prompt prefix so pi sees it. */
   agentPath: string;
 }
 
-/**
- * One message the user typed while pi was busy with a previous turn.
- *
- * Each entry binds the text to the *attachments that were pending when
- * the user hit Enter*. We intentionally snapshot the attachments at
- * enqueue time so a user can:
- *
- *   1. attach foo.png, type "look at this", hit Enter   → queues #1
- *   2. attach bar.pdf, type "and this", hit Enter        → queues #2
- *
- * and have foo.png travel with #1 and bar.pdf with #2 when each fires
- * (instead of both messages getting both attachments). The composer
- * `pendingAttachments` ref is cleared every time we enqueue.
- */
 export interface QueuedMessage {
   id: string;
   text: string;
@@ -81,98 +73,35 @@ export interface QueuedMessage {
   createdAt: number;
 }
 
+/**
+ * Translate a stable error code into a localised user-facing sentence.
+ * Anything we don't have an explicit translation for collapses to
+ * `errors.internal` so a raw upstream string never reaches the UI.
+ */
+function _localiseError(code: string | null | undefined): string {
+  const c = String(code ?? "internal").trim() || "internal";
+  const key = `errors.${c}`;
+  if (i18n.global.te(key)) {
+    return i18n.global.t(key) as string;
+  }
+  return i18n.global.t("errors.internal") as string;
+}
+
 export const useChatStore = defineStore("chat", () => {
-  // `router` is `let` (not `const`) because the multi-bridge tab-switch
-  // logic below swaps the entire RouterState when parking the current
-  // session and restoring a previously-parked one. Each session keeps
-  // its own router instance (messages, toolCallIndex, activeThinking,
-  // activeText cursors) inside the parkedSessions map; the active
-  // store always points `router` at whichever session is on screen.
   let router = createRouterState();
   const messages = ref<ChatMessage[]>([]);
   const session = ref<SessionInfo | null>(null);
   const connState = ref<ConnState>("idle");
   const isStreaming = ref(false);
   const lastError = ref<string | null>(null);
-  // Stable error code that produced `lastError`. Lets the error-card
-  // component (`SessionDisconnectedCard`) pick the right kind / icon /
-  // primary action via its switch statement instead of falling through
-  // to the generic "Something went wrong" path. See web mirror for the
-  // same pattern. Distinct from `lastError` (the localised string)
-  // because the card only matches against codes, not localised copy.
   const lastErrorCode = ref<string | null>(null);
-
-  // ── Transient error suppression ────────────────────────────────────
-  //
-  // Mirrors web/frontend/src/stores/chat.ts. The bridge fires
-  // onState("error", code) on every WS hiccup and immediately
-  // schedules an exponential-backoff reconnect. For network-y codes
-  // the next attempt usually succeeds within 1-3 s, so painting the
-  // full "Connection lost" card right away just gives the user a
-  // 1-second flash of red — exactly the flicker users complained
-  // about ("when an error occured and even if you reload or refresh
-  // flickering occurs").
-  //
-  // Quarantine those codes for `TRANSIENT_GRACE_MS`; if connState
-  // returns to "open" before the timer fires we silently drop the
-  // pending error and the user only ever saw a small "Reconnecting…"
-  // pill (rendered by ChatPane.vue off `isReconnecting`). Otherwise
-  // we promote into the full card after the grace window.
-  //
-  // Terminal codes (auth, quota, kicked, …) bypass the grace —
-  // there's no auto-retry that fixes them, so showing the card
-  // immediately is the right move.
-  const TRANSIENT_CODES: ReadonlySet<string> = new Set([
-    "network",
-    "ws_unreachable",
-    "ws_error",
-    "ws_send_failed",
-    "not_connected",
-    "capacity",
-    "internal",
-  ]);
-  const TRANSIENT_GRACE_MS = 3000;
-  const _transientPending = ref<string | null>(null);
-  let _transientPendingTimer: ReturnType<typeof setTimeout> | null = null;
-
-  function _cancelTransientPending(): void {
-    if (_transientPendingTimer) {
-      clearTimeout(_transientPendingTimer);
-      _transientPendingTimer = null;
-    }
-    _transientPending.value = null;
-  }
 
   function _setError(code: string | null): void {
     if (!code) {
-      _cancelTransientPending();
       lastError.value = null;
       lastErrorCode.value = null;
       return;
     }
-    if (TRANSIENT_CODES.has(code)) {
-      // Don't overwrite an already-shown HARD error with a transient
-      // pending — terminal cards win until the user explicitly
-      // dismisses or recovers.
-      if (lastErrorCode.value && !TRANSIENT_CODES.has(lastErrorCode.value)) {
-        return;
-      }
-      _transientPending.value = code;
-      if (_transientPendingTimer) clearTimeout(_transientPendingTimer);
-      _transientPendingTimer = setTimeout(() => {
-        _transientPendingTimer = null;
-        if (_transientPending.value && connState.value !== "open") {
-          const promoted = _transientPending.value;
-          _transientPending.value = null;
-          lastErrorCode.value = promoted;
-          lastError.value = _localiseError(promoted);
-        } else {
-          _transientPending.value = null;
-        }
-      }, TRANSIENT_GRACE_MS);
-      return;
-    }
-    _cancelTransientPending();
     lastErrorCode.value = code;
     lastError.value = _localiseError(code);
   }
@@ -180,9 +109,9 @@ export const useChatStore = defineStore("chat", () => {
     _setError(null);
   }
 
-  // Pi auto-compaction status, mirrors web/.../stores/chat.ts.
-  // `null` = idle. Active=true while pi summarises; active=false +
-  // succeeded captures the post-result toast (auto-cleared after 8s).
+  // Pi auto-compaction status (`compaction_start` / `compaction_end`
+  // RPC events from pi-mono). Drives the "Summarising long history…"
+  // pill and post-success badge. `null` = idle.
   interface CompactionState {
     active: boolean;
     reason: string;
@@ -195,116 +124,31 @@ export const useChatStore = defineStore("chat", () => {
     compactionState.value = null;
   }
 
-  // Surface to ChatPane for the slim "Reconnecting…" pill rendered
-  // during the grace window (and any subsequent auto-reconnect
-  // attempts before the bridge gives up). Independent of `errorCard`
-  // so the pill and card never both show.
+  // Computed views consumed by ChatPane.vue. EventSource handles
+  // transport-level retries silently, so "reconnecting" here just
+  // means "we're in the connecting state with prior context to
+  // come back to" — not a flicker-prone WS retry loop.
   const isReconnecting = computed(
-    () => _transientPending.value !== null
-      || (connState.value === "connecting" && messages.value.length > 0),
+    () => connState.value === "connecting" && messages.value.length > 0,
   );
-
-  // First-connect skeleton state — true while the bridge is opening
-  // its first WS for an empty (history-less) chat surface.
   const isInitialConnecting = computed(
-    () => connState.value === "connecting" && messages.value.length === 0
+    () => connState.value === "connecting"
+      && messages.value.length === 0
       && !lastErrorCode.value,
   );
 
-  // Drop pending transient error the moment we re-open. Guards
-  // against the weird case where the grace timer fires AFTER a
-  // successful reopen (race with setTimeout's macrotask ordering).
-  watch(connState, (state) => {
-    if (state === "open") _cancelTransientPending();
-  });
-  // Set by `abort()`, cleared by the connect()-side bridge state handler
-  // when the WS subsequently closes. Used to silently respawn pi after
-  // a user-driven abort instead of stranding the chat in "Connection
-  // closed". NOT a `ref` — only the connect/abort code paths read it,
-  // and we don't want a stale render to fire reconnect twice.
-  let _abortedAwaitingReconnect = false;
-
-  // ── parked sessions (multi-bridge) ─────────────────────────────────
-  // When the user switches chat tabs we *don't* close the old WS — long
-  // tool turns (e.g. `pip install`) would lose their tail and the next
-  // visit would spawn a fresh pi instead of resuming. Instead the bridge
-  // is "parked": its dispatcher callbacks are rebound to a parked-mode
-  // dispatcher that updates a per-session snapshot, the WS stays
-  // connected, and pi keeps streaming straight into the snapshot's
-  // router. When the user comes back, _restoreFromParked() swaps the
-  // active store's state in for the snapshot and rebinds the bridge to
-  // the live dispatcher — without ever interrupting the underlying WS.
-  //
-  // Memory cost is bounded: one bridge + one router per chat tab the
-  // user has *visited this session*. disconnect() (workspace exit /
-  // sign-out) closes them all.
-  interface ParkedSession {
-    sid: string;
-    wsid: string | null;
-    bridge: ChatBridge;
-    router: RouterState;
-    isStreaming: boolean;
-    lastError: string | null;
-    // Mirrors `lastErrorCode` on the active store; round-trips through
-    // park → restore so the error card on a restored session resolves
-    // its kind / icon / action correctly. Without this the restored
-    // card always falls through to the generic "Something went wrong"
-    // path because it can't match a localised string against the
-    // code-keyed switch.
-    lastErrorCode: string | null;
-    connState: ConnState;
-    cwd: string | undefined;
-    queuedMessages: QueuedMessage[];
-    pendingAttachments: PendingAttachment[];
-    displayHigh: {
-      input: number;
-      output: number;
-      cacheRead: number;
-      cacheWrite: number;
-      cost: number;
-    };
-  }
-  const parkedSessions = new Map<string, ParkedSession>();
-
-  // Files the user attached (paperclip / paste / drop) that haven't
-  // been included in a prompt yet. The composer renders one chip per
-  // entry; sendPrompt() consumes the whole list and prepends an
-  // "Attached files:" preamble to the message.
-  //
-  // Each entry mirrors the `SavedAttachment` returned by the backend
-  // — we keep both the tree-path (what the file tree wants) AND the
-  // agent_path (what pi wants in its next read() call).
+  // Files the user attached but hasn't yet sent. The composer renders
+  // chips; sendPrompt() consumes the list and prepends an "Attached
+  // files:" preamble to the message body.
   const pendingAttachments = ref<PendingAttachment[]>([]);
 
-  // Messages the user typed while pi was streaming a previous turn.
-  // The watcher below auto-fires the head of the queue the moment
-  // isStreaming flips false. Push/delete/edit are exposed as actions
-  // so QueueStrip.vue can manipulate the list before items fire.
+  // Messages typed while pi was busy. The watcher below auto-fires
+  // the head when isStreaming flips false.
   const queuedMessages = ref<QueuedMessage[]>([]);
 
-  let bridge: ChatBridge | null = null;
+  let stream: ChatStream | null = null;
 
-  // ── session-scoped totals ────────────────────────────────────────────
-  // Two reactive totals coexist:
-  //
-  //   _displayTotals  monotonic, never goes down. Re-derived from
-  //                   `messages`, then clamped per-field to never
-  //                   shrink below the previously-seen high-water
-  //                   mark within this WS session. This is what the
-  //                   chat footer renders.
-  //
-  // Why this matters: the previous implementation re-summed `messages`
-  // on every change, so the displayed cost would visibly drop from
-  // $0.20 → $0.05 whenever the message list briefly dropped a turn —
-  // happens during WS reconnect / history reload / mid-stream message
-  // identity churn. The data-store totals are correct in aggregate
-  // (the persisted JSONL log is the source of truth), but the UI
-  // bouncing makes users think they're being double-charged. Clamping
-  // monotonically gives the visible total the same "only goes up"
-  // behaviour they have in every other AI chat product.
-  //
-  // The clamp resets in `disconnect()` below so a brand-new session
-  // doesn't inherit a stale high-water mark from the previous chat.
+  // ── session-scoped totals (monotonic display clamp) ─────────────────
   const _displayHigh = reactive({
     input: 0,
     output: 0,
@@ -327,7 +171,6 @@ export const useChatStore = defineStore("chat", () => {
       cacheWrite += m.usage.cacheWrite;
       cost += m.usage.cost;
     }
-    // Clamp each field upward against the high-water mark.
     if (input > _displayHigh.input) _displayHigh.input = input;
     if (output > _displayHigh.output) _displayHigh.output = output;
     if (cacheRead > _displayHigh.cacheRead) _displayHigh.cacheRead = cacheRead;
@@ -350,32 +193,12 @@ export const useChatStore = defineStore("chat", () => {
     _displayHigh.cost = 0;
   }
 
-  // ── pending attachments ─────────────────────────────────────────────
-  /**
-   * Build the user-prompt text that pi will see, including the
-   * "Attached files:" preamble when the user has pending attachments.
-   *
-   * The exact wording matters: the agent treats it as part of the user
-   * turn, so we want it to read as if a human typed it. We deliberately
-   * use bullet-points with the agent_path verbatim — pi resolves those
-   * paths against its cwd, so saying "workspace/uploads/foo.png" is
-   * exactly what its `read` tool needs.
-   *
-   * Behavioural goal (per user request):
-   *
-   *   "after uploaded in the next message we need to send inside the
-   *    user message 'uploaded x, y, z files look at them also to
-   *    answer as you need'"
-   *
-   * The preamble does that without overriding the user's actual
-   * question; their text comes second, separated by a blank line.
-   */
+  // ── pending attachments ──────────────────────────────────────────────
   function _wrapWithAttachments(
     userText: string,
     atts: PendingAttachment[] = pendingAttachments.value,
   ): string {
     if (atts.length === 0) return userText;
-
     const lines = atts.map(
       (a) => `- ${a.agentPath}${a.size ? `  (${_humanSize(a.size)})` : ""}`,
     );
@@ -384,7 +207,6 @@ export const useChatStore = defineStore("chat", () => {
       `to the workspace. Please look at ${atts.length === 1 ? "it" : "them"} ` +
       `and use ${atts.length === 1 ? "it" : "them"} when answering:\n` +
       lines.join("\n");
-
     const trimmed = userText.trim();
     return trimmed ? `${preamble}\n\n${trimmed}` : preamble;
   }
@@ -411,11 +233,6 @@ export const useChatStore = defineStore("chat", () => {
   }
 
   // ── live-write mirroring ─────────────────────────────────────────────
-  /**
-   * After every WS message, find the most recent `write` tool call on
-   * the latest assistant turn and push its current state to the files
-   * store so the editor can stream it.
-   */
   function _syncEditorFromWriteCall(): void {
     const last = router.messages[router.messages.length - 1];
     if (!last || last.kind !== "assistant") return;
@@ -437,56 +254,29 @@ export const useChatStore = defineStore("chat", () => {
 
   // ── connect / disconnect ────────────────────────────────────────────
   /**
-   * Open the chat WS for `sessionId`, scoped to `wsid`. Both must be
-   * provided: the WS connection key is sessionId, but every REST call
-   * the UI makes is workspace-scoped.
+   * Open the SSE stream for `sessionId`. Hydrate persisted history
+   * BEFORE opening so users see prior turns instantly; live events
+   * arriving after will only ever append.
    *
-   * Resume order is important — we hydrate the persisted message log
-   * BEFORE opening the WS so users see their old turns instantly. Live
-   * events that arrive after will only ever append a new assistant
-   * message at the end, so there's no risk of clobbering the historical
-   * tail.
+   * No more parked-session juggling — when the user switches chat
+   * tabs we simply close the current stream and open a new one. The
+   * BACKEND keeps the pi process alive (idle reaper kicks in after
+   * 10 min) so a long tool turn the user navigated away from is
+   * still progressing on the server. Coming back replays whatever
+   * happened from the ring buffer.
    */
   async function connect(sessionId: string, wsid: string): Promise<void> {
-    // Consume any pending "auto-reconnect after abort" intent that hasn't
-    // been picked up yet. We're already in connect() — by definition a
-    // reconnect is happening (whether kicked off by abort, the model
-    // picker, or an explicit reconnect()), so the flag's job is done.
-    // Clearing here also defuses a race where the OLD bridge's async
-    // `onclose` arrives after disconnect() and re-reads the flag; without
-    // this clear that callback can fire a phantom second reconnect()
-    // mid-swap, which manifests as "pi crashed" + needs-browser-refresh
-    // when the user changes models during a streaming turn.
-    _abortedAwaitingReconnect = false;
+    // If we're already connected to this exact session, no-op.
+    if (session.value?.id === sessionId && stream && stream.isOpen) return;
 
-    // Decide what to do with the *currently* active session before we
-    // touch any state for the incoming one:
-    //
-    //   1. Same session (refresh / model swap)  → full teardown + fresh
-    //      reconnect, exactly like the previous single-bridge code did.
-    //   2. Different session, with a live bridge → park it. The bridge's
-    //      WS stays open, its dispatcher is rebound to a parked-mode
-    //      stub that updates the parked snapshot, and a long pi turn
-    //      keeps streaming. We DO NOT close it.
-    //   3. No prior session                      → nothing to park.
-    const switchingToDifferent =
-      session.value !== null && session.value.id !== sessionId && bridge !== null;
-    if (switchingToDifferent) {
-      _parkCurrent();
-    } else {
-      // Same-session refresh OR first-ever connect — drop everything.
-      disconnect();
-    }
+    // Same-session refresh OR session swap — drop everything cleanly.
+    disconnect();
 
-    // Reset per-session active state. Even if we're about to restore from
-    // a parked snapshot, having a clean slate first prevents a flicker
-    // where the previous session's messages briefly bleed onto the new
-    // tab.
     router = createRouterState();
     messages.value = [];
     session.value = { id: sessionId };
     isStreaming.value = false;
-    clearError();
+    _setError(null);
     _resetDisplayTotals();
     queuedMessages.value = [];
     pendingAttachments.value = [];
@@ -501,18 +291,6 @@ export const useChatStore = defineStore("chat", () => {
 
     void files.refreshTree();
 
-    // If we visited this session earlier in the workspace lifetime and
-    // its bridge is parked, restore from the snapshot — pi is still
-    // streaming there and may have advanced since we left.
-    const parked = parkedSessions.get(sessionId);
-    if (parked) {
-      parkedSessions.delete(sessionId);
-      if (parked.bridge.isOpen) {
-        _restoreFromParked(parked);
-        return;
-      }
-    }
-
     try {
       const { messages: hist } = await fetchSessionHistory(sessionId);
       if (hist?.length) _hydrateHistory(hist);
@@ -520,234 +298,37 @@ export const useChatStore = defineStore("chat", () => {
       console.warn("[chat] history fetch failed; starting empty", err);
     }
 
-    // Bail out if a newer connect() raced past us while history was loading.
     if (session.value?.id !== sessionId) return;
 
-    // Bind the bridge identity into the onState closure so a dying old
-    // bridge (whose ws.onclose fires asynchronously after we've already
-    // moved on to a new bridge) cannot mutate the active session's UI
-    // state or re-trigger reconnect. This is a belt-and-suspenders guard
-    // on top of the flag-clear above.
-    const newBridge = new ChatBridge({
+    const newStream = new ChatStream({
       sessionId,
-      onState: (state, error) => {
-        if (bridge !== newBridge) return;
+      onState: (state) => {
+        if (stream !== newStream) return;
+        // Map the 4-state ChatStreamState into the 5-state ConnState
+        // by surfacing `error` only when an explicit error happened.
+        if (state === "open") clearError();
         connState.value = state;
-        // The bridge passes us a STABLE error code (ws_kicked,
-        // ws_unreachable, ws_send_failed, …) — feed it through
-        // _setError so the card binding (lastErrorCode) and the
-        // localised label (lastError) stay in lock-step.
-        if (state === "error" && error) _setError(error);
-        if (state === "closed" || state === "error") isStreaming.value = false;
-        // After a client-driven abort the backend closes the WS with code
-        // 4410, which the bridge surfaces as a normal "closed" state. We
-        // set `_abortedAwaitingReconnect` in `abort()` so we can tell
-        // *this* close apart from a real disconnect (network blip, tab
-        // backgrounded, server crash) and silently respawn pi instead of
-        // showing the "Connection closed" banner. Without this the user
-        // would have to click the model picker to reconnect after every
-        // abort, which defeats the purpose of having a stop button.
-        if (state === "closed" && _abortedAwaitingReconnect) {
-          _abortedAwaitingReconnect = false;
-          void reconnect();
-        }
+        if (state === "closed") isStreaming.value = false;
+      },
+      onError: (code) => {
+        if (stream !== newStream) return;
+        _setError(code);
+        connState.value = "error";
+        isStreaming.value = false;
       },
       onEvent: (raw) => {
-        if (bridge !== newBridge) return;
+        if (stream !== newStream) return;
         _dispatch(raw as RpcEvent & Record<string, unknown>);
       },
     });
-    bridge = newBridge;
-    newBridge.open();
-  }
-
-  // ── parked-session helpers (multi-bridge) ──────────────────────────
-  /**
-   * Move the *currently* active session into the parked map. The
-   * underlying WebSocket is NOT closed — pi keeps streaming into the
-   * parked router so a long-running tool call (e.g. `pip install`) is
-   * preserved across the tab switch. `bridge` is cleared so the caller
-   * can immediately install a new active bridge.
-   */
-  function _parkCurrent(): void {
-    if (!bridge || !session.value) return;
-    const sid = session.value.id;
-    const wsid = useWorkspaceStore().activeId;
-    const parked: ParkedSession = {
-      sid,
-      wsid,
-      bridge,
-      router,
-      isStreaming: isStreaming.value,
-      lastError: lastError.value,
-      lastErrorCode: lastErrorCode.value,
-      connState: connState.value,
-      cwd: session.value.cwd,
-      queuedMessages: queuedMessages.value.slice(),
-      pendingAttachments: pendingAttachments.value.slice(),
-      displayHigh: {
-        input: _displayHigh.input,
-        output: _displayHigh.output,
-        cacheRead: _displayHigh.cacheRead,
-        cacheWrite: _displayHigh.cacheWrite,
-        cost: _displayHigh.cost,
-      },
-    };
-
-    // Rebind to the parked-mode dispatcher BEFORE we move the bridge
-    // into the map; otherwise an event arriving in the rebind/move
-    // window would still hit the live dispatcher and mutate the new
-    // active session's state.
-    bridge.rebind({
-      sessionId: sid,
-      onState: (state, error) => {
-        parked.connState = state;
-        if (state === "error" && error) {
-          parked.lastErrorCode = error;
-          parked.lastError = _localiseError(error);
-        }
-        if (state === "closed" || state === "error") parked.isStreaming = false;
-      },
-      onEvent: (raw) => {
-        _dispatchParked(parked, raw as RpcEvent & Record<string, unknown>);
-      },
-    });
-
-    parkedSessions.set(sid, parked);
-    bridge = null;
+    stream = newStream;
+    newStream.open();
   }
 
   /**
-   * Restore a previously-parked session: swap its router back into the
-   * active store, repopulate the visible refs from the snapshot, and
-   * rebind the bridge's dispatcher to the live one. The WS itself was
-   * never closed, so any progress pi made while we were away is already
-   * sitting in `parked.router.messages`.
-   */
-  function _restoreFromParked(parked: ParkedSession): void {
-    router = parked.router;
-    messages.value = router.messages.slice();
-    session.value = { id: parked.sid, cwd: parked.cwd };
-    isStreaming.value = parked.isStreaming;
-    lastError.value = parked.lastError;
-    lastErrorCode.value = parked.lastErrorCode;
-    connState.value = parked.connState;
-
-    queuedMessages.value = parked.queuedMessages;
-    pendingAttachments.value = parked.pendingAttachments;
-
-    _displayHigh.input = parked.displayHigh.input;
-    _displayHigh.output = parked.displayHigh.output;
-    _displayHigh.cacheRead = parked.displayHigh.cacheRead;
-    _displayHigh.cacheWrite = parked.displayHigh.cacheWrite;
-    _displayHigh.cost = parked.displayHigh.cost;
-
-    const restoredBridge = parked.bridge;
-    bridge = restoredBridge;
-
-    restoredBridge.rebind({
-      sessionId: parked.sid,
-      onState: (state, error) => {
-        if (bridge !== restoredBridge) return;
-        connState.value = state;
-        if (state === "error" && error) _setError(error);
-        if (state === "closed" || state === "error") isStreaming.value = false;
-        if (state === "closed" && _abortedAwaitingReconnect) {
-          _abortedAwaitingReconnect = false;
-          void reconnect();
-        }
-      },
-      onEvent: (raw) => {
-        if (bridge !== restoredBridge) return;
-        _dispatch(raw as RpcEvent & Record<string, unknown>);
-      },
-    });
-  }
-
-  /**
-   * Parked-mode event dispatcher. Mirrors the live `_dispatch` but:
-   *   - applies router events to the parked snapshot, not the active one;
-   *   - silently drops events whose side-effects target stores that
-   *     are scoped to the *active* workspace (fs_change, bg_*, permission
-   *     prompts, _session_info). The user will see the up-to-date result
-   *     when they switch back; surfacing them now would mutate state
-   *     belonging to the wrong tab.
-   */
-  function _dispatchParked(
-    parked: ParkedSession,
-    evt: RpcEvent & Record<string, unknown>,
-  ): void {
-    if (DEBUG_EVENTS) {
-      console.debug("[parked rpc]", parked.sid, evt.type, evt);
-    }
-
-    if (evt.type === "agent_start" || evt.type === "turn_start") {
-      parked.isStreaming = true;
-    } else if (evt.type === "agent_end") {
-      parked.isStreaming = false;
-    }
-
-    if (evt.type === "session") {
-      parked.cwd = String(evt.cwd ?? "");
-      return;
-    }
-    // Model-pin / permission-mode info is global to the active store
-    // and doesn't apply to a backgrounded tab.
-    if (evt.type === "_session_info") return;
-
-    // Background-tab permission prompts can't be answered (the modal
-    // belongs to the foreground session). pi will time out the
-    // ctx.ui.select() call on its own and the tool will resolve to deny,
-    // which is the safe default.
-    if (evt.type === "permission_request") return;
-
-    // Title updates ARE safe to apply globally — the chat-session store
-    // is keyed by sid, so we want the picker to show the polished title
-    // immediately even if the user is viewing a different chat.
-    if (evt.type === "_session_titled") {
-      const sid = String(evt.sessionId ?? "");
-      const title = String(evt.title ?? "").trim();
-      if (sid && title) useChatSessionStore().applyTitleUpdate(sid, title);
-      return;
-    }
-
-    if (evt.type === "_bridge_error") {
-      const code = String(evt.code ?? "internal");
-      parked.lastErrorCode = code;
-      parked.lastError = _localiseError(code);
-      parked.isStreaming = false;
-      return;
-    }
-
-    // fs / background-terminal events belong to the active workspace
-    // only — applying them while parked would corrupt the foreground
-    // tab's file tree and terminal panes.
-    if (evt.type === "fs_change") return;
-    if (evt.type === "bg_started" || evt.type === "bg_output" || evt.type === "bg_ended") {
-      return;
-    }
-
-    applyEvent(parked.router, evt);
-
-    const tail = parked.router.messages[parked.router.messages.length - 1];
-    if (tail && tail.kind === "assistant" && tail.errorCode && !tail.error) {
-      tail.error = _localiseError(tail.errorCode);
-    }
-    if (evt.type === "message_end" && !parked.lastError) {
-      if (tail && tail.kind === "assistant" && tail.error) {
-        parked.lastError = tail.error;
-        parked.isStreaming = false;
-      }
-    }
-  }
-
-  /**
-   * Replay a server-projected ChatMessage[] into router state so the UI
-   * paints prior turns. Each entry is wrapped in `reactive()` so Vue
-   * tracks any post-load mutation (e.g. a tool result attached after the
-   * assistant message; usage updated). We also re-index every ToolCall
-   * by id so the live router can still look them up — though in practice
-   * historical and live tool ids never collide.
+   * Replay a server-projected ChatMessage[] into router state so the
+   * UI paints prior turns. Each entry is wrapped in `reactive()` so
+   * Vue tracks any post-load mutation.
    */
   function _hydrateHistory(hist: ChatMessage[]): void {
     const restored = hist.map((m) => reactive(m) as ChatMessage);
@@ -756,8 +337,6 @@ export const useChatStore = defineStore("chat", () => {
       if (m.kind !== "assistant") continue;
       for (const tc of m.toolCalls) router.toolCallIndex.set(tc.id, tc as ToolCall);
     }
-    // Mark every restored assistant turn as complete — there are no
-    // open thinking/text channels to attach further deltas to.
     for (const m of restored) {
       if (m.kind === "assistant") (m as AssistantMessage).done = true;
     }
@@ -765,114 +344,54 @@ export const useChatStore = defineStore("chat", () => {
   }
 
   function disconnect(): void {
-    // An explicit teardown supersedes any pending abort-reconnect intent.
-    // Without this, navigating to a new session immediately after clicking
-    // stop could let the dying bridge's onclose schedule a reconnect to
-    // the *previous* session id.
-    _abortedAwaitingReconnect = false;
-    if (bridge) {
-      bridge.close();
-      bridge = null;
+    if (stream) {
+      stream.close();
+      stream = null;
     }
-    // Close every parked bridge too — disconnect() is called on workspace
-    // exit / sign-out / Workspace.vue unmount, which means the user is
-    // leaving the entire chat surface. Leaving parked WSs open would
-    // pile up zombie pi processes on the backend.
-    for (const p of parkedSessions.values()) {
-      try {
-        p.bridge.close();
-      } catch {
-        /* already gone */
-      }
-    }
-    parkedSessions.clear();
     session.value = null;
     messages.value = [];
     router = createRouterState();
     isStreaming.value = false;
-    // Reset the monotonic-totals high-water mark so a brand-new chat
-    // doesn't inherit the previous chat's cost. The persisted JSONL
-    // log remains the source of truth for per-session accounting.
     _resetDisplayTotals();
-    // Discard any unanswered permission prompts — they were tied to the
-    // pi process we're tearing down. If we left them sitting, the user
-    // would see a stale modal in the next session.
     usePermissionsStore().clear();
-    // Drop pending attachment chips. They were uploaded into a specific
-    // workspace; carrying them across to a new session would point at
-    // files that don't exist (and worse, leak metadata across users on
-    // shared machines). Files on disk are kept — only the chat's
-    // in-memory list is cleared.
     pendingAttachments.value = [];
-    // Drop queued messages along with the WS — they were typed for *this*
-    // workspace's pi process. Carrying them across to a new session
-    // would silently fire prompts in a different chat once the user
-    // reconnected.
     queuedMessages.value = [];
     useWorkspaceStore().setActive(null);
   }
 
   /**
-   * Close + drop a specific session's WS. Called from chat-session when
-   * the user deletes a chat: without this, the parked bridge would keep
-   * its WS open (heartbeat + auto-reconnect) and pin a pi process on
-   * the backend forever. Safe to call for the active session too — it
-   * just delegates to disconnect() so the rest of the cleanup
-   * (workspace teardown, queue drop, etc.) runs uniformly.
+   * Close + drop a specific session's stream. Currently a thin shim
+   * around disconnect() since we no longer keep parked streams. Kept
+   * as a public API so chat-session.ts callers don't have to change.
    */
   function closeSession(sid: string): void {
     if (session.value?.id === sid) {
       disconnect();
-      return;
     }
-    const parked = parkedSessions.get(sid);
-    if (!parked) return;
-    parkedSessions.delete(sid);
-    try {
-      parked.bridge.close();
-    } catch {
-      /* already gone */
-    }
+    // Non-active sessions don't need cleanup — there's no parked
+    // stream to close. The backend's idle reaper will reap pi if
+    // nobody re-attaches within 10 min.
   }
 
   /**
-   * Tear down the WS and re-open it for the *same* session + workspace.
-   * Pi will respawn fresh, picking up whatever the registry has for the
-   * session right now (model pin, permission mode, etc.) — that's what
-   * makes a model swap take effect immediately instead of "on the next
-   * prompt after some other respawn".
-   *
-   * Returns false if there's no live connection to recycle (callers can
-   * skip silently in that case).
+   * Tear down + re-open the stream for the *same* session. Pi will
+   * NOT respawn unless we send a fresh prompt — the backend keeps
+   * the runtime alive across SSE drops. Used by ModelPicker to
+   * pick up a model swap on the next prompt.
    */
   async function reconnect(): Promise<boolean> {
     const sid = session.value?.id;
     const wsid = useWorkspaceStore().activeId;
     if (!sid || !wsid) return false;
-    // connect() already calls disconnect() first, so there's no double-
-    // teardown here. If pi is mid-stream we abort first so the close
-    // handshake isn't racing a queued tool call.
-    if (isStreaming.value) abort();
+    if (isStreaming.value) {
+      try {
+        await stream?.abort();
+      } catch {
+        /* best effort */
+      }
+    }
     await connect(sid, wsid);
     return true;
-  }
-
-  /**
-   * Re-open the WS against a freshly respawned sidecar. Called by the
-   * Tauri-side watchdog handler in `main.ts` when the sidecar exits
-   * and comes back on a (potentially different) port.
-   *
-   * The flow is intentionally minimal: the API client already had its
-   * base URL rebound by `setApiBase()` BEFORE we get here, so this
-   * just needs to drop the dead bridge and re-open. We don't surface
-   * a toast — the existing chat-error banner already shows
-   * "ws_unreachable" while the sidecar is down, and replacing it
-   * with a more granular "Backend restarted, reconnecting" event
-   * would just add noise during the most-stressful 1-2 seconds.
-   */
-  function reanchorBridge(): void {
-    if (!session.value?.id) return;
-    void reconnect();
   }
 
   // ── inbound dispatcher ──────────────────────────────────────────────
@@ -886,12 +405,6 @@ export const useChatStore = defineStore("chat", () => {
     if (evt.type === "agent_start" || evt.type === "turn_start") isStreaming.value = true;
     else if (evt.type === "agent_end") isStreaming.value = false;
 
-    // Pi auto-compaction: pi-mono summarises the conversation when
-    // context approaches `contextWindow - reserveTokens` (default
-    // ~16k). Summary IS persisted to pi's session jsonl AND IS what
-    // gets sent on subsequent prompts. Pill exposes this so the user
-    // sees that history is being summarised — otherwise the feature
-    // is invisible and users worry earlier context was lost.
     if (evt.type === "compaction_start") {
       const reason = String((evt as { reason?: string }).reason || "threshold");
       compactionState.value = {
@@ -930,15 +443,10 @@ export const useChatStore = defineStore("chat", () => {
       session.value = { id: session.value.id, cwd: String(evt.cwd ?? "") };
     }
 
-    // Backend tells us which model the spawned pi actually loaded
-    // (may differ from what we requested if the user downgraded).
     if (evt.type === "_session_info") {
       const model = String(evt.model ?? "");
       const modelName = String(evt.model_name ?? model);
       if (model) useModelsStore().noteSessionInfo(model, modelName);
-      // Permission mode arrives over the wire as either a canonical ID
-      // (auto / ask / cautious) or a legacy alias (approve_risky /
-      // approve_all). The store's setMode() normalizes both.
       const rawMode = evt.permission_mode;
       if (typeof rawMode === "string" && rawMode.length > 0) {
         usePermissionsStore().setMode(rawMode);
@@ -946,13 +454,9 @@ export const useChatStore = defineStore("chat", () => {
       return;
     }
 
-    // Permission gate. The backend rewrites the pi extension's
-    // ctx.ui.select() call into this event; we surface it via the
-    // permissions store so <PermissionPrompt /> can render the modal.
     if (evt.type === "permission_request") {
       const id = String(evt.id ?? "");
       const tool = String(evt.tool ?? "tool");
-      // The store normalizes legacy aliases (approve_risky → ask, etc).
       const mode = (typeof evt.mode === "string" ? evt.mode : "ask") as PermissionMode;
       if (!id) return;
       usePermissionsStore().enqueue({
@@ -967,11 +471,6 @@ export const useChatStore = defineStore("chat", () => {
       return;
     }
 
-    // Background LLM-generated session title landed. We update the
-    // chat-session store in place so the picker / brand header reflect
-    // the polished title without waiting for a refresh. The backend
-    // already CAS-checked against the heuristic title, so by the time
-    // we get here, the new title is durable in the registry.
     if (evt.type === "_session_titled") {
       const sid = String(evt.sessionId ?? "");
       const title = String(evt.title ?? "").trim();
@@ -981,42 +480,28 @@ export const useChatStore = defineStore("chat", () => {
       return;
     }
 
-    // Inline server-side errors arrive as `_bridge_error` with a stable
-    // `code` discriminator. The backend never sends raw exceptions or
-    // file paths — every UI string comes from the i18n table here.
-    //
-    // Special routing:
-    //   - `setup_required` / `session_expired`  → bounce to /login;
-    //     the user has nothing to do on the chat surface until they
-    //     resolve auth.
-    //   - `quota_exceeded` → also flips the billing store flag so the
-    //     upgrade modal pops without waiting for the next /api/usage
-    //     poll.
-    //   - everything else surfaces in the bottom banner only.
     if (evt.type === "_bridge_error") {
       const code = String(evt.code ?? "internal");
-      // Always look up via i18n, NEVER fall back to evt.message.
-      // The backend's English message is human-readable but it's
-      // still server-side language ("Cloud relay rejected the
-      // connection (HTTP 403)") that we don't want surfacing to
-      // end users. _setError stamps both the localised label
-      // AND the stable code so the error card can resolve its
-      // kind / icon / action from the code switch.
+      if (evt.message) {
+        // eslint-disable-next-line no-console
+        console.warn(`[chat] bridge_error code=${code} (raw, suppressed in UI):`, evt.message);
+      }
       _setError(code);
-
       if (code === "quota_exceeded") {
         useBillingStore().noteExhausted(null);
       }
       if (code === "setup_required" || code === "session_expired") {
-        // Bounce to the Welcome screen — the user can't make progress
-        // here until they sign in or add a key. queueMicrotask defers
-        // the navigation past the current event handler so the WS
-        // teardown fires in order.
         queueMicrotask(() => {
           void appRouter.push({ name: "login" });
         });
       }
+      isStreaming.value = false;
+      // fall through so applyEvent stamps the error on the bubble
+    }
 
+    if (evt.type === "_runtime_ended") {
+      // Backend reaped pi (idle timeout) or pi crashed. The next
+      // prompt will spawn a fresh runtime; nothing to surface.
       isStreaming.value = false;
       return;
     }
@@ -1038,165 +523,84 @@ export const useChatStore = defineStore("chat", () => {
     }
 
     applyEvent(router, evt);
-    _syncEditorFromWriteCall();
-    messages.value = router.messages.slice();
 
-    // Localise any error the router just stamped, so both the
-    // assistant bubble AND the bottom banner render friendly text
-    // instead of a raw provider/HTTP string. The router only stamps
-    // `errorCode` (a stable category like "provider_rate_limit",
-    // "provider_usage_policy", …); this helper looks up the
-    // matching `errors.<code>` i18n key and falls back to the
-    // generic `errors.internal` ("Something went wrong. Please try
-    // again.") for any unknown / unmatched code.
-    //
-    // Important contract for future contributors: NEVER set
-    // `asst.error = <raw provider text>`. The chat UI renders
-    // `asst.error` verbatim, so anything that lands there will hit
-    // the user's screen. Always go through `errorCode` + this
-    // helper.
-    const tailMsg = router.messages[router.messages.length - 1];
-    if (
-      tailMsg &&
-      tailMsg.kind === "assistant" &&
-      tailMsg.errorCode &&
-      !tailMsg.error
-    ) {
-      tailMsg.error = _localiseError(tailMsg.errorCode);
-    }
-
-    // Mirror the now-localised error to the error card so the
-    // failure is visible no matter where the user is scrolled.
-    // Skip if a previous tick already populated lastError — the
-    // _bridge_error path sets it in its own branch above.
-    if (evt.type === "message_end" && !lastErrorCode.value) {
-      if (
-        tailMsg &&
-        tailMsg.kind === "assistant" &&
-        tailMsg.errorCode &&
-        tailMsg.error
-      ) {
-        // Prefer the stable code (so the card resolves the right
-        // kind/icon/action). The localised string was already stamped
-        // on the bubble — _setError will re-localise from the code.
-        _setError(tailMsg.errorCode);
-        isStreaming.value = false;
+    if (evt.type === "message_end" || evt.type === "_bridge_error") {
+      const tail = router.messages[router.messages.length - 1];
+      if (tail && tail.kind === "assistant" && tail.errorCode && !tail.error) {
+        tail.error = _localiseError(tail.errorCode);
+        if (!lastError.value) _setError(tail.errorCode);
       }
     }
-  }
 
-  /**
-   * Map a stable error code (provider_rate_limit, provider_usage_policy,
-   * relay_unauthenticated, etc.) to a friendly localised string.
-   * Falls back to the generic `errors.internal` when the code has no
-   * dedicated translation, so the user never sees a raw category
-   * name like "provider_error" leak into the chat.
-   */
-  function _localiseError(code: string): string {
-    const key = `errors.${code}`;
-    if (i18n.global.te(key)) {
-      return i18n.global.t(key) as string;
-    }
-    return i18n.global.t("errors.internal") as string;
+    _syncEditorFromWriteCall();
+    messages.value = router.messages.slice();
   }
 
   // ── outbound ───────────────────────────────────────────────────────
   function sendPrompt(text: string): void {
-    if (!bridge || !bridge.isOpen) {
-      _setError("ws_unreachable");
-      // Bridge is dead — kick off a reconnect attempt so the next
-      // user retry has a chance of landing on a live socket.
+    if (!stream) {
+      _setError("not_connected");
       void reconnect();
       return;
     }
-    // Wrap with attachments if any are pending. The wrapping is done
-    // INSIDE sendPrompt (rather than in the composer) so every entry
-    // point — Enter key, click handler, future programmatic resends —
-    // gets the same treatment without duplicating logic.
     const wrapped = _wrapWithAttachments(text);
     if (!wrapped.trim()) return;
     const reqId = `req-${Date.now()}`;
-    // Send FIRST, only mutate UI state on success. The bridge can
-    // silently fail when the WS closed in the gap between `isOpen`
-    // returning true and `send()` actually writing to the socket
-    // (kicked tab, network blip, transient proxy disconnect…). The
-    // previous order — push bubble → send → mark streaming — left
-    // the UI stuck on "Stop" with no assistant response when that
-    // race fired. Sending first means the local state stays
-    // consistent with what actually went over the wire.
-    const ok = bridge.send({ id: reqId, type: "prompt", message: wrapped });
-    if (!ok) {
-      _setError("ws_send_failed");
-      void reconnect();
-      return;
-    }
+    // Push the user bubble + flip streaming OPTIMISTICALLY so the UI
+    // feels instant. The POST resolves in <100ms typically; if it
+    // fails we surface the error and roll back isStreaming. The
+    // bubble itself stays — the user typed it; we don't want to
+    // make their text disappear on a transient failure.
     pushUserMessage(router, wrapped, reqId);
     messages.value = [...router.messages];
     isStreaming.value = true;
-    // Attachments are one-shot: cleared after the prompt that included
-    // them is sent. The agent's `read` call against the path will work
-    // forever; we just don't want to keep echoing the prefix.
     pendingAttachments.value = [];
+
+    void (async () => {
+      try {
+        await stream!.sendPrompt(wrapped, reqId);
+      } catch (err) {
+        const code = err instanceof ChatStreamError ? err.code : "ws_send_failed";
+        _setError(code);
+        isStreaming.value = false;
+      }
+    })();
   }
 
   function abort(): void {
-    // Always free the local UI immediately. If we relied on the
-    // backend to send `agent_end` / `message_end` to flip the spinner
-    // back, a stuck-streaming UI (e.g. when the prompt was silently
-    // dropped on a half-closed WS — see bridge.send notes) would
-    // never recover even after the user clicked Stop. Resetting
-    // locally first means Stop ALWAYS unsticks the chat from the
-    // user's point of view; the backend abort is a best-effort
-    // courtesy on top of that.
+    // Always free the local UI immediately. The backend abort is a
+    // best-effort courtesy on top of that.
     isStreaming.value = false;
-    if (!bridge || !bridge.isOpen) return;
-    // Arm the auto-reconnect flag *before* we send the frame. The
-    // backend closes the WS very fast (the abort handler sends one
-    // bridge_error then returns, killing pi inline), so by the time
-    // we hit the next microtask the close handler may already have
-    // fired. Setting the flag first guarantees the connect() callback
-    // sees it.
-    _abortedAwaitingReconnect = true;
-    bridge.send({ type: "abort" });
+    if (!stream) return;
+    void stream.abort().catch(() => {
+      // swallow — local UI already reset, nothing else to do
+    });
   }
 
   // ── queue API ────────────────────────────────────────────────────────
-  //
-  // `_sendQueuedItem` is the private dispatcher that turns a QueuedMessage
-  // into an actual bridge.send. It deliberately does NOT re-wrap the text
-  // with the live `pendingAttachments` ref — the queued item carries its
-  // own attachment snapshot already. This is what lets two queued
-  // messages have different attachment lists without leaking.
   function _sendQueuedItem(item: QueuedMessage): void {
-    if (!bridge || !bridge.isOpen) {
-      _setError("ws_unreachable");
+    if (!stream) {
+      _setError("not_connected");
       void reconnect();
       return;
     }
     const body = _wrapWithAttachments(item.text, item.attachments);
     if (!body.trim()) return;
     const reqId = `req-${Date.now()}`;
-    // Send first, then mutate UI — see sendPrompt() for the full
-    // rationale. Without this order a queued item silently dropped on
-    // a stale WS would push a user bubble that pi never received.
-    const ok = bridge.send({ id: reqId, type: "prompt", message: body });
-    if (!ok) {
-      _setError("ws_send_failed");
-      void reconnect();
-      return;
-    }
     pushUserMessage(router, body, reqId);
     messages.value = [...router.messages];
     isStreaming.value = true;
+    void (async () => {
+      try {
+        await stream!.sendPrompt(body, reqId);
+      } catch (err) {
+        const code = err instanceof ChatStreamError ? err.code : "ws_send_failed";
+        _setError(code);
+        isStreaming.value = false;
+      }
+    })();
   }
 
-  /**
-   * Add the current composer state (text + the live `pendingAttachments`
-   * snapshot) to the queue. The composer clears its own textarea; we
-   * clear the attachment chips here so a follow-up "attach + queue"
-   * starts fresh. Returns the new entry's id so the UI can scroll to it
-   * or open the queue tray.
-   */
   function enqueueMessage(text: string): string | null {
     const trimmed = text.trim();
     if (!trimmed && pendingAttachments.value.length === 0) return null;
@@ -1222,15 +626,13 @@ export const useChatStore = defineStore("chat", () => {
   }
 
   /**
-   * Force a queued item to run *now*: aborts the in-flight pi turn (if
-   * any), removes the item from the queue, and dispatches it. The
-   * auto-flush watcher will pick up subsequent items normally once pi
-   * tears down its current run and isStreaming flips false.
+   * Force a queued item to run *now*: aborts the in-flight pi turn
+   * (if any), removes the item from the queue, and dispatches it.
    *
-   * NOTE: we abort first, then send AFTER a microtask so the bridge has
-   * a chance to flush the abort frame before the new prompt frame. In
-   * practice both go through the same WS write queue and are ordered,
-   * but the explicit `await Promise.resolve()` keeps it readable.
+   * Unlike the old WS path, abort here does NOT tear down the
+   * connection — the backend just signals pi to drop its current
+   * turn and stays ready for the next prompt. So we only have to
+   * wait for `isStreaming` to flip false before sending.
    */
   async function pushQueued(id: string): Promise<void> {
     const item = queuedMessages.value.find((q) => q.id === id);
@@ -1238,19 +640,8 @@ export const useChatStore = defineStore("chat", () => {
     queuedMessages.value = queuedMessages.value.filter((q) => q.id !== id);
     if (isStreaming.value) {
       abort();
-      // Wait for the backend to flip isStreaming false (via _bridge_error
-      // 'aborted' or agent_end) AND for the bridge to come back online.
-      // The abort path now genuinely tears down the WS (close code 4410)
-      // and auto-reconnects, so we have to wait for connState to settle
-      // back to "open" or our `bridge.send()` would land on the closed
-      // socket and disappear. Time out after 6s and try anyway — the
-      // bridge will surface an error if the abort/reconnect genuinely
-      // failed.
       const start = Date.now();
-      while (
-        (isStreaming.value || connState.value !== "open") &&
-        Date.now() - start < 6000
-      ) {
+      while (isStreaming.value && Date.now() - start < 6000) {
         await new Promise((r) => setTimeout(r, 50));
       }
     }
@@ -1261,10 +652,8 @@ export const useChatStore = defineStore("chat", () => {
     queuedMessages.value = [];
   }
 
-  // Auto-flush: when the in-flight turn ends and the queue has items,
-  // fire the head. Vue's watch fires after isStreaming changes, so the
-  // backend has already settled. We use { flush: "post" } to avoid
-  // racing with the same tick's _dispatch updates.
+  // Auto-flush: when the in-flight turn ends and the queue has
+  // items, fire the head.
   watch(
     isStreaming,
     (busy, wasBusy) => {
@@ -1277,14 +666,30 @@ export const useChatStore = defineStore("chat", () => {
     { flush: "post" },
   );
 
-  /** Send the user's reply to a permission_request. The store layer handles
-   * dequeueing in <PermissionPrompt />; we just forward over the wire. If
-   * the bridge is gone (rare race during reconnect) we drop silently — the
-   * pi-side ctx.ui.select() will time out and resolve to deny, which is
-   * the safe default. */
+  /** Reply to a permission_request — POST goes via the stream client. */
   function sendPermissionResponse(id: string, decision: PermissionDecision): void {
-    if (!bridge || !bridge.isOpen) return;
-    bridge.send({ id, type: "permission_response", decision });
+    if (!stream) return;
+    // The old WS sent { decision } as a string ("allow_once" /
+    // "allow_session" / "deny_once" / "deny_session"). The new SSE
+    // protocol takes a boolean `granted`; allow_* → true, deny_* →
+    // false. session-vs-once is local UI state (the permission
+    // store remembers it for subsequent prompts) so the backend
+    // only needs the binary answer.
+    const granted = decision.startsWith("allow");
+    void stream.answerPermission(id, granted).catch(() => {
+      // pi-side ctx.ui.select() will time out and resolve to deny
+      // if our POST never lands — safe default, no UI surface.
+    });
+  }
+
+  /** Re-point the chat stream at the (possibly new) sidecar port.
+   *  Called from main.ts after the Tauri sidecar respawns on a
+   *  different localhost port. With SSE this is just a reconnect:
+   *  the EventSource URL is built relative to the current API base,
+   *  which the sidecar watchdog has already updated via setApiBase().
+   */
+  function reanchorBridge(): void {
+    void reconnect();
   }
 
   function focusToolCall(toolCallId: string): void {
@@ -1322,7 +727,6 @@ export const useChatStore = defineStore("chat", () => {
     disconnect,
     closeSession,
     reconnect,
-    reanchorBridge,
     sendPrompt,
     enqueueMessage,
     removeQueued,
@@ -1335,5 +739,6 @@ export const useChatStore = defineStore("chat", () => {
     addPendingAttachments,
     removePendingAttachment,
     clearPendingAttachments,
+    reanchorBridge,
   };
 });

@@ -61,6 +61,7 @@ from routes import (
     auth_webhook,
     bg,
     billing,
+    chat_sse,
     chat_ws,
     config as config_route,
     desktop_handoff,
@@ -117,6 +118,13 @@ async def _lifespan(app: FastAPI):
 
     egress_proxy.start_egress_proxy()
 
+    # Boot the per-session runtime reaper. Idle pi subprocesses
+    # are evicted after IDLE_TIMEOUT_SECONDS (default 10 min) so a
+    # tab the user closed an hour ago doesn't keep a docker
+    # container resident. See services/session_runtime.py.
+    from services.session_runtime import session_runtime_registry as _srr
+    await _srr().start_reaper()
+
     # ── Pre-warm the Gemini explicit context cache for search_docs ──
     # Per-package caches expire on a 24 h TTL; doing this in the
     # background here means the FIRST real user request finds them
@@ -129,6 +137,16 @@ async def _lifespan(app: FastAPI):
         yield
     finally:
         egress_proxy.stop_egress_proxy()
+        # Cancel the reaper. Active runtimes are NOT torn down on
+        # backend shutdown (mirroring the existing WS path) — the
+        # next backend boot will sweep orphaned containers via
+        # container_pool.cleanup_orphaned_containers above.
+        try:
+            from services.session_runtime import session_runtime_registry as _srr
+            await _srr().stop_reaper()
+        except Exception as exc:  # noqa: BLE001
+            import sys as _sys
+            print(f"[lifespan] reaper stop failed: {exc}", file=_sys.stderr)
 
 
 async def _prewarm_typst_cache() -> None:
@@ -229,6 +247,10 @@ def create_app() -> FastAPI:
     app.include_router(terminals.router)
 
     app.include_router(chat_ws.router)
+    # SSE-based chat (POST + EventSource). Lives alongside chat_ws
+    # during the cutover; once the SPA stops opening WS we delete
+    # routes/chat_ws.py and services/session_locks.py.
+    app.include_router(chat_sse.router)
     app.include_router(terminal_ws.router)
     # Desktop chat-relay WS — sits next to chat_ws because it shares
     # the same protocol surface (delegates to chat_ws.run_session_loop).

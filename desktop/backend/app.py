@@ -60,6 +60,7 @@ from routes import (
     auth_webhook,
     bg,
     billing,
+    chat_sse,
     chat_ws,
     config as config_route,
     desktop_auth,
@@ -126,6 +127,14 @@ async def _lifespan(app: FastAPI):
 
         egress_proxy.start_egress_proxy()
 
+    # Boot the per-session runtime reaper. Idle pi subprocesses
+    # are evicted after IDLE_TIMEOUT_SECONDS (default 10 min). The
+    # reaper runs in BOTH desktop and cloud deploy modes — in
+    # desktop the user benefits from faster shutdown when they
+    # close a workspace; in cloud it bounds resident pi memory.
+    from services.session_runtime import session_runtime_registry as _srr
+    await _srr().start_reaper()
+
     try:
         yield
     finally:
@@ -133,6 +142,12 @@ async def _lifespan(app: FastAPI):
             dotenv_watcher.stop()
         if DEPLOY_MODE != "desktop":
             egress_proxy.stop_egress_proxy()
+        try:
+            from services.session_runtime import session_runtime_registry as _srr
+            await _srr().stop_reaper()
+        except Exception as exc:  # noqa: BLE001
+            import sys as _sys
+            print(f"[lifespan] reaper stop failed: {exc}", file=_sys.stderr)
 
 
 def create_app() -> FastAPI:
@@ -169,6 +184,10 @@ def create_app() -> FastAPI:
     app.include_router(terminals.router)
 
     app.include_router(chat_ws.router)
+    # SSE-based chat (POST + EventSource). Lives alongside chat_ws
+    # during cutover; once the SPA stops opening WS we delete the
+    # WS route file. See web/backend/app.py for the rationale.
+    app.include_router(chat_sse.router)
     app.include_router(terminal_ws.router)
 
     # Public (unauth) auth-side endpoints: webhook + feedback +

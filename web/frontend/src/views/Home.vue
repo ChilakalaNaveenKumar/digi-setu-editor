@@ -46,13 +46,14 @@ onMounted(async () => {
 // blocks below pick the actual variant when auth IS required.
 const authOff = computed(() => !cfg.authRequired);
 
-// Signed-in users who already chose to stay on the marketing surface
-// still want one click to "back to chatting" — so the CTA points at
-// /start (auto-resolves to their most recent chat) rather than the
-// picker. The picker stays a click away from the global header for
-// users who genuinely want to browse the list.
+// "Continue to your workspaces" lands on /sessions (the picker), not
+// /start. Earlier we wired this to /start so users skipped the picker
+// step entirely; the user pushed back hard ("I should see sessions
+// page, not open directly the last session") so we reverted: the
+// picker is the canonical post-sign-in surface and users explicitly
+// click into the chat they want from there.
 function goToSessions(): void {
-  router.push({ name: "start" });
+  router.push({ name: "sessions" });
 }
 
 function goToLogin(): void {

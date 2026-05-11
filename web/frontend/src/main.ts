@@ -75,13 +75,15 @@ async function boot(): Promise<void> {
       // No `appearance` override on purpose: per user instruction we
       // ship Clerk's default styling unmodified for SignIn and
       // UserButton.
-      // Land sign-ins on /start so the user is dropped straight into
-      // their most recent chat (or a freshly minted one). See
-      // views/Start.vue for the auto-resolve flow. Fallback is used
-      // when Clerk doesn't have an explicit redirect target, e.g.
-      // OAuth provider that doesn't preserve query state.
-      signInFallbackRedirectUrl: "/start",
-      signUpFallbackRedirectUrl: "/",
+      // Land sign-ins on /sessions (the chat picker). Per user
+      // instruction we explicitly DO NOT auto-open the most recent
+      // chat — they want to see the workspace list every time and
+      // pick what to enter, not get warped straight back into a
+      // running session. /start still exists as a deep-link option
+      // for callers that want auto-resume, but it's no longer the
+      // default landing surface.
+      signInFallbackRedirectUrl: "/sessions",
+      signUpFallbackRedirectUrl: "/sessions",
     });
 
     setTokenResolver(async () => {

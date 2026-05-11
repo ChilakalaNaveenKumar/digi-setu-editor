@@ -21,26 +21,37 @@
 
 set -euo pipefail
 
-# macOS has `shasum`; Linux CI and Windows Git Bash typically have
-# `sha256sum` and/or `openssl`. Prefer the widest portable chain.
+# Order matters: PYTHON FIRST.
+#
+# Earlier we tried `sha256sum` first because it's the lowest-overhead
+# binary on every box. It bit us on the Windows GHA runner: the
+# msys2/Git-Bash build of `sha256sum` opens stdin in TEXT mode under
+# certain Windows fdisk + Cygwin runtime combinations, which means
+# random `\r\n` byte pairs inside an .exe / .msi binary get
+# translated to `\n` before hashing. The result is a SHA that differs
+# from the byte-identical file once it lands on the Linux VM (where
+# `sha256sum` is always binary). We watched a 110 MB .exe transfer
+# at 100% and STILL fail "SHA mismatch after upload" because of this
+# exact bug.
+#
+# Python's `hashlib.sha256` always reads in binary mode regardless of
+# platform, so it produces the same digest for the same byte stream
+# on Windows, macOS, and Linux. Every GHA runner ships Python 3, so
+# this branch fires on essentially every CI invocation.
+#
+# We keep the pure-shell fallbacks for Bitbucket Linux runners and
+# dev laptops without Python (rare but possible), and explicitly
+# pass `-b` to `sha256sum`/`shasum` to force binary mode wherever
+# they're used so the same bug doesn't bite via the fallback path.
 sha256_file() {
   local f="$1"
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$f" | awk '{print $1}'
-  elif command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$f" | awk '{print $1}'
-  elif command -v openssl >/dev/null 2>&1; then
-    openssl dgst -sha256 "$f" | awk '{print $NF}'
-  else
-    _py=""
-    if command -v python3 >/dev/null 2>&1; then
-      _py=python3
-    elif command -v python >/dev/null 2>&1; then
-      _py=python
-    else
-      echo "$0: need sha256sum, shasum, openssl, or python for SHA-256" >&2
-      exit 127
-    fi
+  local _py=""
+  if command -v python3 >/dev/null 2>&1; then
+    _py=python3
+  elif command -v python >/dev/null 2>&1; then
+    _py=python
+  fi
+  if [[ -n "$_py" ]]; then
     "$_py" - "$f" <<'PY'
 import hashlib, sys
 path = sys.argv[1]
@@ -50,6 +61,17 @@ with open(path, "rb") as fp:
         h.update(chunk)
 print(h.hexdigest())
 PY
+    return 0
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum -b "$f" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -b -a 256 "$f" | awk '{print $1}'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "$f" | awk '{print $NF}'
+  else
+    echo "$0: need python, sha256sum, shasum, or openssl for SHA-256" >&2
+    exit 127
   fi
 }
 
