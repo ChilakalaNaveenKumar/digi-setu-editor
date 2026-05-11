@@ -67,7 +67,9 @@ from collections import deque
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional
 
+from services.bg_processes import BackgroundProcessHub
 from services.error_codes import bridge_error, log_error, log_info
+from services.file_watcher import WatcherRegistry
 from services.pi_session import PiSession
 
 
@@ -126,6 +128,21 @@ class SessionRuntime:
 
         self._pi: Optional[PiSession] = None
         self._pi_task: Optional[asyncio.Task[None]] = None
+
+        # File-watcher + background-process fanout. We subscribe at
+        # session-runtime startup so the FIRST stream consumer (which
+        # arrives before the first prompt — the SPA opens the SSE on
+        # ChatPane mount) already gets fs_change events for any disk
+        # mutations the user does in parallel (e.g. dragging a file
+        # into the tree before they send a prompt). The watcher
+        # ref-counts under the hood, so multiple sessions over the
+        # same workspace path share one observer thread.
+        self._fs_watcher = None  # type: ignore[var-annotated]
+        self._fs_queue: Optional[asyncio.Queue[Any]] = None
+        self._fs_task: Optional[asyncio.Task[None]] = None
+        self._bg_registry = None  # type: ignore[var-annotated]
+        self._bg_queue: Optional[asyncio.Queue[Any]] = None
+        self._bg_task: Optional[asyncio.Task[None]] = None
         # Lock protects start/close races so we never spawn two pi's
         # for the same runtime even if two prompts race the first
         # `ensure_started()` call.
@@ -160,11 +177,89 @@ class SessionRuntime:
         self._pending_permissions: dict[str, dict[str, Any]] = {}
 
     # ── lifecycle ───────────────────────────────────────────────────
+    async def ensure_fanout_started(self) -> None:
+        """Subscribe to fs + bg event sources for this workspace.
+
+        Idempotent. Cheap (no subprocess), so we call it from BOTH
+        the first stream-open AND the first prompt — whichever
+        arrives first wins. The reaper releases these on close.
+
+        Why split out from `ensure_started`: the user may open the
+        chat pane (SSE stream connects → wants fs_change events for
+        the file tree) WITHOUT immediately sending a prompt. We
+        don't want to spawn pi just to deliver tree updates — that
+        would burn a chat slot on the rate-limiter for an idle tab.
+
+        Concurrency: takes `_lifecycle_lock` so two prompts arriving
+        simultaneously can't each subscribe (which would double-fan
+        every event into the ring).
+        """
+        async with self._lifecycle_lock:
+            await self._ensure_fanout_started_locked()
+
+    async def _ensure_fanout_started_locked(self) -> None:
+        """Same as `ensure_fanout_started` but assumes the caller
+        already holds `_lifecycle_lock`. Called from `ensure_started`
+        which takes the lock for pi spawn — using this variant
+        avoids the obvious re-entrancy deadlock.
+        """
+        if self._closed:
+            return
+        if self._fs_watcher is None:
+            try:
+                self._fs_watcher = await WatcherRegistry.instance().acquire(
+                    self.workspace_path,
+                )
+                self._fs_queue = self._fs_watcher.subscribe()
+                self._fs_task = asyncio.create_task(
+                    self._pump_fs_events(),
+                    name=f"fs-pump-{self.session_id}",
+                )
+            except Exception as exc:  # noqa: BLE001
+                log_error(
+                    "internal",
+                    session_id=self.session_id,
+                    user_id=self.user_id,
+                    exc=exc,
+                    where="session_runtime.fs_subscribe",
+                )
+                self._fs_watcher = None
+                self._fs_queue = None
+
+        if self._bg_registry is None:
+            try:
+                self._bg_registry = (
+                    BackgroundProcessHub.instance().for_workspace(self.workspace_id)
+                )
+                self._bg_queue = self._bg_registry.subscribe()
+                self._bg_task = asyncio.create_task(
+                    self._pump_bg_events(),
+                    name=f"bg-pump-{self.session_id}",
+                )
+            except Exception as exc:  # noqa: BLE001
+                log_error(
+                    "internal",
+                    session_id=self.session_id,
+                    user_id=self.user_id,
+                    exc=exc,
+                    where="session_runtime.bg_subscribe",
+                )
+                self._bg_registry = None
+                self._bg_queue = None
+
     async def ensure_started(self) -> None:
-        """Spawn pi if it isn't running yet. Idempotent."""
+        """Spawn pi if it isn't running yet. Idempotent.
+
+        Also lazy-arms the fs/bg fanout — same justification as the
+        comment on `ensure_fanout_started`, but covers the path
+        where a stream consumer never showed up before the first
+        prompt (rare but possible: programmatic POST /prompt with no
+        UI attached).
+        """
         async with self._lifecycle_lock:
             if self._closed:
                 raise RuntimeError("session runtime closed")
+            await self._ensure_fanout_started_locked()
             if self._pi is not None:
                 return
 
@@ -217,14 +312,46 @@ class SessionRuntime:
                 return
             self._closed = True
 
-        # Cancel the pump task FIRST so it doesn't race with pi.close().
-        if self._pi_task is not None:
-            self._pi_task.cancel()
+        # Cancel pump tasks FIRST so they don't race with the pi /
+        # registry teardowns below.
+        for task_attr in ("_pi_task", "_fs_task", "_bg_task"):
+            t = getattr(self, task_attr)
+            if t is not None:
+                t.cancel()
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+                setattr(self, task_attr, None)
+
+        # Release fs watcher (ref-counted; observer thread only stops
+        # when the last subscriber releases). Same for bg registry's
+        # subscriber set.
+        if self._fs_watcher is not None and self._fs_queue is not None:
             try:
-                await self._pi_task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                self._fs_watcher.unsubscribe(self._fs_queue)
+            except Exception:  # noqa: BLE001
                 pass
-            self._pi_task = None
+            try:
+                await WatcherRegistry.instance().release(self.workspace_path)
+            except Exception as exc:  # noqa: BLE001
+                log_error(
+                    "internal",
+                    session_id=self.session_id,
+                    user_id=self.user_id,
+                    exc=exc,
+                    where="session_runtime.fs_release",
+                )
+            self._fs_watcher = None
+            self._fs_queue = None
+
+        if self._bg_registry is not None and self._bg_queue is not None:
+            try:
+                self._bg_registry.unsubscribe(self._bg_queue)
+            except Exception:  # noqa: BLE001
+                pass
+            self._bg_registry = None
+            self._bg_queue = None
 
         if self._pi is not None:
             try:
@@ -399,6 +526,60 @@ class SessionRuntime:
             # of-stream marker so consumers can re-fetch history /
             # show a "session ended" affordance.
             self._enqueue({"type": "_runtime_ended"})
+
+    async def _pump_fs_events(self) -> None:
+        """Drain the WorkspaceWatcher queue into the ring.
+
+        These events are what makes the file tree refresh in real
+        time when the agent (or anything else writing to disk) adds,
+        modifies, or removes a file in the workspace. The frontend
+        store dispatches on `evt.type === "fs_change"` (see
+        stores/files.ts.applyFsChange).
+        """
+        q = self._fs_queue
+        if q is None:
+            return
+        try:
+            while not self._closed:
+                msg = await q.get()
+                if isinstance(msg, dict):
+                    self._enqueue(msg)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log_error(
+                "internal",
+                session_id=self.session_id,
+                user_id=self.user_id,
+                exc=exc,
+                where="session_runtime.fs_pump",
+            )
+
+    async def _pump_bg_events(self) -> None:
+        """Drain background-process output into the ring.
+
+        Mirrors the WS path's bg fanout — terminal output, long-
+        running shell tools, etc. The frontend dispatcher handles
+        the `bg_output`/`bg_started`/`bg_exited` types directly.
+        """
+        q = self._bg_queue
+        if q is None:
+            return
+        try:
+            while not self._closed:
+                msg = await q.get()
+                if isinstance(msg, dict):
+                    self._enqueue(msg)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log_error(
+                "internal",
+                session_id=self.session_id,
+                user_id=self.user_id,
+                exc=exc,
+                where="session_runtime.bg_pump",
+            )
 
     # ── internal helpers ────────────────────────────────────────────
     def _enqueue(self, evt: dict[str, Any]) -> None:

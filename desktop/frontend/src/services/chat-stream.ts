@@ -17,7 +17,31 @@
  * one on `window.__pi_token` for the desktop relay path).
  */
 
+import { getApiBase } from "../api/client";
 import type { RpcEvent } from "../types/rpc";
+
+/**
+ * Desktop SPA lives at `tauri://localhost` (or a dev Vite origin)
+ * but the sidecar binds to `http://127.0.0.1:<random-port>` chosen
+ * by the Tauri shell at boot. Relative `/api/...` URLs would resolve
+ * against the SPA's origin and 404 instantly — that was the
+ * "Connection lost · error code: network" the user saw on a fresh
+ * desktop install. setApiBase() (called by main.ts after the sidecar
+ * announces its port) gives us the absolute base; we have to prepend
+ * it ourselves on the EventSource and on the fetch POSTs because
+ * neither path goes through the api/client wrapper that handles
+ * absolutize-ing for normal REST calls.
+ *
+ * On web mode `_apiBase` is empty → `_absolutize` returns the path
+ * unchanged → behaviour is identical to before.
+ */
+function _absolutize(path: string): string {
+  const base = getApiBase();
+  if (!base) return path;
+  if (/^[a-z][a-z0-9+\-.]*:\/\//i.test(path)) return path;
+  if (!path.startsWith("/")) return path;
+  return base + path;
+}
 
 export type ChatStreamState =
   | "idle"        // no stream open
@@ -62,7 +86,9 @@ export class ChatStream {
     this.opts.onState("connecting");
     this.armConnectingTimer();
 
-    const url = `/api/sessions/${encodeURIComponent(this.opts.sessionId)}/stream`;
+    const url = _absolutize(
+      `/api/sessions/${encodeURIComponent(this.opts.sessionId)}/stream`,
+    );
     // `withCredentials: true` ensures the Clerk session cookie is sent
     // even on cross-origin dev (vite 5173 → uvicorn 8000). Same-origin
     // prod doesn't need it but it's harmless.
@@ -137,7 +163,9 @@ export class ChatStream {
 
   // ── private ───────────────────────────────────────────────────────
   private async post(suffix: string, body: unknown): Promise<unknown> {
-    const url = `/api/sessions/${encodeURIComponent(this.opts.sessionId)}${suffix}`;
+    const url = _absolutize(
+      `/api/sessions/${encodeURIComponent(this.opts.sessionId)}${suffix}`,
+    );
     const res = await fetch(url, {
       method: "POST",
       credentials: "include",

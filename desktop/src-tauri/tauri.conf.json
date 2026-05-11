@@ -78,6 +78,10 @@
       "nsis": {
         "installerIcon": "icons/icon.ico",
         "installMode": "perMachine"
+      },
+      "webviewInstallMode": {
+        "type": "embedBootstrapper",
+        "silent": true
       }
     }
   },

@@ -455,7 +455,10 @@ async def _sse_body(
                 continue
             except StopAsyncIteration:
                 # rt closed — emit a final marker and exit.
-                yield b"event: _runtime_ended\ndata: {}\n\n"
+                # Same SSE-format rule as _format_sse: NO `event:`
+                # field, the marker rides on the JSON `type` so it
+                # lands on `onmessage` and the chat.ts dispatcher.
+                yield b'data: {"type":"_runtime_ended"}\n\n'
                 break
 
             yield _format_sse(ev_id, evt)
@@ -486,6 +489,13 @@ async def get_stream(
     # Acquire (or build) the runtime — does NOT spawn pi by itself.
     # Pi spawns when the first POST /prompt arrives.
     rt = await _resolve_runtime(sid, user_id, create=True)
+
+    # Arm the fs+bg fanout NOW so the file tree starts receiving
+    # change events the instant the chat pane mounts — without this,
+    # the user has to send a prompt (which calls ensure_started)
+    # before the tree can refresh on agent writes. See
+    # SessionRuntime.ensure_fanout_started() for the full rationale.
+    await rt.ensure_fanout_started()
 
     # Resume from `Last-Event-ID` if the browser is reconnecting.
     last_id_header = request.headers.get("last-event-id") or request.query_params.get("since") or ""
