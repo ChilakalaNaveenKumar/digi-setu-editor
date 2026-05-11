@@ -31,22 +31,77 @@ from PIL import Image, ImageDraw, ImageFilter
 ROOT = Path(__file__).resolve().parents[2]
 ICON_DIR = ROOT / "desktop" / "src-tauri" / "icons"
 SVG_SOURCE = ROOT / "web" / "frontend" / "public" / "digi-setu-logo.svg"
+# Where to drop the browser favicon set (tab + iOS home-screen icons).
+# Both frontends ship copies so the index.html <link rel="icon" ...> tags
+# resolve cleanly in both web and Tauri-served contexts.
+FAVICON_DIRS = [
+    ROOT / "web" / "frontend" / "public",
+    ROOT / "desktop" / "frontend" / "public",
+]
+# We intentionally use the TIGHT-CROPPED variant for icon generation so
+# the rendered glyph reaches all four edges of the icon canvas. The full
+# wordmark logo stays at SVG_SOURCE for use in the in-app header (which
+# has more horizontal real estate).
+SVG_TIGHT = Path(__file__).resolve().parent / "_logo-tight.svg"
 
 BG_COLOR = (15, 23, 42, 255)            # slate-900 = #0F172A
 GLYPH_COLOR = (255, 255, 255, 255)
 MASTER_SIZE = 1024
-GLYPH_FILL = 0.70                       # Apple HIG: glyph fills ~68-72% of canvas
 CORNER_RADIUS_RATIO = 0.2237            # Apple "squircle" approximation
 
 
-def extract_glyph_from_svg(svg_path: Path) -> Image.Image:
-    """The vue 'svg' is actually a base64 PNG wrapped in <pattern>. Decode it."""
+# We deliberately DROP the rounded-square background and let the glyph fill
+# essentially the entire canvas (98%). At 32px every pixel matters and the
+# old Apple-HIG squircle bg was eating ~30% of the available pixels for
+# decoration. macOS / Windows / Linux all render icons over the platform's
+# own dock/taskbar backdrop, so the bg layer was redundant anyway.
+GLYPH_FILL = 0.98
+
+
+def _have(cmd: str) -> bool:
+    """True if `cmd` resolves on PATH."""
+    from shutil import which
+    return which(cmd) is not None
+
+
+def rasterise_glyph(svg_path: Path, target_w: int, target_h: int) -> Image.Image:
+    """Rasterise the source SVG to fit (target_w x target_h), preserving aspect.
+
+    For TRUE vector SVGs we hand the size directly to `rsvg-convert` so the
+    glyph gets pixel-perfect anti-aliasing at the final output resolution —
+    NEVER a downscaled bitmap, which is where small icons lose their crisp
+    edges. For the legacy embedded-PNG-in-SVG case (the old vue export) we
+    decode the bitmap once and Lanczos-resample, since there's no vector
+    data to rasterise from.
+    """
     raw = svg_path.read_text()
-    m = re.search(r"data:image/png;base64,([A-Za-z0-9+/=]+)", raw)
-    if not m:
-        raise SystemExit(f"no embedded png inside {svg_path}")
-    data = base64.b64decode(m.group(1))
-    return Image.open(io.BytesIO(data)).convert("RGBA")
+    embedded = re.search(r"data:image/png;base64,([A-Za-z0-9+/=]+)", raw)
+    if embedded:
+        data = base64.b64decode(embedded.group(1))
+        bitmap = Image.open(io.BytesIO(data)).convert("RGBA")
+        bitmap = autocrop_alpha(bitmap)
+        w, h = bitmap.size
+        scale = min(target_w / w, target_h / h)
+        nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+        return bitmap.resize((nw, nh), Image.LANCZOS)
+
+    if not _have("rsvg-convert"):
+        raise SystemExit(
+            "rsvg-convert is required to rasterise vector SVGs. "
+            "Install it via `brew install librsvg`."
+        )
+    proc = subprocess.run(
+        [
+            "rsvg-convert",
+            "--width", str(target_w),
+            "--height", str(target_h),
+            "--keep-aspect-ratio",
+            str(svg_path),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return Image.open(io.BytesIO(proc.stdout)).convert("RGBA")
 
 
 def autocrop_alpha(img: Image.Image) -> Image.Image:
@@ -56,49 +111,36 @@ def autocrop_alpha(img: Image.Image) -> Image.Image:
     return img.crop(bbox)
 
 
-def render_master(glyph: Image.Image) -> Image.Image:
-    """Compose the 1024x1024 master: rounded-square bg + centered white glyph."""
-    canvas = Image.new("RGBA", (MASTER_SIZE, MASTER_SIZE), (0, 0, 0, 0))
+def render_at(svg_path: Path, size: int) -> Image.Image:
+    """Render a single icon at exactly (size x size).
 
-    # Rounded-square mask for the navy background.
-    mask = Image.new("L", (MASTER_SIZE, MASTER_SIZE), 0)
-    radius = int(MASTER_SIZE * CORNER_RADIUS_RATIO)
-    ImageDraw.Draw(mask).rounded_rectangle(
-        (0, 0, MASTER_SIZE - 1, MASTER_SIZE - 1),
-        radius=radius,
-        fill=255,
+    Strategy: rasterise the SVG natively at the final size via rsvg-convert
+    so every pixel gets pixel-perfect anti-aliasing, then centre it on a
+    transparent (size x size) canvas. No squircle bg — every pixel goes to
+    the actual glyph. The platform (Dock, Taskbar, Activity bar) supplies
+    its own backdrop.
+    """
+    canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+
+    target = max(1, int(size * GLYPH_FILL))
+    glyph = rasterise_glyph(svg_path, target, target)
+
+    # Force every visible pixel to pure white using the alpha as a mask.
+    _, _, _, alpha = glyph.split()
+    glyph = Image.composite(
+        Image.new("RGBA", glyph.size, GLYPH_COLOR),
+        Image.new("RGBA", glyph.size, (0, 0, 0, 0)),
+        alpha,
     )
-    bg = Image.new("RGBA", (MASTER_SIZE, MASTER_SIZE), BG_COLOR)
-    canvas.paste(bg, (0, 0), mask)
 
-    # Force the glyph to pure white (ignore source colour fringes from JPG-ish PNG).
-    g = glyph.copy()
-    r, gg, b, a = g.split()
-    white = Image.new("RGBA", g.size, GLYPH_COLOR)
-    g = Image.composite(white, Image.new("RGBA", g.size, (0, 0, 0, 0)), a)
-
-    # Scale glyph to fit GLYPH_FILL of the master while preserving aspect ratio.
-    target = int(MASTER_SIZE * GLYPH_FILL)
-    w, h = g.size
-    scale = min(target / w, target / h)
-    nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
-    g = g.resize((nw, nh), Image.LANCZOS)
-
-    ox = (MASTER_SIZE - nw) // 2
-    oy = (MASTER_SIZE - nh) // 2
-    canvas.alpha_composite(g, (ox, oy))
+    nw, nh = glyph.size
+    ox = (size - nw) // 2
+    oy = (size - nh) // 2
+    canvas.alpha_composite(glyph, (ox, oy))
     return canvas
 
 
-def hi_quality_resize(master: Image.Image, size: int) -> Image.Image:
-    """Two-step downscale (mip-map style) keeps thin lines crisp at small sizes."""
-    img = master
-    while img.size[0] // 2 > size:
-        img = img.resize((img.size[0] // 2, img.size[1] // 2), Image.LANCZOS)
-    return img.resize((size, size), Image.LANCZOS)
-
-
-def write_macos_icns(master: Image.Image, out: Path) -> None:
+def write_macos_icns(svg_path: Path, out: Path) -> None:
     iconset = out.with_suffix(".iconset")
     if iconset.exists():
         for f in iconset.iterdir():
@@ -118,7 +160,7 @@ def write_macos_icns(master: Image.Image, out: Path) -> None:
         ("icon_512x512@2x.png", 1024),
     ]
     for name, size in pairs:
-        hi_quality_resize(master, size).save(iconset / name, "PNG")
+        render_at(svg_path, size).save(iconset / name, "PNG")
 
     if out.exists():
         out.unlink()
@@ -131,9 +173,9 @@ def write_macos_icns(master: Image.Image, out: Path) -> None:
     iconset.rmdir()
 
 
-def write_windows_ico(master: Image.Image, out: Path) -> None:
+def write_windows_ico(svg_path: Path, out: Path) -> None:
     sizes = [16, 24, 32, 48, 64, 128, 256]
-    images = [hi_quality_resize(master, s) for s in sizes]
+    images = [render_at(svg_path, s) for s in sizes]
     images[0].save(
         out,
         format="ICO",
@@ -142,14 +184,31 @@ def write_windows_ico(master: Image.Image, out: Path) -> None:
     )
 
 
-def write_pngs(master: Image.Image) -> None:
-    # Tauri default sizes
-    for size in [32, 64, 128]:
-        hi_quality_resize(master, size).save(ICON_DIR / f"{size}x{size}.png", "PNG")
-    hi_quality_resize(master, 256).save(ICON_DIR / "128x128@2x.png", "PNG")
-    master.save(ICON_DIR / "icon.png", "PNG")
+def write_favicons(svg_path: Path) -> None:
+    """Drop favicon.ico + favicon-32 + favicon-192 + apple-touch-icon.png
+    into every frontend public dir so the <link rel="icon"> tags in
+    index.html actually resolve."""
+    for tgt in FAVICON_DIRS:
+        if not tgt.exists():
+            continue
+        ico = [render_at(svg_path, s) for s in (16, 32, 48)]
+        ico[0].save(
+            tgt / "favicon.ico",
+            format="ICO",
+            sizes=[(16, 16), (32, 32), (48, 48)],
+            append_images=ico[1:],
+        )
+        render_at(svg_path, 32).save(tgt / "favicon-32.png", "PNG")
+        render_at(svg_path, 192).save(tgt / "favicon-192.png", "PNG")
+        render_at(svg_path, 180).save(tgt / "apple-touch-icon.png", "PNG")
 
-    # Windows Store assets keep the same artwork (sizes per MS template)
+
+def write_pngs(svg_path: Path) -> None:
+    for size in [32, 64, 128]:
+        render_at(svg_path, size).save(ICON_DIR / f"{size}x{size}.png", "PNG")
+    render_at(svg_path, 256).save(ICON_DIR / "128x128@2x.png", "PNG")
+    render_at(svg_path, MASTER_SIZE).save(ICON_DIR / "icon.png", "PNG")
+
     store_sizes = {
         "Square30x30Logo.png": 30,
         "Square44x44Logo.png": 44,
@@ -163,34 +222,80 @@ def write_pngs(master: Image.Image) -> None:
         "StoreLogo.png": 50,
     }
     for name, size in store_sizes.items():
-        hi_quality_resize(master, size).save(ICON_DIR / name, "PNG")
+        render_at(svg_path, size).save(ICON_DIR / name, "PNG")
+
+
+def _build_tight_variant() -> Path:
+    """Generate (or refresh) the tight-cropped SVG used for icon rendering.
+
+    The wordmark SVG has ~16% of its bounding box reserved as whitespace
+    padding. For icon contexts we want every pixel to count, so we measure
+    the alpha bbox of a high-res rasterisation and rewrite the viewBox to
+    fit the content (with a ~5% safety margin so anti-aliased edges aren't
+    clipped). Result lives next to this script as `_logo-tight.svg`.
+    """
+    if not _have("rsvg-convert"):
+        return SVG_SOURCE  # fall back to the un-cropped source.
+    out = subprocess.run(
+        ["rsvg-convert", "--width", "4096", str(SVG_SOURCE)],
+        check=True, capture_output=True,
+    ).stdout
+    bm = Image.open(io.BytesIO(out)).convert("RGBA")
+    bbox = bm.getbbox()
+    if not bbox:
+        return SVG_SOURCE
+    W, H = bm.size
+    sx, sy = 0, 0
+    raw = SVG_SOURCE.read_text()
+    m = re.search(r'viewBox="([^"]+)"', raw)
+    if m:
+        vx, vy, vw, vh = (float(x) for x in m.group(1).split())
+        sx, sy = vw / W, vh / H
+        bx = vx + bbox[0] * sx
+        by = vy + bbox[1] * sy
+        bw = (bbox[2] - bbox[0]) * sx
+        bh = (bbox[3] - bbox[1]) * sy
+    else:
+        bx, by = bbox[0], bbox[1]
+        bw, bh = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    margin = max(bw, bh) * 0.05
+    bx -= margin; by -= margin
+    bw += 2 * margin; bh += 2 * margin
+    new_vb = f"{bx:.2f} {by:.2f} {bw:.2f} {bh:.2f}"
+    s = re.sub(r'\swidth="[^"]*"', "", raw, count=1)
+    s = re.sub(r'\sheight="[^"]*"', "", s, count=1)
+    s = re.sub(r'viewBox="[^"]*"', f'viewBox="{new_vb}"', s, count=1)
+    SVG_TIGHT.write_text(s)
+    return SVG_TIGHT
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Rebuild Digi Setu app icons.")
-    parser.add_argument("--source", type=Path, default=SVG_SOURCE,
-                        help=f"glyph source (svg-with-embedded-png), default: {SVG_SOURCE}")
+    parser.add_argument("--source", type=Path, default=None,
+                        help=f"glyph source (default: tight-crop of {SVG_SOURCE.relative_to(ROOT)})")
     args = parser.parse_args(argv)
 
-    if not args.source.exists():
-        print(f"source not found: {args.source}", file=sys.stderr)
+    src = args.source or _build_tight_variant()
+
+    if not src.exists():
+        print(f"source not found: {src}", file=sys.stderr)
         return 2
 
-    print(f"[icons] source       : {args.source.relative_to(ROOT)}")
-    glyph = autocrop_alpha(extract_glyph_from_svg(args.source))
-    print(f"[icons] glyph cropped: {glyph.size[0]}x{glyph.size[1]}")
+    print(f"[icons] source       : {src.relative_to(ROOT)}")
+    print(f"[icons] strategy     : rasterise SVG natively at every output size")
+    args.source = src
 
-    master = render_master(glyph)
-    print(f"[icons] master       : {MASTER_SIZE}x{MASTER_SIZE}")
+    write_pngs(args.source)
+    print("[icons] wrote PNG variants (icon.png + Tauri sizes + Square*Logo)")
 
-    write_pngs(master)
-    print("[icons] wrote PNG variants")
+    write_favicons(args.source)
+    print("[icons] wrote browser favicons (favicon.ico + 32/192/apple-touch)")
 
-    write_macos_icns(master, ICON_DIR / "icon.icns")
-    print("[icons] wrote icon.icns (10 embedded sizes)")
+    write_macos_icns(args.source, ICON_DIR / "icon.icns")
+    print("[icons] wrote icon.icns (10 native renders)")
 
-    write_windows_ico(master, ICON_DIR / "icon.ico")
-    print("[icons] wrote icon.ico (7 embedded sizes)")
+    write_windows_ico(args.source, ICON_DIR / "icon.ico")
+    print("[icons] wrote icon.ico (7 native renders)")
 
     print(f"[icons] done -> {ICON_DIR.relative_to(ROOT)}")
     return 0
