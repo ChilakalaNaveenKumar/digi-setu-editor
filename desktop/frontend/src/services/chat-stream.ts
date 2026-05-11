@@ -99,17 +99,13 @@ export class ChatStream {
       this.armConnectingTimer();
     };
 
+    // The server omits the SSE `event:` field deliberately so EVERY
+    // event lands on onmessage. The dispatcher in chat.ts then
+    // routes by the JSON payload's `type` field. (See the footgun
+    // note in routes/chat_sse.py:_format_sse for why.)
     es.onmessage = (e: MessageEvent<string>) => {
       this.handlePayload(e.data);
     };
-
-    // The server tags events with `event: <type>` so consumers CAN
-    // filter via addEventListener. We register a fallback for the
-    // `_runtime_ended` server-final event so the SPA can show
-    // "session ended" without us having to mirror every type here.
-    es.addEventListener("_runtime_ended", () => {
-      this.opts.onState("closed");
-    });
   }
 
   /** Tear down the EventSource. Safe to call multiple times. */

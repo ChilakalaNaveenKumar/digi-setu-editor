@@ -391,17 +391,21 @@ async def get_runtime_status(
 def _format_sse(ev_id: int, evt: dict[str, Any]) -> bytes:
     """Format one event as an SSE block.
 
-    Spec: lines `id:` `event:` `data:` followed by `\\n\\n`. We use
-    the event dict's `type` as the event name so EventSource consumers
-    can filter via `addEventListener('agent_text', …)` if they want;
-    most consumers will just listen on `onmessage` (the default
-    'message' event).
+    Spec footgun: if you emit `event: <name>` then EventSource
+    routes the event to `addEventListener(<name>, …)` ONLY, and
+    the default `onmessage` handler never fires. Our frontend
+    listens on `onmessage` and dispatches based on the JSON
+    payload's `type` field, so we deliberately omit `event:` —
+    every event lands on `onmessage` and the dispatcher in
+    chat.ts picks it apart.
+
+    `id:` is kept so EventSource sends it as `Last-Event-ID` on
+    automatic reconnects and the backend's ring buffer can
+    replay missed events.
     """
-    ev_type = str(evt.get("type") or "message")
     payload = json.dumps(evt, separators=(",", ":"), ensure_ascii=False)
     return (
         f"id: {ev_id}\n"
-        f"event: {ev_type}\n"
         f"data: {payload}\n\n"
     ).encode("utf-8")
 

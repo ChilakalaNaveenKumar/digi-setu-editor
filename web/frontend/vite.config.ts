@@ -21,7 +21,37 @@ export default defineConfig(({ mode }) => {
       port,
       strictPort: true,
       proxy: {
-        "/api": apiTarget,
+        // SSE-friendly proxy config. Defaults buffer responses and
+        // close the upstream socket after ~2 min — both kill our
+        // long-lived `/api/sessions/:sid/stream` event source. Bump
+        // the timeout to effectively-infinite, set the buffer to a
+        // tiny size so each SSE chunk flushes immediately, and make
+        // sure no compression middleware is inserted.
+        "/api": {
+          target: apiTarget,
+          changeOrigin: false,
+          ws: false,
+          // 24h timeout — well beyond any plausible browser tab life.
+          // Without this http-proxy default-closes after 120s and the
+          // SSE consumer receives no more events.
+          timeout: 24 * 60 * 60 * 1000,
+          proxyTimeout: 24 * 60 * 60 * 1000,
+          // Some proxy adapters set a `Cache-Control` that makes
+          // intermediaries buffer; explicitly mirror what the backend
+          // sets so behaviour matches prod (Caddy direct to uvicorn).
+          configure: (proxy) => {
+            proxy.on("proxyRes", (proxyRes) => {
+              if (
+                String(proxyRes.headers["content-type"] || "").includes(
+                  "text/event-stream",
+                )
+              ) {
+                proxyRes.headers["cache-control"] = "no-cache, no-transform";
+                proxyRes.headers["x-accel-buffering"] = "no";
+              }
+            });
+          },
+        },
         "/ws": { target: wsTarget, ws: true },
       },
     },
