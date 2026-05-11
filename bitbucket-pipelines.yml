@@ -271,9 +271,25 @@ definitions:
           # the "did not receive expected object" pack-negotiation error
           # that sinks fresh pushes to an empty / divergent target.
           - git fetch --unshallow origin "$BITBUCKET_BRANCH" || git fetch origin "$BITBUCKET_BRANCH"
-          # Always push the branch. Push the tag too if this run was
-          # triggered by a tag push.
-          - git push --force-with-lease github "HEAD:${BITBUCKET_BRANCH:-main}"
+          # We MUST fetch the github mirror too, otherwise --force-with-lease
+          # below dies with "stale info" (the lease checks that github's
+          # current sha matches what we last fetched — and without this
+          # fetch, we've never fetched github at all). The `|| true` keeps
+          # the very first run on an empty mirror passing.
+          - git fetch github "$BITBUCKET_BRANCH" 2>/dev/null || true
+          # Branch push. Use a SHA-pinned lease so the check is exact:
+          # "only push if github/main is at the sha we just fetched, OR
+          # is empty (--force-with-lease=ref accepts an absent remote).
+          # If the fetch above failed (empty mirror), the lease silently
+          # degrades to plain --force which is what we want for bootstrap.
+          - >
+            EXPECTED=$(git rev-parse "github/${BITBUCKET_BRANCH:-main}" 2>/dev/null || echo "");
+            if [ -n "$EXPECTED" ]; then
+              git push --force-with-lease="${BITBUCKET_BRANCH:-main}:${EXPECTED}" \
+                github "HEAD:${BITBUCKET_BRANCH:-main}";
+            else
+              git push github "HEAD:${BITBUCKET_BRANCH:-main}";
+            fi
           - >
             if [ -n "${BITBUCKET_TAG}" ]; then
               git push github "${BITBUCKET_TAG}";
