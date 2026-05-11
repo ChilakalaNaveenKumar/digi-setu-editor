@@ -65,7 +65,7 @@ const chat = useChatStore();
 const ws = useWorkspaceStore();
 const files = useFilesStore();
 const ui = useUiStore();
-const { pendingAttachments, queuedMessages, connState, isStreaming } = storeToRefs(chat);
+const { pendingAttachments, queuedMessages, connState, isStreaming, lastErrorCode } = storeToRefs(chat);
 
 const text = ref("");
 const fileInput = ref<HTMLInputElement | null>(null);
@@ -128,10 +128,20 @@ function submit(): void {
   // attachments — that's a valid intent (user dropped files, hit send
   // to ask "look at these").
   if (!text.value.trim() && pendingAttachments.value.length === 0) return;
-  if (chat.isStreaming) {
-    // Pi is mid-turn: enqueue instead of sending. The store snapshots
-    // the current pendingAttachments onto the queued item and clears
-    // the composer's chip strip so the next message starts fresh.
+  // Three "send-now is unsafe" cases all funnel into the local
+  // queue (which the chat store auto-drains the moment pi is free
+  // and the SSE stream is open again):
+  //   1. pi is mid-turn (existing behaviour);
+  //   2. SSE transport is reconnecting after a blip — POST /prompt
+  //      would race the new connection and the rate-limiter could
+  //      misattribute the slot;
+  //   3. the runtime hasn't reported `_session_info` yet (initial
+  //      connecting on a brand-new tab).
+  // In all three the user keeps their text in the queue strip
+  // above the composer, sees it fire automatically, and the
+  // "Reconnecting…" pill no longer eats their typing.
+  const transportNotReady = connState.value !== "open";
+  if (chat.isStreaming || transportNotReady) {
     chat.enqueueMessage(text.value);
   } else {
     chat.sendPrompt(text.value);
@@ -251,7 +261,22 @@ function isImageMime(mime: string): boolean {
   return mime.startsWith("image/");
 }
 
-const inputDisabled = computed(() => connState.value !== "open");
+// Composer typing should NEVER be blocked just because the SSE
+// transport is mid-reconnect. EventSource flickers between `open`
+// and `connecting` on every momentary network blip (Wi-Fi roam,
+// laptop wake-from-sleep, server keep-alive miss); blocking input
+// on that state made the chat feel broken — users would start
+// typing, see "Reconnecting…" appear under the textarea, and lose
+// the cursor mid-word until the stream re-opened. Now: typing is
+// always allowed; if `submit()` fires while the stream is still
+// re-opening, the message goes into the local queue and replays
+// the moment the runtime accepts the next prompt (same path as
+// "send while pi is mid-turn"). The only state that legitimately
+// blocks input is a HARD error surfaced as `lastErrorCode` — at
+// that point the SessionDisconnectedCard takes over the UI and
+// the composer below is unreachable anyway, so this is more of a
+// defensive guard than a UX gate.
+const inputDisabled = computed(() => !!lastErrorCode.value);
 </script>
 
 <template>

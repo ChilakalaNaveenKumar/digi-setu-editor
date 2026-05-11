@@ -666,6 +666,26 @@ export const useChatStore = defineStore("chat", () => {
     { flush: "post" },
   );
 
+  // Auto-flush: when the SSE transport flips back to `open` (after a
+  // reconnect blip) and the user enqueued something while it was
+  // down, fire the head. Without this, anything typed during a brief
+  // network hiccup would sit in the queue strip forever waiting for
+  // a "pi turn end" that never came (because no turn ever started).
+  // The isStreaming watcher above handles the "send while pi is
+  // busy" path; this one handles "send while transport is reconnecting".
+  watch(
+    connState,
+    (now, prev) => {
+      if (now !== "open" || prev === "open") return;
+      if (isStreaming.value) return;
+      if (queuedMessages.value.length === 0) return;
+      const [head, ...rest] = queuedMessages.value;
+      queuedMessages.value = rest;
+      _sendQueuedItem(head);
+    },
+    { flush: "post" },
+  );
+
   /** Reply to a permission_request — POST goes via the stream client. */
   function sendPermissionResponse(id: string, decision: PermissionDecision): void {
     if (!stream) return;
