@@ -78,10 +78,86 @@ from services.session_runtime import (
     SessionRuntime,
     session_runtime_registry,
 )
+from services.title_gen import generate_title
 from services.user_prefs import user_prefs
 
 
 router = APIRouter()
+
+
+# ── auto-titling ────────────────────────────────────────────────────
+#
+# Mirror of routes/chat_ws.py's title flow, ported to SSE: on the first
+# user prompt of a chat we set a heuristic title in the registry, fan
+# `_session_titled` out via the runtime's event ring so the active SPA
+# tab updates its picker without a full reload, then fire a background
+# task that asks the title-gen LLM for a polished version and CAS-
+# replaces the heuristic. Without this the picker shows "Untitled chat"
+# forever on SSE-only clients (the WS handler is the only place that
+# used to do this).
+
+
+def _title_heuristic(prompt: str) -> str:
+    """Same heuristic the WS handler uses. Lazy import to avoid cycles."""
+    from routes.chat_ws import _derive_title  # local import to avoid cycles
+    return _derive_title(prompt)
+
+
+async def _upgrade_title_via_llm(
+    rt: SessionRuntime,
+    prompt_text: str,
+    heuristic_title: str,
+) -> None:
+    """Background task: ask the title-gen LLM for a polished title and
+    CAS-swap it in place of the heuristic. Best-effort; never raises."""
+    try:
+        llm_title = await generate_title(prompt_text)
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"[sse {rt.session_id}] title_gen raised: {exc!r}",
+            file=sys.stderr,
+        )
+        return
+    if not llm_title:
+        return
+    reg = Registry.instance()
+    rec = reg.maybe_replace_heuristic_title(rt.session_id, heuristic_title, llm_title)
+    if not rec:
+        return
+    rt.broadcast_meta_event({
+        "type": "_session_titled",
+        "sessionId": rt.session_id,
+        "title": rec["title"],
+        "workspaceId": rec.get("workspace_id"),
+    })
+
+
+def _kick_title_flow(rt: SessionRuntime, msg: str) -> None:
+    """Place the heuristic title and schedule the LLM upgrade. Idempotent."""
+    if getattr(rt, "_title_kicked", False):
+        return
+    text = (msg or "").strip()
+    if not text:
+        return
+    heuristic = _title_heuristic(text)
+    if not heuristic:
+        return
+    reg = Registry.instance()
+    placed = reg.maybe_set_initial_title(rt.session_id, heuristic)
+    if not placed:
+        rt._title_kicked = True  # type: ignore[attr-defined]
+        return
+    rt._title_kicked = True  # type: ignore[attr-defined]
+    rt.broadcast_meta_event({
+        "type": "_session_titled",
+        "sessionId": rt.session_id,
+        "title": placed["title"],
+        "workspaceId": placed.get("workspace_id"),
+    })
+    asyncio.create_task(
+        _upgrade_title_via_llm(rt, text, placed["title"]),
+        name=f"title_gen[{rt.session_id}]",
+    )
 
 
 # ── helpers ─────────────────────────────────────────────────────────
@@ -310,6 +386,11 @@ async def post_prompt(
     # FIRST prompt, since pi stays alive between prompts).
     if rt._pi is None and not rl.try_take(user_id, "pi.spawn"):  # noqa: SLF001
         raise HTTPException(status_code=429, detail=bridge_error("rate_limit"))
+
+    # Auto-title the chat from the first user prompt. Idempotent across
+    # subsequent prompts in the same runtime — see `_kick_title_flow`
+    # for the guards.
+    _kick_title_flow(rt, body.message)
 
     try:
         request_id = await rt.send_prompt(body.message, request_id=body.request_id)

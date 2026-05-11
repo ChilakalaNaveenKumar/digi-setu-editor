@@ -2,60 +2,66 @@
 Shared path conventions and safety helpers for everything that touches a
 workspace's user-files directory.
 
-DESKTOP fork — workspace layout:
+A "workspace" looks like:
 
-    /the/folder/the/user/picked/    ← THIS IS the workspace.
-                                       The user's real files live here
-                                       directly. There is NO `workspace/`
-                                       subdir like the web sandbox uses
-                                       (that subdir was an artefact of
-                                       wrapping a ws_id-named sandbox
-                                       around the user's content; on
-                                       desktop we trust the user's pick
-                                       and treat the folder itself as
-                                       the working tree).
+    web/data/workspaces/<wsid>/        ← the agent's cwd
+      workspace/                       ← user files (the only thing the UI sees)
+      .pi/        → symlink            ← agent config (read by pi)
+      extensions/ → symlink            ← agent tools
+      guides/     → symlink            ← agent docs
+      AGENTS.md   → symlink            ← agent instructions
+      package.json → symlink           ← agent extension manifest
 
-All path-safety boundaries enforced here are anchored to the picked
-folder, so traversal attempts (`..`, absolute paths, symlink-out)
-still get rejected before any I/O happens — but they're rejected
-relative to the user's folder, not a synthetic subdir.
+The agent writes inside `workspace/`. All path-safety boundaries enforced
+here are anchored to `<workspace_path>/workspace/`, so traversal attempts
+(`..`, absolute paths, symlink-out) get rejected before any I/O happens.
 
-This module is dependency-free (stdlib only) so both the watcher and
-the file-ops helpers can import it without forming cycles.
+This module is dependency-free (stdlib only) so both the watcher and the
+file-ops helpers can import it without forming cycles.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-# Kept as an empty constant rather than removing it: a couple of legacy
-# call sites still reference WORKSPACE_SUBDIR (e.g. log lines, doc
-# strings). With the value blank, `Path(workspace_path) / "" == Path(workspace_path)`
-# so any code that does `Path(ws) / WORKSPACE_SUBDIR` ends up at the
-# same place `ws_root()` returns. Keep this empty until all references
-# are flushed; do NOT re-introduce a real subdir on desktop.
-WORKSPACE_SUBDIR = ""
+# Subdir the agent uses for its files (`AGENTS.md` tells it to write here).
+WORKSPACE_SUBDIR = "workspace"
 
 
 def ws_root(workspace_path: Path) -> Path:
-    """
-    Resolve the user-visible files root inside a workspace folder.
-
-    Desktop semantics: the picked folder IS the working tree. No
-    `workspace/` subdir is appended. The agent's cwd, the file watcher's
-    root, and the editor's file tree all observe this same path.
-    """
-    return Path(workspace_path)
+    """Resolve the user-visible files root inside a workspace folder."""
+    return Path(workspace_path) / WORKSPACE_SUBDIR
 
 
 # ── ignore lists ──────────────────────────────────────────────────────────
-_IGNORE_NAMES = {".DS_Store", ".git"}
+# `.DS_Store` / `.git` are the obvious noise. The remaining names
+# (AGENTS.md, package.json, extensions, guides, node_modules) are
+# the **agent-metadata symlinks** wired into the sandbox by
+# registry._wire_sandbox_symlinks so pi (running with cwd `/workspace`
+# = sandbox parent in docker mode, or workspace_path itself in
+# subprocess mode) can find them at its cwd. The watcher in
+# file_watcher.py also ignores them when scanning the sandbox parent
+# for stray writes — they're implementation detail, the user
+# shouldn't see them in the file tree mixed with their own files.
+# (`.pi/` is already covered by the leading-dot prefix rule.) If
+# a real user file happens to share one of these names, that's a
+# cost we accept.
+_IGNORE_NAMES = {
+    ".DS_Store",
+    ".git",
+    "AGENTS.md",
+    "package.json",
+    "extensions",
+    "guides",
+    "node_modules",
+}
 _IGNORE_PREFIXES = (".",)
 _IGNORE_SUFFIXES = (".swp", ".swo", "~")
 
 
 def should_ignore(rel_path: str) -> bool:
-    """True for OS junk and editor swap files we hide from the UI."""
+    """True for OS junk, editor swap files, and agent-metadata symlinks
+    we hide from the UI. See `_IGNORE_NAMES` for the full list."""
     parts = Path(rel_path).parts
     for p in parts:
         if p in _IGNORE_NAMES:

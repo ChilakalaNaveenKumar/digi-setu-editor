@@ -34,13 +34,34 @@ def ws_root(workspace_path: Path) -> Path:
 
 
 # ── ignore lists ──────────────────────────────────────────────────────────
-_IGNORE_NAMES = {".DS_Store", ".git"}
+# `.DS_Store` / `.git` are the obvious noise. The remaining names
+# (AGENTS.md, package.json, extensions, guides, node_modules) are
+# the **agent-metadata symlinks** wired into the sandbox by
+# registry._wire_sandbox_symlinks so pi (running with cwd `/workspace`
+# = sandbox parent in docker mode, or workspace_path itself in
+# subprocess mode) can find them at its cwd. The watcher in
+# file_watcher.py also ignores them when scanning the sandbox parent
+# for stray writes — they're implementation detail, the user
+# shouldn't see them in the file tree mixed with their own files.
+# (`.pi/` is already covered by the leading-dot prefix rule.) If
+# a real user file happens to share one of these names, that's a
+# cost we accept.
+_IGNORE_NAMES = {
+    ".DS_Store",
+    ".git",
+    "AGENTS.md",
+    "package.json",
+    "extensions",
+    "guides",
+    "node_modules",
+}
 _IGNORE_PREFIXES = (".",)
 _IGNORE_SUFFIXES = (".swp", ".swo", "~")
 
 
 def should_ignore(rel_path: str) -> bool:
-    """True for OS junk and editor swap files we hide from the UI."""
+    """True for OS junk, editor swap files, and agent-metadata symlinks
+    we hide from the UI. See `_IGNORE_NAMES` for the full list."""
     parts = Path(rel_path).parts
     for p in parts:
         if p in _IGNORE_NAMES:

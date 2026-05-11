@@ -70,19 +70,25 @@ _PROMPT_TRIM_CHARS = 1500
 _TITLE_MAX_CHARS = 50
 
 _SYSTEM = (
-    "Title the user's chat in 3–6 words, Title Case, ≤50 chars. "
+    "You title chat sessions for a Typst document editor. "
+    "Always output a 2–6 word Title Case label (≤50 chars), even for "
+    "tiny, vague, or nonsense input — pick the most sensible label "
+    "you can. Examples: "
+    "'hi' → 'Quick Greeting'; "
+    "'test' → 'Test Chat'; "
+    "'jhabhjab' → 'Random Input'; "
+    "'fix bug' → 'Bug Fix Help'; "
+    "'help me write a resume' → 'Resume Drafting Help'. "
     "Describe the topic or intent — never the act of asking. "
-    "Always produce a title for any topical message, even vague ones "
-    "(use a generic label like 'Open-Ended Build' or 'Bug Fix Help'). "
     "Output the title only — no quotes, punctuation, or preamble. "
-    "Reply NO_TITLE only for pure greetings like 'hi' or 'hey'."
+    "Never reply NO_TITLE; always produce a title."
 )
 
-# Minimum prompt length to bother calling Haiku at all. Anything
-# shorter is almost certainly a greeting or a typo and the heuristic
-# title ("Hi", "Test", etc.) is just as informative as anything an LLM
-# would invent.
-_MIN_PROMPT_CHARS = 12
+# No length gate and no NO_TITLE escape hatch. Every non-empty prompt
+# gets routed to Haiku — the cost of one tiny call is negligible
+# compared to the UX damage of leaving a typo, "hi", or one-word stub
+# as the chat title forever. Haiku is instructed to label even
+# nonsense input ("jhabhjab" → "Random Input").
 
 
 # ── Vertex access token cache ────────────────────────────────────────────
@@ -184,18 +190,103 @@ def _clean_title(raw: str) -> Optional[str]:
 async def generate_title(prompt: str) -> Optional[str]:
     """Return an LLM-generated title for `prompt`, or None on any failure.
 
+    Routing
+    -------
+    The actual HTTP call has TWO flavours, picked by ``PI_MODE``:
+
+      * ``PI_MODE=desktop`` — POST to the local ``/llm-proxy/vertex``
+        endpoint. ``routes.llm_proxy`` injects the cached Clerk JWT,
+        forwards to ``${PI_RELAY_HTTP_BASE}/v1/relay/vertex/...``, and
+        the cloud relay swaps in ADC before talking to Vertex. Same
+        codepath pi itself uses for chat. No gcloud / ADC required on
+        the laptop — the user's machine never sees a Google bearer.
+
+      * ``PI_MODE=web`` (or unset) — POST directly to
+        ``aiplatform.googleapis.com`` with a gcloud-ADC bearer. This
+        is the original path used by the web VM, where ADC is
+        available out of the box.
+
     Never raises. Callers can `await asyncio.create_task(generate_title(p))`
     safely.
     """
     text = (prompt or "").strip()
-    if len(text) < _MIN_PROMPT_CHARS:
-        # Too thin to title meaningfully. The heuristic title for a
-        # short prompt is itself just the trimmed prompt, which is
-        # already as good as it gets — don't burn an LLM call.
+    if not text:
         return None
     if len(text) > _PROMPT_TRIM_CHARS:
         text = text[:_PROMPT_TRIM_CHARS]
 
+    body = {
+        "anthropic_version": "vertex-2023-10-16",
+        "max_tokens": _TITLE_MAX_TOKENS,
+        "system": _SYSTEM,
+        "messages": [{"role": "user", "content": text}],
+    }
+
+    deploy_mode = (os.environ.get("PI_MODE", "web") or "web").strip().lower()
+    if deploy_mode == "desktop":
+        return await _generate_via_cloud_relay(body)
+    return await _generate_via_direct_vertex(body)
+
+
+async def _generate_via_cloud_relay(body: dict) -> Optional[str]:
+    """Desktop path: POST through the localhost JWT-injecting proxy.
+
+    The proxy adds ``Authorization: Bearer <Clerk JWT>`` and forwards
+    to the cloud relay, which validates the user, swaps in ADC, and
+    talks to Vertex. The project id is a placeholder — the cloud
+    relay rewrites it server-side (see ``services/relay_spawn.py`` for
+    the matching ``relay-managed`` placeholder pi uses).
+    """
+    try:
+        # Lazy import — config.local_proxy_base() raises if PORT isn't
+        # set yet (which happens when this module is imported during
+        # pytest collection, before the sidecar boots). We don't want
+        # the bare import to fail.
+        from config import local_proxy_base
+        proxy_base = local_proxy_base()
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"[title_gen] cloud-relay base unavailable ({exc}); "
+            "skipping LLM title (heuristic stays)",
+            file=sys.stderr,
+        )
+        return None
+
+    url = (
+        f"{proxy_base}/vertex/v1/projects/relay-managed/locations/global"
+        f"/publishers/anthropic/models/{_TITLE_MODEL}:rawPredict"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=_TITLE_TIMEOUT_S) as client:
+            resp = await client.post(
+                url,
+                json=body,
+                headers={"Content-Type": "application/json"},
+            )
+    except httpx.TimeoutException:
+        print(
+            f"[title_gen] cloud-relay timeout after {_TITLE_TIMEOUT_S}s; "
+            "heuristic stays",
+            file=sys.stderr,
+        )
+        return None
+    except Exception as exc:  # noqa: BLE001
+        print(f"[title_gen] cloud-relay request failed: {exc}", file=sys.stderr)
+        return None
+
+    if resp.status_code != 200:
+        body_preview = resp.text[:200].replace("\n", " ")
+        print(
+            f"[title_gen] cloud-relay http {resp.status_code}: {body_preview}",
+            file=sys.stderr,
+        )
+        return None
+
+    return _parse_anthropic_response(resp)
+
+
+async def _generate_via_direct_vertex(body: dict) -> Optional[str]:
+    """Web/VM path: direct Vertex call with gcloud-ADC bearer."""
     project = os.environ.get("GOOGLE_CLOUD_PROJECT")
     if not project:
         # The chat path also sources env.sh into the pi subprocess env,
@@ -221,12 +312,6 @@ async def generate_title(prompt: str) -> Optional[str]:
         f"https://{host}/v1/projects/{project}/locations/{_TITLE_REGION}"
         f"/publishers/anthropic/models/{_TITLE_MODEL}:rawPredict"
     )
-    body = {
-        "anthropic_version": "vertex-2023-10-16",
-        "max_tokens": _TITLE_MAX_TOKENS,
-        "system": _SYSTEM,
-        "messages": [{"role": "user", "content": text}],
-    }
 
     try:
         async with httpx.AsyncClient(timeout=_TITLE_TIMEOUT_S) as client:
@@ -246,7 +331,7 @@ async def generate_title(prompt: str) -> Optional[str]:
             file=sys.stderr,
         )
         return None
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         print(f"[title_gen] vertex request failed: {exc}", file=sys.stderr)
         return None
 
@@ -255,7 +340,6 @@ async def generate_title(prompt: str) -> Optional[str]:
         # forces a fresh gcloud fetch.
         if resp.status_code == 401:
             _token_cache.clear()
-        # 200-char preview is enough to debug without polluting the log.
         body_preview = resp.text[:200].replace("\n", " ")
         print(
             f"[title_gen] vertex http {resp.status_code}: {body_preview}",
@@ -263,10 +347,17 @@ async def generate_title(prompt: str) -> Optional[str]:
         )
         return None
 
+    return _parse_anthropic_response(resp)
+
+
+def _parse_anthropic_response(resp: httpx.Response) -> Optional[str]:
+    """Extract a clean title string from a Vertex Anthropic Messages response.
+
+    Shared by both the cloud-relay and direct-Vertex flavours — the
+    relay is a transparent passthrough, so the wire shape is identical.
+    """
     try:
         data = resp.json()
-        # Anthropic Messages format: content is a list of blocks; we want
-        # the concatenated text from the first text block.
         for block in data.get("content", []):
             if block.get("type") == "text":
                 cleaned = _clean_title(block.get("text", ""))
@@ -277,7 +368,11 @@ async def generate_title(prompt: str) -> Optional[str]:
                 if cleaned and cleaned.upper().replace(" ", "_") == "NO_TITLE":
                     return None
                 return cleaned
-    except Exception as exc:
-        print(f"[title_gen] failed to parse vertex response: {exc}", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"[title_gen] failed to parse Anthropic response: {exc}",
+            file=sys.stderr,
+        )
         return None
+    return None
     return None

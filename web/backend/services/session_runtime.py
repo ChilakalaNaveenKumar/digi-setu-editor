@@ -115,6 +115,7 @@ class SessionRuntime:
         permission_mode: str,
         permission_mode_file: Optional[Path],
         workspace_id: str,
+        use_cloud_relay: bool = False,
     ) -> None:
         self.session_id = session_id
         self.user_id = user_id
@@ -125,6 +126,14 @@ class SessionRuntime:
         self.permission_mode = permission_mode
         self.permission_mode_file = permission_mode_file
         self.workspace_id = workspace_id
+        # Cloud-relay routing is decided by the caller (chat_sse /
+        # chat_ws) via services/relay_spawn.decide_spawn_route. We
+        # carry the resolved bit here so the lazy ensure_started()
+        # hands it to PiSession at spawn time. Defaulting to False
+        # keeps the WS path's existing behaviour (it sets the flag
+        # directly when constructing PiSession; this attribute is
+        # only consulted by the SSE path's ensure_started).
+        self.use_cloud_relay = use_cloud_relay
 
         self._pi: Optional[PiSession] = None
         self._pi_task: Optional[asyncio.Task[None]] = None
@@ -206,15 +215,23 @@ class SessionRuntime:
         if self._closed:
             return
         if self._fs_watcher is None:
+            acquired_watcher = None
             try:
-                self._fs_watcher = await WatcherRegistry.instance().acquire(
+                acquired_watcher = await WatcherRegistry.instance().acquire(
                     self.workspace_path,
                 )
-                self._fs_queue = self._fs_watcher.subscribe()
+                self._fs_queue = acquired_watcher.subscribe()
                 self._fs_task = asyncio.create_task(
                     self._pump_fs_events(),
                     name=f"fs-pump-{self.session_id}",
                 )
+                # Only assign self._fs_watcher AFTER all the steps that
+                # could fail have succeeded, so the close() path's
+                # release-on-set-watcher contract holds. If we assigned
+                # earlier and create_task threw, close() would still
+                # release — but the error path below would then double-
+                # release and silently underflow the refcount.
+                self._fs_watcher = acquired_watcher
             except Exception as exc:  # noqa: BLE001
                 log_error(
                     "internal",
@@ -223,8 +240,32 @@ class SessionRuntime:
                     exc=exc,
                     where="session_runtime.fs_subscribe",
                 )
+                # Roll back partial setup. The acquire bumped the
+                # refcount; if we don't release here, the observer
+                # thread leaks until the SessionRuntime reaper kicks
+                # in 10 minutes later (or never, if the runtime is
+                # immediately re-used).
+                if acquired_watcher is not None:
+                    if self._fs_queue is not None:
+                        try:
+                            acquired_watcher.unsubscribe(self._fs_queue)
+                        except Exception:  # noqa: BLE001
+                            pass
+                    try:
+                        await WatcherRegistry.instance().release(
+                            self.workspace_path,
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
                 self._fs_watcher = None
                 self._fs_queue = None
+                if self._fs_task is not None:
+                    self._fs_task.cancel()
+                    try:
+                        await self._fs_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    self._fs_task = None
 
         if self._bg_registry is None:
             try:
@@ -272,6 +313,7 @@ class SessionRuntime:
                 permission_mode=self.permission_mode,
                 permission_mode_file=self.permission_mode_file,
                 user_id=self.user_id,
+                use_cloud_relay=self.use_cloud_relay,
             )
             try:
                 await self._pi.start()
@@ -598,6 +640,21 @@ class SessionRuntime:
     def _touch(self) -> None:
         self._last_active = time.monotonic()
 
+    def broadcast_meta_event(self, evt: dict[str, Any]) -> None:
+        """Inject a non-pi event into the ring so all stream consumers
+        see it.
+
+        Used by sidecar-side actions that aren't pi-emitted but still
+        need to reach the SPA over the same SSE channel — e.g.
+        ``_session_titled`` from the background title-gen task.
+
+        Public (vs. ``_enqueue``) so route handlers don't have to reach
+        into private state. No-op once the runtime is closed.
+        """
+        if self._closed:
+            return
+        self._enqueue(evt)
+
     # Reaper introspection — public so the registry's reaper can call.
     def is_idle(self, now: float) -> bool:
         if self._in_flight:
@@ -651,6 +708,7 @@ class SessionRuntimeRegistry:
         permission_mode: str,
         permission_mode_file: Optional[Path],
         workspace_id: str,
+        use_cloud_relay: bool = False,
     ) -> SessionRuntime:
         """Return the existing runtime for this session, or build a fresh one.
 
@@ -672,6 +730,7 @@ class SessionRuntimeRegistry:
                 permission_mode=permission_mode,
                 permission_mode_file=permission_mode_file,
                 workspace_id=workspace_id,
+                use_cloud_relay=use_cloud_relay,
             )
             self._runtimes[session_id] = rt
             return rt

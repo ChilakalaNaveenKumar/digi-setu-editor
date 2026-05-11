@@ -63,6 +63,7 @@ real Vertex bearer.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Optional
 
 from config import local_proxy_base
@@ -179,3 +180,89 @@ def cloud_relay_subprocess_env(spec: ModelSpec, env: dict[str, str]) -> dict[str
     out.setdefault("CLOUD_ML_REGION", out["GOOGLE_CLOUD_LOCATION"])
 
     return out
+
+
+# ── unified spawn-route decision ────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class SpawnRoute:
+    """How a freshly-resolved (user, model) should reach an LLM.
+
+    The route is purely an upfront decision — once the caller acts on
+    it, the heavy lifting (env scrubbing, base-URL injection) lives in
+    :func:`cloud_relay_subprocess_env` / :func:`services.byok.byok_subprocess_env`.
+
+    Fields
+    ------
+    kind:
+        ``"local_byok"`` — pi spawns locally with the user's own
+        provider keys (cheapest path; preferred when BYOK_MODE is on
+        AND the model has a BYOK route).
+
+        ``"local_relay"`` — pi spawns locally but the SDK base URL is
+        rewritten to our localhost proxy. Default for signed-in
+        non-BYOK users on Vertex models.
+
+        ``"ws_relay"`` — pi runs on the cloud VM; the local sidecar
+        proxies the chat over a WebSocket relay. Used only for models
+        whose provider has no relay route (none today). The SSE path
+        cannot service this — it returns ``setup_required`` instead.
+
+        ``"setup_required"`` — user is not signed in and the model has
+        no BYOK route. Caller must surface a sign-in / upgrade prompt.
+
+    use_cloud_relay:
+        Convenience flag passed straight to ``PiSession`` — true only
+        for ``local_relay``.
+    """
+
+    kind: str
+    use_cloud_relay: bool
+
+
+def decide_spawn_route(
+    *,
+    spec: Optional[ModelSpec],
+    byok_mode: bool,
+    signed_in: bool,
+) -> SpawnRoute:
+    """Pick the spawn flavour for ``(user, model)``.
+
+    Centralises the dispatch matrix so the WS handler, the SSE handler,
+    and any future transport (a TUI? a test fixture?) all agree on
+    where the LLM call goes. The matrix mirrors the inline comment
+    block in ``routes/chat_ws.py`` (search for "Dispatch: local pi vs
+    cloud relay vs sign-in modal") — keep this docstring in sync if
+    that ordering ever changes.
+
+    Priority (first match wins):
+      1. BYOK_MODE + has_byok_route(spec)        → local_byok
+      2. signed_in + has cloud_relay_provider    → local_relay
+      3. signed_in + no cloud_relay_provider     → ws_relay
+      4. otherwise                               → setup_required
+    """
+    if spec is None:
+        # Defensive: an unknown model id can't be routed anywhere
+        # safely. Treat as setup_required so the SPA prompts the user
+        # to pick a different model.
+        return SpawnRoute(kind="setup_required", use_cloud_relay=False)
+
+    # Priority 1 — BYOK if possible.
+    if byok_mode:
+        # Local import: services/byok.py imports from this module
+        # transitively in some test paths; lazy-import keeps the
+        # module-load order safe.
+        from services.byok import byok_provider_for as _byok_pf  # noqa: E402
+
+        if _byok_pf(spec) is not None:
+            return SpawnRoute(kind="local_byok", use_cloud_relay=False)
+
+    # Priorities 2/3/4 — gated on auth.
+    if not signed_in:
+        return SpawnRoute(kind="setup_required", use_cloud_relay=False)
+
+    if cloud_relay_provider_for(spec) is not None:
+        return SpawnRoute(kind="local_relay", use_cloud_relay=True)
+
+    return SpawnRoute(kind="ws_relay", use_cloud_relay=False)

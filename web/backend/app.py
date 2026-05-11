@@ -125,6 +125,17 @@ async def _lifespan(app: FastAPI):
     from services.session_runtime import session_runtime_registry as _srr
     await _srr().start_reaper()
 
+    # Boot the file-watcher reaper. Belt-and-braces over the
+    # session-runtime reaper above: if a SessionRuntime crash
+    # path forgets to release its watcher reference, the watcher
+    # reaper sweeps unreferenced WorkspaceWatchers within
+    # REAPER_GRACE_SECS so the inotify watch + observer thread
+    # don't outlive the session that owned them. Also gives a
+    # short grace window so a tab refresh doesn't tear down the
+    # observer for the same workspace it's about to re-acquire.
+    from services.file_watcher import WatcherRegistry as _WR
+    await _WR.instance().start_reaper()
+
     # ── Pre-warm the Gemini explicit context cache for search_docs ──
     # Per-package caches expire on a 24 h TTL; doing this in the
     # background here means the FIRST real user request finds them
@@ -147,6 +158,12 @@ async def _lifespan(app: FastAPI):
         except Exception as exc:  # noqa: BLE001
             import sys as _sys
             print(f"[lifespan] reaper stop failed: {exc}", file=_sys.stderr)
+        try:
+            from services.file_watcher import WatcherRegistry as _WR
+            await _WR.instance().stop_reaper()
+        except Exception as exc:  # noqa: BLE001
+            import sys as _sys
+            print(f"[lifespan] fswatcher reaper stop failed: {exc}", file=_sys.stderr)
 
 
 async def _prewarm_typst_cache() -> None:

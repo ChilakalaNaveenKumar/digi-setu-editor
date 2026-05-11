@@ -78,10 +78,111 @@ from services.session_runtime import (
     SessionRuntime,
     session_runtime_registry,
 )
+from services.title_gen import generate_title
 from services.user_prefs import user_prefs
 
 
 router = APIRouter()
+
+
+# Re-use the WS handler's title heuristic so the picker shows the SAME
+# initial title regardless of which transport the client is on. Single
+# source of truth lives in routes/chat_ws.py — importing into the SSE
+# module would create a cycle if chat_ws ever imports back, so we pull
+# the function out via a local import inside the helper. Cheap once
+# (Python caches the module).
+def _title_heuristic(prompt: str) -> str:
+    from routes.chat_ws import _derive_title  # local import to avoid cycles
+    return _derive_title(prompt)
+
+
+async def _upgrade_title_via_llm(
+    rt: SessionRuntime,
+    prompt_text: str,
+    heuristic_title: str,
+) -> None:
+    """Background task: ask the title-gen LLM for a polished title and
+    CAS-swap it in place of the heuristic.
+
+    Mirrors ``routes.chat_ws._upgrade_title_via_llm`` minus the WS-
+    specific ``ws.send_json`` hop. We push the resulting envelope into
+    the runtime's event ring instead, so all attached SSE consumers
+    pick it up the same way they pick up agent events.
+
+    Never raises — title generation is best-effort. The heuristic title
+    stays in place on any failure.
+    """
+    try:
+        llm_title = await generate_title(prompt_text)
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"[sse {rt.session_id}] title_gen raised: {exc!r}",
+            file=sys.stderr,
+        )
+        return
+    if not llm_title:
+        return
+    reg = Registry.instance()
+    rec = reg.maybe_replace_heuristic_title(rt.session_id, heuristic_title, llm_title)
+    if not rec:
+        # User renamed the chat (or another tab raced us) before the
+        # LLM responded — keep their version.
+        return
+    rt.broadcast_meta_event({
+        "type": "_session_titled",
+        "sessionId": rt.session_id,
+        "title": rec["title"],
+        "workspaceId": rec.get("workspace_id"),
+    })
+
+
+def _kick_title_flow(rt: SessionRuntime, msg: str) -> None:
+    """Place the heuristic title and schedule the LLM upgrade.
+
+    No-op if ``msg`` is blank, the registry already has a title, or
+    we've already kicked off the LLM upgrade for this runtime. Idempotent
+    across multiple prompts in the same chat — we only auto-title from
+    the FIRST user message.
+
+    Side effects:
+      * Persists the heuristic to the registry (visible to /sessions
+        listing immediately).
+      * Broadcasts ``_session_titled`` with the heuristic so the active
+        SPA tab updates its picker without waiting for the LLM round-trip.
+      * Schedules the background LLM upgrade.
+    """
+    if getattr(rt, "_title_kicked", False):
+        return
+    text = (msg or "").strip()
+    if not text:
+        return
+    heuristic = _title_heuristic(text)
+    if not heuristic:
+        return
+    reg = Registry.instance()
+    placed = reg.maybe_set_initial_title(rt.session_id, heuristic)
+    if not placed:
+        # User already named the chat from the picker — leave it alone
+        # AND don't fire the LLM upgrade (we'd just race their title).
+        rt._title_kicked = True  # type: ignore[attr-defined]
+        return
+    rt._title_kicked = True  # type: ignore[attr-defined]
+    rt.broadcast_meta_event({
+        "type": "_session_titled",
+        "sessionId": rt.session_id,
+        "title": placed["title"],
+        "workspaceId": placed.get("workspace_id"),
+    })
+    # Fire-and-forget the LLM upgrade. We deliberately don't keep a
+    # handle — the background task survives the request lifecycle and
+    # broadcasts via the runtime's ring (no per-request WebSocket to
+    # close on us). If the runtime is reaped before the LLM responds
+    # the broadcast is a silent no-op (broadcast_meta_event guards on
+    # `_closed`).
+    asyncio.create_task(
+        _upgrade_title_via_llm(rt, text, placed["title"]),
+        name=f"title_gen[{rt.session_id}]",
+    )
 
 
 # ── helpers ─────────────────────────────────────────────────────────
@@ -178,9 +279,11 @@ async def _resolve_runtime(
 
     # Decide which model to use — same logic the old WS handler had
     # (pinned model on session, else workspace default, else cheapest
-    # for plan).
-    from services.billing import CreditLedger  # local to avoid cycles
-    plan_id = CreditLedger.instance().get_plan_id(user_id)
+    # for plan). Desktop has no local CreditLedger (Stripe/credit
+    # state lives in the cloud); we use the cloud-cached plan id
+    # exactly like routes/chat_ws.py does.
+    from services.plan_cache import get_plan_id as _get_plan_id  # local to avoid cycles
+    plan_id = _get_plan_id(user_id)
     pinned_model = (sess_rec.get("model") or "").strip()
     workspace_default = (
         user_prefs().get_workspace_model(user_id, sess_rec["workspace_id"]) or ""
@@ -215,21 +318,65 @@ async def _resolve_runtime(
                     active_model_spec.pi_provider if active_model_spec else None
                 )
 
-    # BYOK gate — if no key path exists for the model, refuse.
-    if BYOK_MODE and active_model_spec is not None:
-        from services.byok import byok_provider_for as _byok_pf  # noqa: E402
-        if _byok_pf(active_model_spec) is None:
-            log_error(
-                "setup_required",
-                session_id=session_id,
-                user_id=user_id,
-                where="sse_byok_gate",
-                model=active_model_id,
-            )
-            raise HTTPException(
-                status_code=402,
-                detail={**bridge_error("setup_required"), "code": "upgrade_required"},
-            )
+    # ── Spawn-route decision ──────────────────────────────────────
+    # Decide where the LLM call goes BEFORE we acquire a runtime, so
+    # the runtime is constructed with the right `use_cloud_relay` bit
+    # from the start. The matrix is shared with the WS handler via
+    # services/relay_spawn.decide_spawn_route — keep both call sites
+    # using the helper so a future routing change lands in one place.
+    #
+    # Why surface a hard error on ws_relay / setup_required instead of
+    # silently spawning pi: pi without credentials returns a single
+    # `{"type":"response","success":false,"error":"No API key..."}`
+    # envelope that the SPA dispatcher discards (it's a command-ack,
+    # not an agent turn). The user then sees a chat that "looks fine"
+    # but produces no AI response — exactly the bug we're fixing here.
+    # Fail loudly at /prompt time so the UI can show a sign-in /
+    # upgrade card.
+    from routes.desktop_auth import get_cached_desktop_session  # noqa: E402
+    from services.relay_spawn import decide_spawn_route  # noqa: E402
+
+    cached_session = get_cached_desktop_session()
+    route = decide_spawn_route(
+        spec=active_model_spec,
+        byok_mode=BYOK_MODE,
+        signed_in=cached_session is not None,
+    )
+
+    if route.kind == "setup_required":
+        log_error(
+            "setup_required",
+            session_id=session_id,
+            user_id=user_id,
+            where="sse_route_setup_required",
+            model=active_model_id,
+            byok_mode=BYOK_MODE,
+        )
+        raise HTTPException(
+            status_code=402 if BYOK_MODE else 401,
+            detail={**bridge_error("setup_required"), "code": "upgrade_required"},
+        )
+
+    if route.kind == "ws_relay":
+        # The SSE transport can't service the legacy WS-relay branch
+        # (which requires a bidirectional pi-on-VM channel). Today no
+        # production model lands here — keep the explicit error so a
+        # future model that does immediately surfaces instead of
+        # silently failing. If/when a model needs ws_relay we'll add
+        # an SSE-compatible cloud spawn (likely the same /v1/relay
+        # endpoint pi already uses for vertex passthrough, just for
+        # the new provider).
+        log_error(
+            "setup_required",
+            session_id=session_id,
+            user_id=user_id,
+            where="sse_route_ws_relay_unsupported",
+            model=active_model_id,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={**bridge_error("setup_required"), "code": "upgrade_required"},
+        )
 
     permission_mode = user_prefs().get_permission_mode(user_id, plan_id=plan_id)
     permission_mode_file = user_prefs().ensure_live_file(user_id, permission_mode)
@@ -246,6 +393,7 @@ async def _resolve_runtime(
         permission_mode=permission_mode,
         permission_mode_file=permission_mode_file,
         workspace_id=sess_rec["workspace_id"],
+        use_cloud_relay=route.use_cloud_relay,
     )
 
     reg.touch_session(session_id)
@@ -268,48 +416,27 @@ async def post_prompt(
 
     rl = RateLimiter.instance()
 
-    # Burst cap + per-user concurrent-chat cap (the latter pegs to
-    # this runtime's lifetime — released by the reaper, not by the
-    # request).
+    # Burst cap. Desktop has no per-user concurrent-chat cap (single-
+    # user app — `acquire_chat_slot` exists only in the multi-tenant
+    # web RateLimiter). The cloud relay still rate-limits per Clerk
+    # user id at its layer, so a runaway client can't burn through
+    # the org quota by spinning chats locally.
     if not rl.try_take(user_id, "ws.connect"):
         raise HTTPException(status_code=429, detail=bridge_error("rate_limit"))
-
-    # Chat-slot budget: only count this runtime once. The slot is
-    # released when the runtime is closed (see _release_slot below).
-    # We use a sentinel attribute on the runtime to track "this
-    # runtime owns a slot for user X".
-    if not getattr(rt, "_chat_slot_held", False):
-        granted, current, cap = rl.acquire_chat_slot(user_id)
-        if not granted:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    **bridge_error("too_many_chats"),
-                    "current": current,
-                    "cap": cap,
-                },
-            )
-        # Mark the runtime so we know to release on close.
-        rt._chat_slot_held = True  # type: ignore[attr-defined]
-
-        # Patch close() to release the slot.
-        original_close = rt.close
-
-        async def close_and_release() -> None:
-            try:
-                await original_close()
-            finally:
-                if getattr(rt, "_chat_slot_held", False):
-                    RateLimiter.instance().release_chat_slot(user_id)
-                    rt._chat_slot_held = False  # type: ignore[attr-defined]
-
-        rt.close = close_and_release  # type: ignore[method-assign]
 
     # Pi spawn rate-limit (separate bucket so a spammy reconnecter
     # can't burn the spawn budget — but here it only triggers on
     # FIRST prompt, since pi stays alive between prompts).
     if rt._pi is None and not rl.try_take(user_id, "pi.spawn"):  # noqa: SLF001
         raise HTTPException(status_code=429, detail=bridge_error("rate_limit"))
+
+    # Auto-title the chat from the first user prompt. Idempotent across
+    # subsequent prompts in the same runtime — see `_kick_title_flow`
+    # for the matrix. Runs BEFORE send_prompt so the heuristic title
+    # is in the registry the moment the prompt round-trips, and so the
+    # `_session_titled` envelope is queued before any agent_start
+    # event from pi (UI stores can rely on the order).
+    _kick_title_flow(rt, body.message)
 
     try:
         request_id = await rt.send_prompt(body.message, request_id=body.request_id)

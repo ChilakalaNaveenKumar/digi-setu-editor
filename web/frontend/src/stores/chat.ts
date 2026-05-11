@@ -269,36 +269,77 @@ export const useChatStore = defineStore("chat", () => {
     // If we're already connected to this exact session, no-op.
     if (session.value?.id === sessionId && stream && stream.isOpen) return;
 
-    // Same-session refresh OR session swap — drop everything cleanly.
-    disconnect();
+    const workspace = useWorkspaceStore();
+    const files = useFilesStore();
+    const terminals = useTerminalsStore();
 
-    router = createRouterState();
-    messages.value = [];
-    session.value = { id: sessionId };
+    // A "tab switch" inside the same workspace is the common case. We
+    // do NOT call `disconnect()` (which blanks file tree, terminals,
+    // workspace.setActive(null), the message list, …) — that's what
+    // made tab switching feel like a full app refresh. Instead we
+    // surgically tear down ONLY what's session-scoped: the SSE stream
+    // and the per-session pending state. File tree and terminal panes
+    // belong to the workspace and stay put.
+    const sameWorkspace = workspace.activeId === wsid;
+
+    if (stream) {
+      stream.close();
+      stream = null;
+    }
+
+    // Per-session resets (always — these are bound to a single chat).
     isStreaming.value = false;
     _setError(null);
     _resetDisplayTotals();
     queuedMessages.value = [];
     pendingAttachments.value = [];
+    usePermissionsStore().clear();
 
-    const workspace = useWorkspaceStore();
-    const files = useFilesStore();
-    const terminals = useTerminalsStore();
-
+    // Workspace-scoped resets (only when actually moving workspaces).
     workspace.setActive(wsid);
-    files.resetForNewSession();
-    terminals.resetForNewSession();
+    if (!sameWorkspace) {
+      files.resetForNewSession();
+      terminals.resetForNewSession();
+      void files.refreshTree();
+    } else {
+      // Same workspace, different chat — terminals are per-chat so we
+      // do reset them, but the file tree stays as-is (it shows the
+      // workspace, not the chat). Background terminal output for the
+      // new chat will replay from the SSE ring on connect.
+      terminals.resetForNewSession();
+    }
 
-    void files.refreshTree();
+    // Mark the session as switching but keep the OLD messages on
+    // screen until the new history is fetched. We swap atomically
+    // below — that's what removes the "blank flash" between tabs.
+    session.value = { id: sessionId };
 
+    let nextRouter = createRouterState();
+    let nextMessages: ChatMessage[] = [];
     try {
       const { messages: hist } = await fetchSessionHistory(sessionId);
-      if (hist?.length) _hydrateHistory(hist);
+      if (hist?.length) {
+        const restored = hist.map((m) => reactive(m) as ChatMessage);
+        nextRouter.messages = restored;
+        for (const m of restored) {
+          if (m.kind !== "assistant") continue;
+          (m as AssistantMessage).done = true;
+          for (const tc of m.toolCalls) {
+            nextRouter.toolCallIndex.set(tc.id, tc as ToolCall);
+          }
+        }
+        nextMessages = restored;
+      }
     } catch (err) {
       console.warn("[chat] history fetch failed; starting empty", err);
     }
 
     if (session.value?.id !== sessionId) return;
+
+    // Atomic swap: replace router state + visible messages in a
+    // single tick so Vue paints exactly one new frame.
+    router = nextRouter;
+    messages.value = nextMessages.slice();
 
     const newStream = new ChatStream({
       sessionId,
@@ -323,24 +364,6 @@ export const useChatStore = defineStore("chat", () => {
     });
     stream = newStream;
     newStream.open();
-  }
-
-  /**
-   * Replay a server-projected ChatMessage[] into router state so the
-   * UI paints prior turns. Each entry is wrapped in `reactive()` so
-   * Vue tracks any post-load mutation.
-   */
-  function _hydrateHistory(hist: ChatMessage[]): void {
-    const restored = hist.map((m) => reactive(m) as ChatMessage);
-    router.messages = restored;
-    for (const m of restored) {
-      if (m.kind !== "assistant") continue;
-      for (const tc of m.toolCalls) router.toolCallIndex.set(tc.id, tc as ToolCall);
-    }
-    for (const m of restored) {
-      if (m.kind === "assistant") (m as AssistantMessage).done = true;
-    }
-    messages.value = restored.slice();
   }
 
   function disconnect(): void {

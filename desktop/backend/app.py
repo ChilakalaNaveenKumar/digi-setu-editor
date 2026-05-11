@@ -135,6 +135,14 @@ async def _lifespan(app: FastAPI):
     from services.session_runtime import session_runtime_registry as _srr
     await _srr().start_reaper()
 
+    # File-watcher reaper — see web/backend/app.py for full
+    # rationale. Sweeps unreferenced WorkspaceWatchers within
+    # REAPER_GRACE_SECS so observer threads + inotify watches
+    # don't outlive the SessionRuntime that owned them on any
+    # crash path that bypasses the explicit release.
+    from services.file_watcher import WatcherRegistry as _WR
+    await _WR.instance().start_reaper()
+
     try:
         yield
     finally:
@@ -148,6 +156,12 @@ async def _lifespan(app: FastAPI):
         except Exception as exc:  # noqa: BLE001
             import sys as _sys
             print(f"[lifespan] reaper stop failed: {exc}", file=_sys.stderr)
+        try:
+            from services.file_watcher import WatcherRegistry as _WR
+            await _WR.instance().stop_reaper()
+        except Exception as exc:  # noqa: BLE001
+            import sys as _sys
+            print(f"[lifespan] fswatcher reaper stop failed: {exc}", file=_sys.stderr)
 
 
 def create_app() -> FastAPI:

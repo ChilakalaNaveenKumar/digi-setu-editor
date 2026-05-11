@@ -515,9 +515,11 @@ function killBg(): void {
             </span>
           </div>
 
-          <!-- Command (full, wraps, never truncated) -->
+          <!-- Command (full, wraps; capped at ~10 lines so a long heredoc
+               stays scrollable instead of pushing the output region off
+               screen). -->
           <pre
-            class="border-b border-border/60 bg-editor px-3 py-2 font-mono text-[11.5px] leading-[1.55] text-foreground/95 whitespace-pre-wrap break-words"
+            class="max-h-40 overflow-auto border-b border-border/60 bg-editor px-3 py-2 font-mono text-[11.5px] leading-[1.55] text-foreground/95 whitespace-pre-wrap break-words"
           ><span class="select-none text-muted-foreground">$ </span>{{ selectedCommand || "(streaming command…)" }}</pre>
 
           <!-- Truncation banner -->
@@ -608,9 +610,11 @@ function killBg(): void {
             >pid {{ selectedBg.process.pid }}</span>
           </div>
 
-          <!-- Command -->
+          <!-- Command (cap at ~10 lines like the bash variant — a
+               heredoc-style spawn command can otherwise push the live
+               output region off screen). -->
           <pre
-            class="border-b border-border/60 bg-editor px-3 py-2 font-mono text-[11.5px] leading-[1.55] text-foreground/95 whitespace-pre-wrap break-words"
+            class="max-h-40 overflow-auto border-b border-border/60 bg-editor px-3 py-2 font-mono text-[11.5px] leading-[1.55] text-foreground/95 whitespace-pre-wrap break-words"
           ><span class="select-none text-muted-foreground">$ </span>{{ selectedCommand }}</pre>
 
           <!-- Live output (file-tailed by the backend, no refresh button needed) -->
