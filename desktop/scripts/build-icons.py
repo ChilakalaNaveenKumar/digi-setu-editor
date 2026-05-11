@@ -235,17 +235,16 @@ def write_pngs(svg_path: Path) -> None:
         render_at(svg_path, size).save(ICON_DIR / name, "PNG")
 
 
-def _build_tight_variant() -> Path:
+def _build_tight_variant() -> Path | None:
     """Generate (or refresh) the tight-cropped SVG used for icon rendering.
 
-    The wordmark SVG has ~16% of its bounding box reserved as whitespace
-    padding. For icon contexts we want every pixel to count, so we measure
-    the alpha bbox of a high-res rasterisation and rewrite the viewBox to
-    fit the content (with a ~5% safety margin so anti-aliased edges aren't
-    clipped). Result lives next to this script as `_logo-tight.svg`.
+    Returns the cropped SVG path on success, or None if `rsvg-convert`
+    isn't available — in which case the caller should treat the build as
+    a no-op (the icons committed to the repo are already correct and the
+    script is idempotent, so skipping is safe).
     """
     if not _have("rsvg-convert"):
-        return SVG_SOURCE  # fall back to the un-cropped source.
+        return None
     out = subprocess.run(
         ["rsvg-convert", "--width", "4096", str(SVG_SOURCE)],
         check=True, capture_output=True,
@@ -286,6 +285,15 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     src = args.source or _build_tight_variant()
+
+    if src is None:
+        print(
+            "[icons] rsvg-convert unavailable — keeping checked-in icons "
+            "unchanged (install with: brew install librsvg / "
+            "apt install librsvg2-bin)",
+            file=sys.stderr,
+        )
+        return 0
 
     if not src.exists():
         print(f"source not found: {src}", file=sys.stderr)

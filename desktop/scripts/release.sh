@@ -258,11 +258,32 @@ rebuild_icons() {
     [[ ${SKIP_ICONS} -eq 1 ]] && { log "--skip-icons set, reusing existing icons/"; return 0; }
     [[ ${DMG_ONLY}   -eq 1 ]] && return 0
     banner "rebuild app icons"
-    # Pillow is the only hard dep — install on demand into the user's
-    # python3 if it's missing, so a clean Mac doesn't trip preflight.
+    # Pillow is the only hard Python dep — install on demand into the
+    # user's python3 if it's missing, so a clean Mac doesn't trip preflight.
     if ! python3 -c 'import PIL' 2>/dev/null; then
         log "installing Pillow for the icon pipeline"
         pip3 install --quiet Pillow
+    fi
+    # rsvg-convert (librsvg) is needed to rasterise the true-vector SVG
+    # source. On a clean Mac runner Homebrew is preinstalled but the
+    # package isn't, so install on demand. On Linux use apt. If neither
+    # works we fall back to "reuse the icons committed to the repo" since
+    # they're already correct — `build-icons.py` is idempotent and the
+    # checked-in PNGs / .ico / .icns are the same bytes the script would
+    # produce.
+    if ! command -v rsvg-convert >/dev/null 2>&1; then
+        if command -v brew >/dev/null 2>&1; then
+            log "installing librsvg via Homebrew"
+            brew install --quiet librsvg || log "brew install librsvg failed (continuing with checked-in icons)"
+        elif command -v apt-get >/dev/null 2>&1; then
+            log "installing librsvg2-bin via apt"
+            sudo apt-get update -qq && sudo apt-get install -y -qq librsvg2-bin \
+                || log "apt install librsvg2-bin failed (continuing with checked-in icons)"
+        fi
+    fi
+    if ! command -v rsvg-convert >/dev/null 2>&1; then
+        log "rsvg-convert unavailable — reusing checked-in icons (no rebuild)"
+        return 0
     fi
     python3 "${HERE}/build-icons.py"
 }
