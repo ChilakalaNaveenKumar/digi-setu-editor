@@ -19,6 +19,7 @@ import { nextTick, onMounted, ref, watch } from "vue";
 import type { ChatMessage } from "../types/rpc";
 import AssistantMessage from "./AssistantMessage.vue";
 import UserMessage from "./UserMessage.vue";
+import WebSandboxNotice from "./WebSandboxNotice.vue";
 
 const props = defineProps<{ messages: ChatMessage[] }>();
 
@@ -86,10 +87,19 @@ onMounted(() => {
     >
       <div
         v-if="messages.length === 0"
-        class="mt-12 text-center text-lead text-muted-foreground"
+        class="mt-8"
       >
-        <p class="mb-2">No messages yet.</p>
-        <p class="text-body">Type below to start the conversation.</p>
+        <!-- Strong, expandable framing of the cloud-sandbox model.
+             The notice lives at the top of the empty state (before
+             the "type below" copy) because that's the eye path: users
+             open a new chat, see a blank surface, and we want them
+             to absorb the constraints BEFORE they paste a workflow
+             that won't fit. -->
+        <WebSandboxNotice />
+        <div class="text-center text-lead text-muted-foreground">
+          <p class="mb-2">No messages yet.</p>
+          <p class="text-body">Type below to start the conversation.</p>
+        </div>
       </div>
 
       <template v-for="m in messages" :key="m.id">

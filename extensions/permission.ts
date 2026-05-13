@@ -76,9 +76,30 @@ function currentMode(): Mode {
 	}
 }
 
+// Hard timeout on `ctx.ui.select`. This is a *safety net*, not the
+// primary auto-accept mechanism — the frontend modal counts down a
+// shorter (30s) visible timer and fires `allow_once` at 0 so the
+// user can see what's about to happen and intervene. We hold this
+// backend-side timeout 2× longer (60s) to absorb network round-trips
+// and to catch the "frontend never received the prompt" failure mode
+// (the streaming bug that bit Nicholas Bian on 2026-05). Without a
+// backend timeout the extension would block forever in that case;
+// without a SHORT backend timeout the user has to wait 2 min to see
+// why the agent stalled.
+//
+// On timeout we deliberately resolve to ALLOW rather than DENY. The
+// older default-deny path was correct in a single-user dev setup
+// (better to fail closed than to run a stray `rm -rf` while the
+// developer was at lunch) but it's the wrong default for the hosted
+// product: web users hitting their very first tool call had no way
+// to see the prompt due to an SSE buffering issue, so "no response"
+// almost always meant "the prompt never arrived" rather than "the
+// user actively chose to do nothing". Allowing on timeout fixes the
+// silent-stall failure mode and matches the policy users set when
+// they pick `auto` mode anyway.
 const TIMEOUT_MS = (() => {
-	const n = Number(process.env.PI_PERMISSION_TIMEOUT_MS || "120000");
-	return Number.isFinite(n) && n > 0 ? n : 120_000;
+	const n = Number(process.env.PI_PERMISSION_TIMEOUT_MS || "60000");
+	return Number.isFinite(n) && n > 0 ? n : 60_000;
 })();
 
 /** Tools that are always safe to run without asking. Read-only filesystem ops. */
@@ -262,8 +283,7 @@ export default function (pi: ExtensionAPI): void {
 			{ timeout: TIMEOUT_MS },
 		);
 
-		// Anything other than an explicit allow_* decision is treated as a deny.
-		// Undefined (cancelled / timed out) defaults to deny — fail safe.
+		// Explicit allow → run.
 		if (choice === "allow_once") {
 			return undefined;
 		}
@@ -271,10 +291,23 @@ export default function (pi: ExtensionAPI): void {
 			allowSession.add(fp);
 			return undefined;
 		}
+		// Explicit deny → block, with the specific reason recorded for the
+		// audit log / chat transcript.
+		if (choice === "deny_once") {
+			return { block: true, reason: "user denied" };
+		}
 		if (choice === "deny_session") {
 			denySession.add(fp);
 			return { block: true, reason: "user denied (session)" };
 		}
-		return { block: true, reason: choice === "deny_once" ? "user denied" : "user did not respond in time" };
+		// Undefined → the modal closed without a decision (timed out or
+		// the user navigated away). Allow on timeout: see the rationale
+		// above the TIMEOUT_MS declaration. The audit log still records
+		// the tool call as `auto-allowed (timeout)` so a deny-on-timeout
+		// policy can be reinstated by reading those audit entries.
+		console.error(
+			`[permission] timeout reached for ${toolName} (${fp}) — auto-allowing`,
+		);
+		return undefined;
 	});
 }

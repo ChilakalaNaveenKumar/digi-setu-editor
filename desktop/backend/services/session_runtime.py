@@ -70,6 +70,7 @@ from typing import Any, AsyncIterator, Optional
 from services.bg_processes import BackgroundProcessHub
 from services.error_codes import bridge_error, log_error, log_info
 from services.file_watcher import WatcherRegistry
+from services.models_registry import get_model
 from services.pi_session import PiSession
 
 
@@ -184,6 +185,26 @@ class SessionRuntime:
         # hasn't answered yet. Stored so a reconnecting client can
         # re-render any modal without waiting for pi to repeat itself.
         self._pending_permissions: dict[str, dict[str, Any]] = {}
+
+        # Seed `_session_info` into the ring at construction time so the
+        # very first SSE subscriber gets the model + permission_mode
+        # snapshot BEFORE pi has spawned. Previously this event was
+        # only emitted from inside `ensure_started()` (i.e. after the
+        # user sent their first prompt), which left the chat header's
+        # model picker showing the "select model" placeholder for the
+        # entire pre-prompt window. All the fields are known at
+        # __init__ time, so the runtime can publish them immediately
+        # without waiting on pi. See the web copy of this file for the
+        # full rationale.
+        _spec = get_model(self.model_id)
+        _display_name = _spec.name if _spec else self.model_id
+        self._enqueue({
+            "type": "_session_info",
+            "model": self.model_id,
+            "model_name": _display_name,
+            "permission_mode": self.permission_mode,
+            "workspace_id": self.workspace_id,
+        })
 
     # ── lifecycle ───────────────────────────────────────────────────
     async def ensure_fanout_started(self) -> None:
@@ -331,16 +352,10 @@ class SessionRuntime:
                 self._enqueue(bridge_error("internal"))
                 raise
 
-            # Emit the same `_session_info` envelope the WS path used
-            # so the existing frontend dispatcher doesn't notice the
-            # transport change.
-            self._enqueue({
-                "type": "_session_info",
-                "model": self.model_id,
-                "model_name": self.model_id,  # caller may overwrite via patch
-                "permission_mode": self.permission_mode,
-                "workspace_id": self.workspace_id,
-            })
+            # `_session_info` is already in the ring (seeded by
+            # __init__) — no need to re-emit on pi spawn. The SPA's
+            # SSE stream replays it on connect, so the picker label
+            # is correct from the moment the chat pane mounts.
 
             self._pi_task = asyncio.create_task(
                 self._pump_pi_events(),

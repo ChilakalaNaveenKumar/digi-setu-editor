@@ -29,11 +29,19 @@ accepted on read and silently rewritten to the canonical form on the
 first save — so a stale prefs.json keeps working through the upgrade
 without manual intervention.
 
-Defaults are plan-aware: free/starter users default to `ask`, pro/
-enterprise users default to `auto`. Reasoning: paying users are
-typically power users running a lot of agentic code and the per-call
-modal would become an "OK, OK, OK" reflex; free users are more likely
-first-time users who benefit from the speed bump.
+Default for the desktop app is `ask` for every plan, paired with the
+auto-allow safety net (30s visible countdown in the modal + 60s hard
+timeout server-side, both resolving to ALLOW). The brief stint at
+`auto` removed the silent-stall failure mode but also removed the
+speed bump for first-time users — they had no idea what tool calls
+the agent was running until the side-effects landed. `ask` puts a
+face on every bash / write / edit / process call without sacrificing
+the safety net: the modal auto-resolves to ALLOW after thirty
+seconds whether the user sees it or not, so the previous "prompt
+invisible AND wait forever" failure mode is impossible. Users who do
+want full silence can flip to `auto` from the chat settings menu;
+users who want to gate every read can flip to `cautious`. This
+matches the web product (see web/backend/services/user_prefs.py).
 """
 
 from __future__ import annotations
@@ -81,11 +89,13 @@ def normalize_permission_mode(raw: str) -> Optional[str]:
     return _LEGACY_PERMISSION_ALIASES.get(cleaned)
 
 
-# Default first-launch posture. `ask` matches the Cursor / Cline /
-# Claude Code default — agent runs everything but pops a confirm prompt
-# for risky shell ops (rm, network, sudo). Override with
-# PI_PERMISSION_MODE_DEFAULT for desktop launches that want a different
-# first-launch posture.
+# Default first-launch posture for the desktop app. Matches the web
+# product: every new user starts at `auto` so the first bash call
+# doesn't stall behind a "do you want to allow this?" modal that
+# unfamiliar users misread as a hang. Users who want the safety bump
+# can pick `ask` or `cautious` from the chat settings menu. Override
+# with PI_PERMISSION_MODE_DEFAULT (e.g. `ask`) for a build that wants
+# the old posture without a code change.
 _DEFAULT_FROM_ENV = os.environ.get("PI_PERMISSION_MODE_DEFAULT", "").strip().lower()
 _DEFAULT_NORMALISED = normalize_permission_mode(_DEFAULT_FROM_ENV)
 DEFAULT_PERMISSION_MODE = _DEFAULT_NORMALISED if _DEFAULT_NORMALISED else "ask"

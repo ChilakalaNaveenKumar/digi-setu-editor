@@ -94,6 +94,8 @@
       "wantsTo": "Digi Setu wants to",
       "showDetails": "Show details (a)",
       "hideDetails": "Hide details (a)",
+      "autoAllowIn": "Auto-allowing in {secs}s — click any button to cancel.",
+      "autoAllowHint": "Auto-allow in {secs}s · expand to pause",
       "intent": "Intent",
       "command": "Command",
       "create": "Create",
@@ -135,6 +137,30 @@
     "untitledChat": "Untitled chat",
     "connectionClosed": "Lost connection. Reconnecting…",
     "connectionError": "Something's not working. Please try again."
+  },
+
+  "sandbox": {
+    "headlineStrong": "This is not your local machine.",
+    "headlineRest": "You're talking to an agent running in a temporary cloud sandbox — files, installs, and processes here don't reach your computer.",
+    "showDetails": "What works here, what doesn't",
+    "hideDetails": "Hide details",
+    "dismissTitle": "Dismiss this notice",
+    "limitsLine": "Per workspace: 100 MB disk · 15 min per command. Background jobs and installed packages don't survive a container restart.",
+    "worksHeader": "Works well here",
+    "worksTypst": "Typst documents — reports, invoices, résumés, posters",
+    "worksScripts": "Quick Python / shell scripts (stdlib + the preinstalled toolchain)",
+    "worksDocs": "Drafting, editing, summarising, formatting text",
+    "worksCompile": "Compile a .typ → PDF and preview the output",
+    "worksExperiment": "Trying out ideas before committing to your local setup",
+    "notForHeader": "Won't work — use the desktop app",
+    "notForR": "R, RStudio, Quarto, LaTeX, MATLAB, anything requiring apt-get / a fresh install",
+    "notForBigData": "Datasets larger than ~100 MB or that need to live across sessions",
+    "notForLong": "Jobs that run longer than 5 minutes per step",
+    "notForPersistent": "Anything that needs to keep state after you close the chat",
+    "notForLocal": "Reading or writing files on your own laptop / network drives",
+    "ctaCompact": "Get desktop app →",
+    "ctaDesktop": "Get the desktop app — no limits, runs on your own machine",
+    "ctaSubline": "Free, works offline once installed, uses your own folders and tools. Mac, Windows, Linux."
   },
 
   "privacy": {
