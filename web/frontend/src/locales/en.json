@@ -145,5 +145,10 @@
   "terms": {
     "badge": "v2 · last updated 2026-05",
     "title": "Terms & output ownership"
+  },
+
+  "acknowledgements": {
+    "badge": "open-source · last updated 2026-05",
+    "title": "Acknowledgements"
   }
 }

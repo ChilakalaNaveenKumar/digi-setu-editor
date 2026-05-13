@@ -103,6 +103,54 @@ const KEY_FACTS: KeyFact[] = [
             to the model output. Digi Setu just orchestrates the call —
             it never sees the request or response.
           </p>
+          <div class="mt-3 rounded-lg border border-border bg-muted/40 p-4 text-body leading-relaxed">
+            <p class="flex items-center gap-2 font-semibold">
+              <Icon icon="codicon:info" class="h-4 w-4 text-primary" />
+              One IP nuance worth knowing
+            </p>
+            <p class="mt-2 text-muted-foreground">
+              Some jurisdictions — most notably the United States, per
+              the U.S. Copyright Office's 2023 guidance — hold that
+              <em>purely machine-generated</em> output is not eligible
+              for copyright protection in its raw form. Review and edit
+              what the agent produces before relying on it where
+              authorship attribution or downstream IP claims matter.
+              You're free to use, modify, and ship the output; just
+              don't assume "the agent wrote 100% of it" is the same
+              thing as "you own a copyright on it."
+            </p>
+          </div>
+        </section>
+
+        <!-- 1b. Third-party software notices -->
+        <section>
+          <h2 class="flex items-center gap-2 text-lead font-semibold uppercase tracking-wide text-foreground">
+            <Icon icon="codicon:heart" class="h-4 w-4 text-primary" />
+            Third-party software inside Digi Setu
+          </h2>
+          <p class="mt-3 text-body leading-relaxed">
+            Digi Setu bundles the
+            <a href="https://typst.app" target="_blank" rel="noopener" class="text-primary underline-offset-2 hover:underline">Typst</a>
+            typesetting engine, several Typst packages
+            (Touying, CeTZ, Fletcher, Codly, Quill, Circuiteria),
+            two open-source fonts (Source Sans 3, Noto Color Emoji),
+            and the usual application stack
+            (Vue, Tauri, FastAPI, Iconify, Stripe SDK, Clerk SDK).
+            Every component is used under its own open-source licence.
+          </p>
+          <p class="mt-3 text-body leading-relaxed">
+            The full attribution document — every package, copyright
+            holder, and licence text — lives at
+            <RouterLink to="/acknowledgements" class="text-primary underline-offset-2 hover:underline">
+              Acknowledgements
+            </RouterLink>
+            and at
+            <code class="rounded bg-muted px-1 py-0.5 font-mono text-caption">THIRD_PARTY_NOTICES.md</code>
+            in the source repository. CeTZ is the only component
+            distributed under a copyleft licence (LGPL-3.0); the
+            Acknowledgements page explains how that interacts with
+            Digi Setu specifically.
+          </p>
         </section>
 
         <!-- 2. Acceptable use -->

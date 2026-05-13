@@ -14,6 +14,8 @@
  *                      routed here because Clerk's "legal documents"
  *                      URL field points there).
  *   /terms             Static terms / output ownership
+ *   /acknowledgements  Open-source third-party notices (in-app render
+ *                      of THIRD_PARTY_NOTICES.md). Public, no auth.
  *
  * `/chat/:sid` is the only persistable URL inside the app — bookmark
  * it and it'll resolve the workspace from the session id at boot.
@@ -72,6 +74,7 @@ const PUBLIC_ROUTES = new Set([
   "start",
   "privacy",
   "terms",
+  "acknowledgements",
   "pricing",
   "feedback",
   "download",
@@ -160,6 +163,21 @@ const routes: RouteRecordRaw[] = [
     name: "terms",
     component: () => import("./views/Terms.vue"),
     meta: { header: "full", footer: true },
+  },
+  {
+    // Open-source acknowledgements / third-party notices. Renders the
+    // same content as THIRD_PARTY_NOTICES.md at the repo root and is
+    // the legal-attribution surface required by every redistribution
+    // clause we ship under (MIT, Apache 2.0, OFL, LGPL).
+    path: "/acknowledgements",
+    name: "acknowledgements",
+    component: () => import("./views/Acknowledgements.vue"),
+    meta: { header: "full", footer: true },
+  },
+  {
+    // Common alternate spelling — keep both URLs alive.
+    path: "/acknowledgments",
+    redirect: "/acknowledgements",
   },
   {
     path: "/feedback",

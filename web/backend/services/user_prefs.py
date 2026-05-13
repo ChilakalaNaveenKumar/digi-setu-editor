@@ -29,11 +29,17 @@ accepted on read and silently rewritten to the canonical form on the
 first save — so a stale prefs.json keeps working through the upgrade
 without manual intervention.
 
-Defaults are plan-aware: free/starter users default to `ask`, pro/
-enterprise users default to `auto`. Reasoning: paying users are
-typically power users running a lot of agentic code and the per-call
-modal would become an "OK, OK, OK" reflex; free users are more likely
-first-time users who benefit from the speed bump.
+Default for the hosted web app is `auto` for every plan. The earlier
+plan-aware split (`ask` for free/starter, `auto` for pro/enterprise)
+locked first-time users out of the agent loop on the web: the approval
+modal piggybacks on the same SSE channel the assistant streams over,
+and any proxy / connectivity hiccup that drops a stream chunk also
+drops the prompt. The user then sees the agent "hang" on the very
+first bash call. `auto` removes that failure mode for everyone; users
+who actively want the speed bump can still flip to `ask` from the
+chat settings menu. Desktop still defaults to `ask` (see its copy of
+this file) because the local extension surfaces the prompt out-of-band
+of the streamed output.
 """
 
 from __future__ import annotations
@@ -81,14 +87,17 @@ def normalize_permission_mode(raw: str) -> Optional[str]:
     return _LEGACY_PERMISSION_ALIASES.get(cleaned)
 
 
-# Default first-launch posture. `ask` matches the Cursor / Cline /
-# Claude Code default — agent runs everything but pops a confirm prompt
-# for risky shell ops (rm, network, sudo). Override with
-# PI_PERMISSION_MODE_DEFAULT for desktop launches that want a different
-# first-launch posture.
+# Default first-launch posture for the hosted web app. We pick `auto`
+# so the agent's bash / write / edit calls don't stall behind an
+# approval modal the user might never see (the modal piggybacks on the
+# same SSE stream the assistant uses, so any drop also drops the
+# prompt). Users who want the speed bump can flip to `ask` or
+# `cautious` from the chat settings menu and the choice persists.
+# Override with PI_PERMISSION_MODE_DEFAULT (e.g. `ask`) if a particular
+# deploy wants to restore the old posture without a code change.
 _DEFAULT_FROM_ENV = os.environ.get("PI_PERMISSION_MODE_DEFAULT", "").strip().lower()
 _DEFAULT_NORMALISED = normalize_permission_mode(_DEFAULT_FROM_ENV)
-DEFAULT_PERMISSION_MODE = _DEFAULT_NORMALISED if _DEFAULT_NORMALISED else "ask"
+DEFAULT_PERMISSION_MODE = _DEFAULT_NORMALISED if _DEFAULT_NORMALISED else "auto"
 
 # user_id from Clerk looks like "user_2abcXYZ..."; in dev we sometimes
 # pass "anon" or an email. Restrict to filesystem-safe chars to avoid

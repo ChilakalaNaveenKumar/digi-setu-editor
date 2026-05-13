@@ -41,6 +41,10 @@ import { RouterLink } from "vue-router";
           class="hover:text-foreground hover:underline"
         >Terms</RouterLink>
         <RouterLink
+          to="/acknowledgements"
+          class="hover:text-foreground hover:underline"
+        >Open Source</RouterLink>
+        <RouterLink
           to="/feedback"
           class="hover:text-foreground hover:underline"
         >Contact</RouterLink>

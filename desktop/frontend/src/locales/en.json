@@ -196,6 +196,11 @@
     "badge": "v2 · last updated 2026-05",
     "title": "Privacy & data handling"
   },
+  "acknowledgements": {
+    "badge": "open-source · last updated 2026-05",
+    "title": "Acknowledgements"
+  },
+
   "terms": {
     "badge": "v2 · last updated 2026-05",
     "title": "Terms & output ownership"
