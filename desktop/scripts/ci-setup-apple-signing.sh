@@ -146,12 +146,37 @@ if [[ -n "${APPLE_SIGN_P12_BASE64:-}" ]]; then
     security list-keychains -d user -s "$KEYCHAIN" $existing
     security default-keychain -s "$KEYCHAIN"
 
-    identity="$(security find-identity -v -p codesigning "$KEYCHAIN" \
+    # ── DIAGNOSTIC: dump everything we can see in the keychain ─────
+    echo "::group::keychain inventory"
+    echo "[all certs in build keychain]"
+    security find-certificate -a "$KEYCHAIN" 2>&1 | grep -E '"alis"|"labl"' | head -40 || true
+    echo
+    echo "[identities, ALL — no -v filter]"
+    security find-identity -p codesigning "$KEYCHAIN" 2>&1 || true
+    echo
+    echo "[identities, VALID-ONLY — -v filter]"
+    security find-identity -v -p codesigning "$KEYCHAIN" 2>&1 || true
+    echo
+    echo "[identities, ALL keychains in search list]"
+    security find-identity -p codesigning 2>&1 || true
+    echo "::endgroup::"
+    # ── /DIAGNOSTIC ───────────────────────────────────────────────
+
+    # Use ALL keychains (not just our build keychain) so cert chain
+    # validation can reach Apple's intermediate + root certs that
+    # ship in the runner's System.keychain. Drop the -v filter
+    # because GHA hosted runners often fail OCSP/CRL revocation
+    # checks (network policy) and would mark the cert "invalid" even
+    # though codesign itself will accept it (codesign re-runs its
+    # own chain validation at sign time using cached/offline trust).
+    identity="$(security find-identity -p codesigning "$KEYCHAIN" \
         | awk -F'"' '/Developer ID Application/{print $2; exit}')"
 
     if [[ -z "$identity" ]]; then
         echo "::error::no Developer ID Application identity found in imported .p12"
-        security find-identity -v -p codesigning "$KEYCHAIN" >&2
+        echo "[full identity dump for debugging]" >&2
+        security find-identity -p codesigning "$KEYCHAIN" >&2
+        security find-identity -p codesigning >&2
         exit 1
     fi
 
