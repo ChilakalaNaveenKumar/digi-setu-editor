@@ -21,9 +21,17 @@
 #       c. Regenerate THIRD_PARTY_LICENSES.txt
 #       d. npm install + Vite frontend dist
 #       e. tauri build --target <host arch> --bundles app
-#       f. Deep ad-hoc sign
+#       f. Sign .app — Developer ID + Hardened Runtime when
+#          $APPLE_SIGNING_IDENTITY is set; ad-hoc otherwise.
 #       g. create-dmg with drag-to-Applications layout
-#       h. Upload to digi-setu.com/downloads/ via upload-installer.sh
+#       h. Notarize + staple the DMG when $APPLE_NOTARY_API_KEY +
+#          _ID + _ISSUER are all set; skipped otherwise.
+#       i. Upload to digi-setu.com/downloads/ via upload-installer.sh
+#
+# CI signing wiring lives in desktop/scripts/ci-setup-apple-signing.sh,
+# which decodes the .p12 + .p8 from base64 secrets into an ephemeral
+# keychain / on-disk file and exports APPLE_SIGNING_IDENTITY +
+# APPLE_NOTARY_API_KEY{,_ID,_ISSUER} for the build steps below.
 #   5.  Linux path (when --linux or --all):
 #       a. Build (or reuse) the digi-setu/linux-builder Docker image
 #       b. Run build-linux-inside.sh inside the container — fresh
@@ -365,11 +373,117 @@ build_tauri_mac() {
 }
 
 sign_app_mac() {
-    banner "macOS · deep-sign .app"
+    banner "macOS · sign .app"
     [[ -d "${APP_PATH}" ]] || fail ".app not found at ${APP_PATH}"
-    codesign --force --deep --sign - "${APP_PATH}"
-    codesign --verify --deep --strict --verbose=1 "${APP_PATH}"
+
+    # Two signing modes:
+    #
+    #   1. Developer ID (production) — when APPLE_SIGNING_IDENTITY is
+    #      set, sign with Hardened Runtime + secure timestamp + the
+    #      Entitlements.plist that opts back into the JIT / dlopen /
+    #      DYLD_* behaviours bundled Node and PyInstaller need. This
+    #      is what CI does when the macOS p12 secret is configured;
+    #      see desktop/scripts/ci-setup-apple-signing.sh.
+    #
+    #   2. Ad-hoc (dev / PR / no-secrets-configured fallback) — sign
+    #      with the special "-" identity. Apps signed this way still
+    #      open after a right-click → Open dance, but Gatekeeper warns
+    #      strangers. Perfect for internal smoke tests.
+    #
+    # We intentionally do NOT bake the Developer ID identity into
+    # tauri.conf.json's bundle.macOS.signingIdentity — that would
+    # have `tauri build` try to sign during the bundle phase, which
+    # fails on any runner whose keychain doesn't hold the cert (every
+    # PR runner, every developer who hasn't imported the .p12). Doing
+    # the sign here, after the bundle, keeps tauri build identity-
+    # agnostic and centralises the sign logic in one place.
+    local identity="${APPLE_SIGNING_IDENTITY:-}"
+    local entitlements="${DESKTOP}/src-tauri/Entitlements.plist"
+
+    if [[ -n "${identity}" ]]; then
+        log "signing with Developer ID identity: ${identity}"
+        local sign_args=(
+            --force
+            --deep
+            --options runtime
+            --timestamp
+            --sign "${identity}"
+        )
+        if [[ -f "${entitlements}" ]]; then
+            sign_args+=(--entitlements "${entitlements}")
+        else
+            warn "no Entitlements.plist at ${entitlements}; the .app will fail notarization (V8/dyld blocked by Hardened Runtime)"
+        fi
+        codesign "${sign_args[@]}" "${APP_PATH}"
+    else
+        log "no APPLE_SIGNING_IDENTITY set; falling back to ad-hoc signature"
+        codesign --force --deep --sign - "${APP_PATH}"
+    fi
+
+    codesign --verify --deep --strict --verbose=2 "${APP_PATH}"
     log "signed: ${APP_PATH}"
+}
+
+notarize_dmg_mac() {
+    # Apple notarization. Required for Gatekeeper to silently approve
+    # a Developer-ID-signed app downloaded from the internet on macOS
+    # 10.15+; without it, every first-launch shows a "Apple cannot
+    # check it for malicious software" dialog identical to what an
+    # unsigned app sees.
+    #
+    # We notarize the DMG (not the .app inside it) because Apple
+    # accepts both, and stapling the DMG covers the case where a
+    # stranger downloads the DMG, opens it, and runs the .app once —
+    # the OS validates the DMG's stapled ticket before mounting and
+    # caches the result for the .app within. (You can also notarize
+    # the .app itself, but then `stapler staple` wants to write into
+    # the bundle, which messes up our ad-hoc-sign + dev-tree workflow.)
+    #
+    # Skipped when any of the three credentials is missing; same
+    # rationale as sign_app_mac's ad-hoc fallback. ci-setup-apple-
+    # signing.sh exports all three at once, so it's all-or-nothing.
+    if [[ -z "${APPLE_NOTARY_API_KEY:-}" \
+       || -z "${APPLE_NOTARY_API_KEY_ID:-}" \
+       || -z "${APPLE_NOTARY_API_ISSUER:-}" ]]; then
+        log "skipping notarization (APPLE_NOTARY_API_KEY{,_ID} / APPLE_NOTARY_API_ISSUER not all set)"
+        return 0
+    fi
+
+    [[ -f "${DMG_OUT}" ]] || fail "DMG not found at ${DMG_OUT}"
+
+    banner "macOS · notarize + staple ${DMG_NAME}"
+    log "submitting to Apple notary (this typically takes 30 s – 5 min)…"
+
+    # `--wait` blocks until Apple's verdict comes back. Without it we'd
+    # have to poll the submission UUID ourselves, which is fragile.
+    # Apple's notary service is generally fast (~1 min) but spikes to
+    # 10–15 min during US-hours backlogs; the GHA runner timeout
+    # accommodates this.
+    if ! xcrun notarytool submit "${DMG_OUT}" \
+            --key "${APPLE_NOTARY_API_KEY}" \
+            --key-id "${APPLE_NOTARY_API_KEY_ID}" \
+            --issuer "${APPLE_NOTARY_API_ISSUER}" \
+            --wait \
+            --output-format plist > /tmp/notary-result.plist; then
+        warn "notarytool submit returned non-zero — fetching log for diagnosis"
+        # `notarytool log` works whether the submission was accepted,
+        # rejected, or invalid; the log is always Apple's last word.
+        local sub_id
+        sub_id="$(plutil -extract id raw -o - /tmp/notary-result.plist 2>/dev/null || true)"
+        if [[ -n "${sub_id}" ]]; then
+            xcrun notarytool log "${sub_id}" \
+                --key "${APPLE_NOTARY_API_KEY}" \
+                --key-id "${APPLE_NOTARY_API_KEY_ID}" \
+                --issuer "${APPLE_NOTARY_API_ISSUER}" \
+                || true
+        fi
+        fail "notarization failed; see log above"
+    fi
+
+    log "stapling notary ticket onto ${DMG_NAME}"
+    xcrun stapler staple "${DMG_OUT}"
+    xcrun stapler validate "${DMG_OUT}"
+    log "notarized + stapled: ${DMG_OUT}"
 }
 
 build_dmg() {
@@ -498,6 +612,7 @@ mac_pipeline() {
     build_tauri_mac
     sign_app_mac
     build_dmg
+    notarize_dmg_mac
 }
 
 # ── 5. Linux pipeline (Docker) ────────────────────────────────────
