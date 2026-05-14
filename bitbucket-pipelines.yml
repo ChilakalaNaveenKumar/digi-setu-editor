@@ -224,6 +224,17 @@ definitions:
             done;
             { echo "PI_CLOUD_API_BASE=https://digi-setu.com"; echo "PI_RELAY_BASE=https://api.digi-setu.com"; echo "CLERK_TENANT=prod"; } >> .release-secrets.tmp.env
           - export TAURI_BUILD_ENV="$BITBUCKET_CLONE_DIR/.release-secrets.tmp.env"
+          # Opt in to build.rs's live-secret guard escape hatch. The Linux
+          # .deb has the same constraint as the macOS DMG / Windows EXE:
+          # the FastAPI sidecar shipped inside the bundle calls
+          # clerk_backend_api.Clerk(bearer_auth=CLERK_SECRET_KEY) for JWT
+          # verification + session refresh, so until that surface moves
+          # to a cloud worker the desktop binary has to embed
+          # CLERK_SECRET_KEY_PROD=sk_live_… for prod-tenant auth to work.
+          # Same risk + rotation discipline as documented at the top of
+          # .github/workflows/release.yml — see that file for the full
+          # block. Drop this flag once the cloud-side migration ships.
+          - export DIGI_SETU_ALLOW_EMBED_LIVE_SECRET=1
           # build-linux-inside.sh defaults WORKSPACE=/workspace because
           # it normally runs inside our Docker linux-builder image with
           # the repo bind-mounted there. On a Bitbucket runner the
