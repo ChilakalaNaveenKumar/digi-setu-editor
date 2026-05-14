@@ -170,7 +170,12 @@ def main() -> int:
     # surface it BEFORE uvicorn starts so the Tauri shell logs the
     # real cause instead of a port-bind error.
     try:
+        logging.info("Importing config...")
+        import config as _cfg  # type: ignore[import-not-found]
+        logging.info("config imported OK (AUTH_REQUIRED=%s, DEPLOY_MODE=%s)", _cfg.AUTH_REQUIRED, _cfg.DEPLOY_MODE)
+        logging.info("Importing routes...")
         from app import app  # type: ignore[import-not-found]
+        logging.info("app imported OK")
     except Exception:
         logging.exception("Could not import FastAPI app — backend boot failed")
         return 2

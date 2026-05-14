@@ -190,7 +190,7 @@ for pkg in ("certifi", "clerk_backend_api", "svix"):
 # we exclude it. uvicorn's auto-detection then falls back to asyncio.
 excludes = []
 if sys.platform == "win32":
-    excludes += ["uvloop"]
+    excludes += ["uvloop", "fcntl", "termios", "pty"]
 
 
 a = Analysis(

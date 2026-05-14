@@ -9,23 +9,12 @@
 #                                    duplicating on GHA wastes private-
 #                                    repo minutes for zero benefit.
 #
-# Removed (2026-05-10): `macos-intel` job.
-#   - The `macos-15-intel` hosted runner has a persistent DiskArbitration
-#     deadlock that hangs `create-dmg` for the full 8-min wall-clock
-#     timeout on EVERY rc, then retries 3× → 24+ min wasted per build.
-#     We landed an 8-min-per-attempt timeout + `hdiutil -srcfolder`
-#     salvage path; even those weren't enough — runs frequently still
-#     burn through the full 60-min job budget and get cancelled.
-#   - macOS Intel users get the arm64 DMG under Rosetta 2 in the
-#     meantime (works, just one extra layer). Download.vue's
-#     `macIntelAvailable=false` surfaces this as "coming soon — use the
-#     Apple Silicon DMG via Rosetta meanwhile".
-#   - When we ship a real macOS Intel installer it'll be via
-#     `tauri build --target universal-apple-darwin` from macos-15 —
-#     one universal2 DMG that runs native on both archs, no separate
-#     Intel runner needed. Blocked on auditing our Python wheels for
-#     universal2 (cryptography, pydantic-core, etc. ship universal2;
-#     a few internal sidecar deps don't yet).
+# Restored (2026-05-13): `macos-intel` job.
+#   - The old macos-15-intel hosted runner had a persistent DiskArbitration
+#     deadlock. We now cross-compile from the M-series macos-15 runner
+#     instead: Rust cross-compiles natively, PyInstaller runs under
+#     `arch -x86_64` (Rosetta 2), and create-dmg runs on ARM with no
+#     hdiutil deadlocks.
 #
 # Why this exists alongside desktop/scripts/release.sh:
 #   - release.sh builds macOS + Linux locally on a dev's laptop. Windows
@@ -311,6 +300,123 @@ jobs:
           name: macos-arm-dmg
           path: /tmp/Digi-Setu-*-arm64.dmg
 
-  # macos-intel job removed 2026-05-10 — see header comment for the
-  # reasoning. Intel users get the arm64 DMG via Rosetta until we ship
-  # a universal2 build from the macos-arm runner.
+  # ── macOS x86_64 (Intel) ────────────────────────────────────────────
+  # Output: Digi-Setu-<version>-x86_64.dmg
+  #
+  # Runs on the SAME M-series runner as macos-arm, but cross-compiles
+  # for x86_64 via Rosetta 2. This sidesteps the DiskArbitration
+  # deadlock that plagued the now-removed macos-15-intel job entirely:
+  #   - Rust cross-compiles natively (just `--target x86_64-apple-darwin`)
+  #   - PyInstaller runs under `arch -x86_64` to produce an x86_64 sidecar
+  #   - create-dmg runs on ARM (no hdiutil deadlocks on M-series)
+  #
+  # Depends on macos-arm so we don't double-bill on the frontend +
+  # icon builds; the frontend dist is architecture-independent and
+  # gets shared via upload-artifact / download-artifact.
+  macos-intel:
+    runs-on: macos-15            # M-series; cross-compiles via Rosetta
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: flags
+        shell: bash
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+        run: |
+          [[ -n "$GCP_SA_KEY" ]] && echo "has_gcp=true" >> "$GITHUB_OUTPUT" || echo "has_gcp=false" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rosetta 2
+        run: softwareupdate --install-rosetta --agree-to-license || true
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            desktop/src-tauri/target
+          key: cargo-macos-intel-${{ hashFiles('desktop/src-tauri/Cargo.lock') }}
+
+      - name: Install create-dmg + Pillow
+        run: |
+          brew install create-dmg
+          python3 -m pip install --quiet Pillow
+
+      - if: steps.flags.outputs.has_gcp == 'true'
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - if: steps.flags.outputs.has_gcp == 'true'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Stage backend/.env with Clerk + cloud-target keys
+        shell: bash
+        env:
+          CLERK_PUBLISHABLE_KEY_PROD: ${{ secrets.CLERK_PUBLISHABLE_KEY_PROD }}
+          CLERK_SECRET_KEY_PROD:      ${{ secrets.CLERK_SECRET_KEY_PROD }}
+        run: |
+          mkdir -p desktop/backend
+          {
+            echo "CLERK_PUBLISHABLE_KEY_PROD=$CLERK_PUBLISHABLE_KEY_PROD"
+            echo "CLERK_SECRET_KEY_PROD=$CLERK_SECRET_KEY_PROD"
+            echo "PI_CLOUD_API_BASE=https://digi-setu.com"
+            echo "PI_RELAY_BASE=https://api.digi-setu.com"
+            echo "CLERK_TENANT=prod"
+          } > desktop/backend/.env
+          chmod 0600 desktop/backend/.env
+
+      - name: Build x86_64 sidecar under Rosetta
+        run: |
+          cd desktop/backend
+          python3 -m venv .venv
+          source .venv/bin/activate
+          pip install --quiet --disable-pip-version-check -r requirements.txt
+          pip install --quiet "pyinstaller>=6.10,<7"
+          cd ../sidecar
+          # Run PyInstaller under Rosetta so the frozen binary is x86_64
+          arch -x86_64 python -m PyInstaller --clean --noconfirm pyinstaller.spec
+          # Tauri expects the platform-suffixed name
+          DIST="$(pwd)/dist"
+          cp "$DIST/pi-typst-sidecar" "$DIST/pi-typst-sidecar-x86_64-apple-darwin"
+
+      - name: Build x86_64 DMG (release.sh --mac --local-env --no-upload --skip-sidecar)
+        env:
+          APP_VERSION: ${{ env.APP_VERSION }}
+        run: |
+          # Override the host arch detection so release.sh targets x86_64
+          # even though we're running on ARM. The sidecar is already built
+          # above (x86_64 via Rosetta), so --skip-sidecar avoids rebuilding
+          # it as arm64.
+          export TAURI_CLI_TARGET=x86_64-apple-darwin
+          bash desktop/scripts/release.sh --mac --local-env --no-upload --skip-sidecar
+
+      - name: Upload .dmg to digi-setu.com (only if SA key provided)
+        if: steps.flags.outputs.has_gcp == 'true'
+        env:
+          GCP_PROJECT: ${{ secrets.GCP_PROJECT || 'digi-setu-dev' }}
+          GCP_VM:      ${{ secrets.GCP_VM      || 'digi-setu-live' }}
+          GCP_ZONE:    ${{ secrets.GCP_ZONE    || 'us-central1-a' }}
+        run: |
+          DMG="/tmp/Digi-Setu-${APP_VERSION}-x86_64.dmg"
+          if [[ -f "$DMG" ]]; then
+            bash deploy/scripts/upload-installer.sh "$DMG"
+          else
+            echo "::warning::no x86_64 .dmg produced at $DMG"
+            ls -la /tmp/Digi-Setu-* || true
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-intel-dmg
+          path: /tmp/Digi-Setu-*-x86_64.dmg

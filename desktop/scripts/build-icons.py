@@ -186,12 +186,7 @@ def write_macos_icns(svg_path: Path, out: Path) -> None:
 def write_windows_ico(svg_path: Path, out: Path) -> None:
     sizes = [16, 24, 32, 48, 64, 128, 256]
     images = [render_at(svg_path, s) for s in sizes]
-    images[0].save(
-        out,
-        format="ICO",
-        sizes=[(s, s) for s in sizes],
-        append_images=images[1:],
-    )
+    _write_ico_from_images(images, out)
 
 
 def write_favicons(svg_path: Path) -> None:
@@ -201,16 +196,62 @@ def write_favicons(svg_path: Path) -> None:
     for tgt in FAVICON_DIRS:
         if not tgt.exists():
             continue
-        ico = [render_at(svg_path, s) for s in (16, 32, 48)]
-        ico[0].save(
+        _write_ico_from_images(
+            [render_at(svg_path, s) for s in (16, 32, 48)],
             tgt / "favicon.ico",
-            format="ICO",
-            sizes=[(16, 16), (32, 32), (48, 48)],
-            append_images=ico[1:],
         )
         render_at(svg_path, 32).save(tgt / "favicon-32.png", "PNG")
         render_at(svg_path, 192).save(tgt / "favicon-192.png", "PNG")
         render_at(svg_path, 180).save(tgt / "apple-touch-icon.png", "PNG")
+
+
+def _write_ico_from_images(images: list[Image.Image], out: Path) -> None:
+    """Write a multi-size ICO file from a list of Pillow images.
+
+    Sizes < 256 use raw BMP data (required by Windows RC.EXE for
+    embedding into .exe resources). The 256x256 entry uses PNG
+    compression per the ICO spec.
+    """
+    blobs: list[bytes] = []
+    for img in images:
+        img = img.convert("RGBA")
+        w, h = img.size
+        if w >= 256 or h >= 256:
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            blobs.append(buf.getvalue())
+        else:
+            bih = struct.pack(
+                "<IiiHHIIiiII",
+                40, w, h * 2, 1, 32, 0, 0, 0, 0, 0, 0,
+            )
+            pixels = img.load()
+            rows = b""
+            for y in range(h - 1, -1, -1):
+                for x in range(w):
+                    r, g, b, a = pixels[x, y]
+                    rows += struct.pack("BBBB", b, g, r, a)
+            row_pad = (w + 31) // 32 * 4
+            and_mask = b"\x00" * (row_pad * h)
+            blobs.append(bih + rows + and_mask)
+
+    num = len(images)
+    header = struct.pack("<HHH", 0, 1, num)
+    dir_block = b""
+    data_offset = 6 + 16 * num
+    for img, blob in zip(images, blobs):
+        w_b = 0 if img.width >= 256 else img.width
+        h_b = 0 if img.height >= 256 else img.height
+        dir_block += struct.pack(
+            "<BBBBHHII", w_b, h_b, 0, 0, 1, 32, len(blob), data_offset,
+        )
+        data_offset += len(blob)
+
+    with open(out, "wb") as f:
+        f.write(header)
+        f.write(dir_block)
+        for blob in blobs:
+            f.write(blob)
 
 
 def write_pngs(svg_path: Path) -> None:

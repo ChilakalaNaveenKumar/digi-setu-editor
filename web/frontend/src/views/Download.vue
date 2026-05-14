@@ -154,7 +154,7 @@ const firstLaunchKind = computed<"mac" | "windows" | "linux">(() => {
 // in the meantime; when we ship a real Intel installer it'll be a
 // universal2 binary from the macos-arm runner (no separate Intel job).
 const macArmAvailable = true;
-const macIntelAvailable = false;
+const macIntelAvailable = true;
 // .deb covers Ubuntu/Debian/Mint/Pop!_OS — easily 80%+ of Linux desktop
 // installs. .AppImage is held back because Tauri 2's bundler downloads
 // its own copy of `linuxdeploy.AppImage` and execs it directly, which

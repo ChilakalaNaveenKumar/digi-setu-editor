@@ -70,11 +70,20 @@ APP_VERSION="${APP_VERSION:-0.1.0}"
 GCP_PROJECT="${GCP_PROJECT:-digi-setu-dev}"
 
 ARCH="$(uname -m)"
-case "$ARCH" in
-    arm64)  TARGET="aarch64-apple-darwin"; DMG_ARCH="arm64" ;;
-    x86_64) TARGET="x86_64-apple-darwin";  DMG_ARCH="x86_64" ;;
-    *) printf '[release] unsupported arch: %s\n' "$ARCH" >&2; exit 1 ;;
-esac
+if [[ -n "${TAURI_CLI_TARGET:-}" ]]; then
+    TARGET="$TAURI_CLI_TARGET"
+    case "$TARGET" in
+        aarch64-apple-darwin) DMG_ARCH="arm64"  ;;
+        x86_64-apple-darwin)  DMG_ARCH="x86_64" ;;
+        *) DMG_ARCH="$ARCH" ;;
+    esac
+else
+    case "$ARCH" in
+        arm64)  TARGET="aarch64-apple-darwin"; DMG_ARCH="arm64" ;;
+        x86_64) TARGET="x86_64-apple-darwin";  DMG_ARCH="x86_64" ;;
+        *) printf '[release] unsupported arch: %s\n' "$ARCH" >&2; exit 1 ;;
+    esac
+fi
 
 DMG_NAME="${DMG_NAME:-Digi-Setu-${APP_VERSION}-${DMG_ARCH}.dmg}"
 APP_PATH="${DESKTOP}/src-tauri/target/${TARGET}/release/bundle/macos/Digi Setu.app"

@@ -54,6 +54,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+import sys
+
 from config import CORS_ORIGINS, DEPLOY_MODE
 from routes import (
     attachments,
@@ -74,11 +76,13 @@ from routes import (
     prefs,
     sessions,
     snapshots,
-    terminal_ws,
-    terminals,
     usage,
     workspaces,
 )
+
+_HAS_PTY = sys.platform != "win32"
+if _HAS_PTY:
+    from routes import terminal_ws, terminals
 from services import container_pool, dotenv_watcher, egress_proxy
 
 
@@ -195,14 +199,16 @@ def create_app() -> FastAPI:
     app.include_router(snapshots.router)
 
     app.include_router(bg.router)
-    app.include_router(terminals.router)
+    if _HAS_PTY:
+        app.include_router(terminals.router)
 
     app.include_router(chat_ws.router)
     # SSE-based chat (POST + EventSource). Lives alongside chat_ws
     # during cutover; once the SPA stops opening WS we delete the
     # WS route file. See web/backend/app.py for the rationale.
     app.include_router(chat_sse.router)
-    app.include_router(terminal_ws.router)
+    if _HAS_PTY:
+        app.include_router(terminal_ws.router)
 
     # Public (unauth) auth-side endpoints: webhook + feedback +
     # desktop deep-link exchange.
