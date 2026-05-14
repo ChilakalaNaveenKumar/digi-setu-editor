@@ -51,6 +51,8 @@ _bootstrap_env()
 # ruff: noqa: E402  -- imports below intentionally follow _bootstrap_env()
 from contextlib import asynccontextmanager
 
+import sys
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -77,11 +79,13 @@ from routes import (
     prefs,
     sessions,
     snapshots,
-    terminal_ws,
-    terminals,
     usage,
     workspaces,
 )
+
+_HAS_PTY = sys.platform != "win32"
+if _HAS_PTY:
+    from routes import terminal_ws, terminals
 from services import container_pool, egress_proxy
 
 
@@ -261,14 +265,16 @@ def create_app() -> FastAPI:
     app.include_router(snapshots.router)
 
     app.include_router(bg.router)
-    app.include_router(terminals.router)
+    if _HAS_PTY:
+        app.include_router(terminals.router)
 
     app.include_router(chat_ws.router)
     # SSE-based chat (POST + EventSource). Lives alongside chat_ws
     # during the cutover; once the SPA stops opening WS we delete
     # routes/chat_ws.py and services/session_locks.py.
     app.include_router(chat_sse.router)
-    app.include_router(terminal_ws.router)
+    if _HAS_PTY:
+        app.include_router(terminal_ws.router)
     # Desktop chat-relay WS — sits next to chat_ws because it shares
     # the same protocol surface (delegates to chat_ws.run_session_loop).
     # Requires services/auth's subprotocol-bearer support to be wired,
