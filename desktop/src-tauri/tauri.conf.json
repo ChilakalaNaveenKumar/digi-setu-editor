@@ -10,7 +10,7 @@
     "frontendDist": "../frontend/dist"
   },
   "app": {
-    "withGlobalTauri": true,
+    "withGlobalTauri": false,
     "macOSPrivateApi": true,
     "windows": [
       {
@@ -30,10 +30,11 @@
       }
     ],
     "security": {
-      "csp": null,
+      "csp": "default-src 'self' tauri: ipc:; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: tauri: ipc: asset: https:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:* ws://127.0.0.1:* http://localhost:* ws://localhost:*; frame-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'",
+      "devCsp": "default-src 'self' tauri: ipc:; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' http://localhost:5173; style-src 'self' 'unsafe-inline' http://localhost:5173; img-src 'self' data: blob: tauri: ipc: asset: https: http://localhost:5173; font-src 'self' data: http://localhost:5173; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:* ws://127.0.0.1:* http://localhost:* ws://localhost:*; frame-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'",
       "assetProtocol": {
         "enable": true,
-        "scope": ["**"]
+        "scope": ["$APPDATA/**", "$APPLOCALDATA/**", "$RESOURCE/**"]
       }
     }
   },

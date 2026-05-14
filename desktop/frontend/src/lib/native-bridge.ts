@@ -3,9 +3,13 @@
  *
  * The same SPA bundle ships to both the web (Vite + Caddy) and desktop
  * (Tauri shell) deployments. We feature-detect Tauri at runtime via
- * `window.__TAURI_INTERNALS__` (injected by the Tauri WebView when
- * `withGlobalTauri: true` is set) and fall through to web-flavour
- * implementations otherwise.
+ * `window.__TAURI_INTERNALS__` (always injected by the Tauri WebView,
+ * regardless of `withGlobalTauri`) and fall back to a `__TAURI__` check
+ * for older Tauri shells that only ever exposed the convenience global
+ * (which DOES require `withGlobalTauri: true`). Our config sets
+ * `withGlobalTauri: false` so the IPC bridge isn't reachable from any
+ * third-party script that lands in the SPA — every caller has to go
+ * through the explicit `@tauri-apps/api/core` import below.
  *
  * Why dynamic imports of `@tauri-apps/api`? Static imports would force
  * Vite to bundle the package into every web build too, even though the

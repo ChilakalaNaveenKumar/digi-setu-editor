@@ -100,6 +100,47 @@ fn main() {
         }
     }
 
+    // ── Live-secret guard ──────────────────────────────────────────
+    // Refuse to bake a production Clerk secret key (`sk_live_…`) into
+    // the binary unless the operator has explicitly opted in via the
+    // `DIGI_SETU_ALLOW_EMBED_LIVE_SECRET=1` env var. Every public
+    // download of a build that embeds a live secret is a Clerk
+    // takeover risk — `strings <bundle>/Contents/MacOS/digi-setu`
+    // will reveal it on any unprotected machine.
+    //
+    // The opt-in exists so internal/test builds (where the secret
+    // isn't actually live, or where the operator has accepted the
+    // risk for a controlled distribution list) can still ship.
+    // CI / public-release pipelines should never set the flag.
+    let allow_live = std::env::var("DIGI_SETU_ALLOW_EMBED_LIVE_SECRET")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    println!("cargo:rerun-if-env-changed=DIGI_SETU_ALLOW_EMBED_LIVE_SECRET");
+
+    let secret_keys = ["CLERK_SECRET_KEY", "CLERK_SECRET_KEY_PROD"];
+    for k in secret_keys.iter() {
+        if let Some(v) = values.get(*k) {
+            if v.starts_with("sk_live_") && !allow_live {
+                panic!(
+                    "\n\n\
+                    [build.rs] Refusing to embed a LIVE Clerk secret key ({k}=sk_live_…) \n\
+                    into the desktop binary. Anyone with the .app/.exe could extract it \n\
+                    via `strings` and impersonate any user.\n\n\
+                    Resolve one of:\n\
+                      • Move JWT verification + session refresh to the cloud backend so \n\
+                        the desktop only needs the publishable key (recommended).\n\
+                      • Use a Clerk *test* secret (sk_test_…) for desktop builds and \n\
+                        keep prod auth cloud-only.\n\
+                      • For an internal/test build only, set \n\
+                        DIGI_SETU_ALLOW_EMBED_LIVE_SECRET=1 to acknowledge the risk \n\
+                        and bypass this guard. NEVER set this in a public-release \n\
+                        pipeline.\n\n\
+                    See SECURITY-RELEASE.md for the full migration plan.\n\n"
+                );
+            }
+        }
+    }
+
     for k in wanted.iter() {
         let v = values.get(*k).cloned().unwrap_or_default();
         // `cargo:rustc-env` injects this as a compile-time env var

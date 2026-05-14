@@ -324,19 +324,30 @@ fn home_dir() -> Option<PathBuf> {
 fn kill_orphan_sidecars() {
     #[cfg(unix)]
     {
-        // pgrep + kill -9 by name. We deliberately do NOT match the
-        // full path so this also clears dev-tree sidecars left over
-        // from `cargo tauri dev` runs on the developer's machine —
-        // they would otherwise outlive the dev process and confuse a
-        // subsequent packaged-app launch.
-        let _ = std::process::Command::new("pkill")
-            .arg("-9")
-            .arg("-f")
-            .arg("pi-typst-sidecar")
-            .status();
+        // We previously used `pkill -9 -f pi-typst-sidecar`, but `-f`
+        // matches the full command line — which silently kills any
+        // unrelated user process whose argv happens to contain that
+        // string (e.g. `vim pi-typst-sidecar.log`, `grep pi-typst-…`,
+        // a shell history entry replayed via `fc`). Match by
+        // executable basename instead so we can never grenade the
+        // wrong process. `-x` does an exact comm-name match;
+        // pgrep/pkill enforce the 15-char comm limit so the binary
+        // name MUST stay short (it's "pi-typst-sidecar" = 16 chars
+        // truncated to "pi-typst-sidec" in `comm`, so we match the
+        // truncated form too).
+        for name in ["pi-typst-sidecar", "pi-typst-sidec"] {
+            let _ = std::process::Command::new("pkill")
+                .arg("-9")
+                .arg("-x")
+                .arg(name)
+                .status();
+        }
     }
     #[cfg(windows)]
     {
+        // taskkill /IM already matches by image (executable) name,
+        // not arbitrary command-line substring, so this side was
+        // already safe.
         let _ = std::process::Command::new("taskkill")
             .arg("/F")
             .arg("/IM")

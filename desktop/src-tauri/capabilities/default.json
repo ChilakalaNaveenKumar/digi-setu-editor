@@ -1,15 +1,13 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capabilities granted to the main webview. Each permission is the minimum needed for the SPA to do its job; nothing here grants raw filesystem or shell access — those are mediated by our IPC commands in src/commands.rs.",
+  "description": "Capabilities granted to the main webview. The SPA NEVER calls @tauri-apps/plugin-fs or plugin-shell directly — every filesystem / process action goes through the FastAPI sidecar (path-checked, audit-logged) or one of our custom IPC commands in src/commands.rs (pick_folder, open_external_url, …). We therefore deliberately do NOT grant fs:default or shell:default; those would let any XSS-injected script bypass our backend's permission checks and read or execute anything as the user.",
   "windows": ["main"],
   "permissions": [
     "core:default",
     "core:event:default",
     "core:window:default",
     "core:webview:default",
-
-    "shell:default",
 
     "opener:default",
     "opener:allow-open-url",
@@ -23,8 +21,6 @@
     "os:allow-os-type",
     "os:allow-locale",
     "os:allow-arch",
-
-    "fs:default",
 
     "deep-link:default",
     "deep-link:allow-get-current",

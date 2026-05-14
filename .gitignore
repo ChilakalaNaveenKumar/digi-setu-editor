@@ -12,6 +12,20 @@ logs/
 .env
 .env.*
 !.env.example
+
+# Code-signing material. The .cer (public certificate) is harmless to
+# commit but carries no value in source control — it lives in Keychain
+# Access on the build machine. The .p12 / .pfx / .pem / .key files
+# bundle the private key and would let anyone with the file impersonate
+# us as a Developer ID signer; they MUST never be tracked. The CSR is
+# pointless to keep around once Apple has issued the cert.
+*.cer
+*.p12
+*.pfx
+*.pem
+*.key
+*.certSigningRequest
+AuthKey_*.p8
 web/backend/.env
 web/backend/.env.*
 !web/backend/.env.example
