@@ -459,17 +459,21 @@ notarize_dmg_mac() {
     # Apple's notary service is generally fast (~1 min) but spikes to
     # 10–15 min during US-hours backlogs; the GHA runner timeout
     # accommodates this.
-    if ! xcrun notarytool submit "${DMG_OUT}" \
-            --key "${APPLE_NOTARY_API_KEY}" \
-            --key-id "${APPLE_NOTARY_API_KEY_ID}" \
-            --issuer "${APPLE_NOTARY_API_ISSUER}" \
-            --wait \
-            --output-format plist > /tmp/notary-result.plist; then
-        warn "notarytool submit returned non-zero — fetching log for diagnosis"
-        # `notarytool log` works whether the submission was accepted,
-        # rejected, or invalid; the log is always Apple's last word.
-        local sub_id
-        sub_id="$(plutil -extract id raw -o - /tmp/notary-result.plist 2>/dev/null || true)"
+    local notary_rc=0
+    xcrun notarytool submit "${DMG_OUT}" \
+        --key "${APPLE_NOTARY_API_KEY}" \
+        --key-id "${APPLE_NOTARY_API_KEY_ID}" \
+        --issuer "${APPLE_NOTARY_API_ISSUER}" \
+        --wait \
+        --output-format plist > /tmp/notary-result.plist || notary_rc=$?
+
+    local sub_id sub_status
+    sub_id="$(plutil -extract id raw -o - /tmp/notary-result.plist 2>/dev/null || true)"
+    sub_status="$(plutil -extract status raw -o - /tmp/notary-result.plist 2>/dev/null || true)"
+    log "notary submission id=${sub_id:-<none>} status=${sub_status:-<none>} rc=${notary_rc}"
+
+    if [[ "${sub_status}" != "Accepted" ]]; then
+        warn "notarization not accepted — fetching log for diagnosis"
         if [[ -n "${sub_id}" ]]; then
             xcrun notarytool log "${sub_id}" \
                 --key "${APPLE_NOTARY_API_KEY}" \
@@ -477,11 +481,26 @@ notarize_dmg_mac() {
                 --issuer "${APPLE_NOTARY_API_ISSUER}" \
                 || true
         fi
-        fail "notarization failed; see log above"
+        fail "notarization status=${sub_status:-<none>} (rc=${notary_rc})"
     fi
 
+    # Apple's CloudKit (which `stapler` queries to fetch the signed
+    # ticket) sometimes lags a few seconds behind notarytool's
+    # `--wait` returning Accepted. A "Record not found" / Error 65
+    # from stapler is almost always propagation lag, not a real
+    # failure — retry with backoff before giving up.
     log "stapling notary ticket onto ${DMG_NAME}"
-    xcrun stapler staple "${DMG_OUT}"
+    local staple_attempt
+    for staple_attempt in 1 2 3 4 5 6 7 8; do
+        if xcrun stapler staple "${DMG_OUT}"; then
+            break
+        fi
+        if [[ "${staple_attempt}" -eq 8 ]]; then
+            fail "stapler staple failed after 8 attempts (CloudKit propagation lag suspected)"
+        fi
+        log "stapler not ready yet (attempt ${staple_attempt}/8); retrying in 15 s…"
+        sleep 15
+    done
     xcrun stapler validate "${DMG_OUT}"
     log "notarized + stapled: ${DMG_OUT}"
 }
