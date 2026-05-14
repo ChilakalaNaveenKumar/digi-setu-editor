@@ -11,10 +11,19 @@
 #
 # Restored (2026-05-13): `macos-intel` job.
 #   - The old macos-15-intel hosted runner had a persistent DiskArbitration
-#     deadlock. We now cross-compile from the M-series macos-15 runner
-#     instead: Rust cross-compiles natively, PyInstaller runs under
-#     `arch -x86_64` (Rosetta 2), and create-dmg runs on ARM with no
-#     hdiutil deadlocks.
+#     deadlock (root cause: macOS background services — XProtect,
+#     Spotlight/mds — holding disk resources while hdiutil is mid-flight;
+#     GitHub closed actions/runner-images#7522 in 2026-01 as
+#     "working as designed"). We now cross-compile from the M-series
+#     macos-15 runner instead: Rust cross-compiles natively, PyInstaller
+#     runs under `arch -x86_64` (Rosetta 2), and create-dmg runs on ARM
+#     with no hdiutil deadlocks.
+#   - Belt-and-braces: release.sh's build_dmg() also uses create-dmg
+#     v1.2.3's built-in `--hdiutil-retries 5` flag (PR#198, Nov 2025),
+#     which retries hdiutil's create AND detach phases internally with
+#     proper `sync` between attempts. Both job install steps version-
+#     check create-dmg >= 1.2.3 so a Homebrew regression can't silently
+#     re-introduce the hour-long hang.
 #
 # Why this exists alongside desktop/scripts/release.sh:
 #   - release.sh builds macOS + Linux locally on a dev's laptop. Windows
@@ -243,7 +252,25 @@ jobs:
 
       - name: Install create-dmg + Pillow
         run: |
+          # We require create-dmg >= 1.2.3 for its --hdiutil-retries flag
+          # (PR#198, Nov 2025) — release.sh's build_dmg() depends on it
+          # to survive macOS DiskArbitration deadlocks. Homebrew on a
+          # fresh GHA runner pulls latest, so this is a belt-and-braces
+          # version check; if it ever serves an older version we want a
+          # loud failure here rather than a silent hour-long DMG hang.
           brew install create-dmg
+          cdmg_ver="$(create-dmg --version 2>/dev/null | awk '{print $2; exit}')"
+          if [[ -z "$cdmg_ver" ]]; then
+            echo "::error::create-dmg installed but reported no --version; likely too old"
+            exit 1
+          fi
+          # bash 3.2 doesn't have native version-compare; do it via sort -V.
+          oldest_ok="1.2.3"
+          if [[ "$(printf '%s\n%s\n' "$oldest_ok" "$cdmg_ver" | sort -V | head -1)" != "$oldest_ok" ]]; then
+            echo "::error::create-dmg $cdmg_ver < $oldest_ok (missing --hdiutil-retries support)"
+            exit 1
+          fi
+          echo "create-dmg $cdmg_ver OK"
           python3 -m pip install --quiet Pillow
 
       - if: steps.flags.outputs.has_gcp == 'true'
@@ -349,7 +376,20 @@ jobs:
 
       - name: Install create-dmg + Pillow
         run: |
+          # Same version pin as macos-arm — release.sh's build_dmg()
+          # depends on create-dmg >= 1.2.3's --hdiutil-retries flag.
           brew install create-dmg
+          cdmg_ver="$(create-dmg --version 2>/dev/null | awk '{print $2; exit}')"
+          if [[ -z "$cdmg_ver" ]]; then
+            echo "::error::create-dmg installed but reported no --version; likely too old"
+            exit 1
+          fi
+          oldest_ok="1.2.3"
+          if [[ "$(printf '%s\n%s\n' "$oldest_ok" "$cdmg_ver" | sort -V | head -1)" != "$oldest_ok" ]]; then
+            echo "::error::create-dmg $cdmg_ver < $oldest_ok (missing --hdiutil-retries support)"
+            exit 1
+          fi
+          echo "create-dmg $cdmg_ver OK"
           python3 -m pip install --quiet Pillow
 
       - if: steps.flags.outputs.has_gcp == 'true'

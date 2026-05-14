@@ -376,103 +376,83 @@ build_dmg() {
     banner "macOS · build DMG (create-dmg)"
     rm -f "${DMG_OUT}"
 
-    # macos-15-intel GHA runners occasionally hang in `hdiutil` calls
-    # (DiskArbitration deadlocks — manifest as "Creating disk image..."
-    # never returning, or the closing `hdiutil detach` blocking
-    # forever). On Apple Silicon runners these typically finish in
-    # 60–120 s; we cap each attempt at 8 minutes so a hung run can't
-    # eat the entire 6-hour GitHub Actions budget.
+    # macOS background services (XProtect, Spotlight/mds, indexing,
+    # delayed I/O flushes) regularly hold disk resources while
+    # create-dmg's hdiutil calls are mid-flight, manifesting as either
+    #   - "hdiutil: create failed - Resource busy"     (49168), or
+    #   - "Creating disk image..." stuck indefinitely  (DiskArbitration deadlock)
     #
-    # Strategy:
-    #   1. Run create-dmg in the background with a wall-clock timeout.
-    #   2. If it succeeds → done.
-    #   3. If it fails or times out → force-detach orphan mounts,
-    #      salvage the rw image if create-dmg got that far, retry.
-    #   4. After 3 failures, bypass create-dmg entirely and build a
-    #      no-frills DMG with `hdiutil create -srcfolder`. Loses the
-    #      drag-to-Applications layout but gives users a usable
-    #      installer instead of failing the whole release.
-    local _attempt
-    local _attempt_timeout=480   # 8 minutes per create-dmg attempt
-    for _attempt in 1 2 3; do
-        log "create-dmg attempt ${_attempt}/3 (timeout ${_attempt_timeout}s)"
-        # Spawn create-dmg as a background job and watch the wall clock.
-        # `create-dmg` doesn't accept a --timeout flag, and `gtimeout`
-        # isn't on stock GHA runners, so we manage the timer ourselves
-        # — and we pgrep-kill the orphaned `hdiutil` children that
-        # create-dmg leaves running when we SIGTERM it (otherwise the
-        # next attempt races against a leftover mount).
-        (
-            create-dmg \
-                --volname "Digi Setu" \
-                --window-pos 200 120 \
-                --window-size 640 400 \
-                --icon-size 128 \
-                --icon "Digi Setu.app" 180 200 \
-                --hide-extension "Digi Setu.app" \
-                --app-drop-link 460 200 \
-                --no-internet-enable \
-                "${DMG_OUT}" \
-                "${APP_PATH}"
-        ) &
-        local _pid=$!
-        local _waited=0
-        local _ok=0
-        while [[ ${_waited} -lt ${_attempt_timeout} ]]; do
-            if ! kill -0 "${_pid}" 2>/dev/null; then
-                wait "${_pid}" && _ok=1 || _ok=0
-                break
-            fi
-            sleep 5
-            _waited=$((_waited + 5))
-        done
-        if kill -0 "${_pid}" 2>/dev/null; then
-            log "create-dmg attempt ${_attempt} timed out at ${_waited}s; killing"
-            kill -TERM "${_pid}" 2>/dev/null || true
-            sleep 2
-            kill -KILL "${_pid}" 2>/dev/null || true
-            # create-dmg shells out to hdiutil; chase those down too.
-            pkill -f "hdiutil" 2>/dev/null || true
-            wait "${_pid}" 2>/dev/null || true
-        fi
-        if [[ ${_ok} -eq 1 && -f "${DMG_OUT}" ]]; then
-            log "DMG: ${DMG_OUT} ($(du -h "${DMG_OUT}" | cut -f1))"
-            return 0
-        fi
+    # GitHub closed actions/runner-images#7522 in 2026-01 as
+    # "working as designed" — the issue is upstream macOS, not the
+    # runner image. They explicitly recommend retries + sync as the
+    # only durable mitigation.
+    #
+    # create-dmg v1.2.3 (Nov 2025, PR#198) shipped a built-in
+    # `--hdiutil-retries N` flag that retries BOTH the create AND
+    # detach phases internally with proper sync/backoff. That's the
+    # right layer for the retry — an outer wall-clock wrapper can't
+    # call sync or wait for mds to release the file, it just kills
+    # the process and re-runs on a still-busy filesystem.
+    #
+    # We require create-dmg >= 1.2.3 (the CI workflow's
+    # `brew install create-dmg` pulls latest, and a local dev's
+    # `brew install create-dmg` from release.sh's preflight does too).
+    local _cdmg_version
+    _cdmg_version="$(create-dmg --version 2>/dev/null | awk '{print $2; exit}')"
+    if [[ -z "${_cdmg_version}" ]]; then
+        warn "create-dmg has no --version; assuming pre-1.2.3 — hdiutil hangs on Intel runners will not be retried"
+    fi
 
-        log "create-dmg attempt ${_attempt} failed; force-detaching stuck mounts"
-        # Force-detach any orphan dmg.* mount that didn't unmount cleanly.
-        local _mnt
-        for _mnt in $(mount | awk '/dmg\./{print $1}'); do
-            hdiutil detach "${_mnt}" -force 2>/dev/null || true
-        done
-        # Some create-dmg failures leak a /Volumes/dmg.* directory; clear it.
-        for _vol in /Volumes/dmg.*; do
-            [[ -d "${_vol}" ]] && hdiutil detach "${_vol}" -force 2>/dev/null || true
-        done
-
-        # On the last create-dmg retry, salvage: convert the rw image
-        # (which IS a valid DMG, it just never got the read-only
-        # compression pass) into a final UDZO image.
-        if [[ ${_attempt} -eq 3 ]]; then
-            local _rw_img
-            _rw_img=$(ls -t /tmp/rw.*."${DMG_NAME}" 2>/dev/null | head -1)
-            if [[ -n "${_rw_img}" && -f "${_rw_img}" ]]; then
-                log "salvaging rw DMG: ${_rw_img}"
-                if hdiutil convert "${_rw_img}" -format UDZO -o "${DMG_OUT}" -ov; then
-                    log "DMG: ${DMG_OUT} ($(du -h "${DMG_OUT}" | cut -f1)) [salvaged]"
-                    return 0
-                fi
-                log "salvage convert failed; falling through to plain hdiutil path"
-            fi
-        fi
-        sleep 5
+    # Best-effort cleanup of any orphan mounts from a previous failed
+    # run (rare on a fresh CI runner, common on a re-run dev box).
+    local _mnt _vol
+    for _mnt in $(mount | awk '/dmg\./{print $1}'); do
+        hdiutil detach "${_mnt}" -force 2>/dev/null || true
+    done
+    for _vol in /Volumes/dmg.*; do
+        [[ -d "${_vol}" ]] && hdiutil detach "${_vol}" -force 2>/dev/null || true
     done
 
-    # Plain fallback. `hdiutil create -srcfolder` skips the AppleScript
-    # window-layout step that's most likely to hang, at the cost of the
-    # drag-to-Applications visual. The user gets a working DMG; we'll
-    # rerun the release with a fresh runner if we want the pretty one.
+    # Flush filesystem buffers — the official GitHub workaround
+    # for the hdiutil deadlock. Cheap (~50 ms) and harmless.
+    sync; sleep 1
+
+    log "create-dmg (--hdiutil-retries 5) → ${DMG_OUT}"
+    if create-dmg \
+            --volname "Digi Setu" \
+            --window-pos 200 120 \
+            --window-size 640 400 \
+            --icon-size 128 \
+            --icon "Digi Setu.app" 180 200 \
+            --hide-extension "Digi Setu.app" \
+            --app-drop-link 460 200 \
+            --no-internet-enable \
+            --hdiutil-retries 5 \
+            "${DMG_OUT}" \
+            "${APP_PATH}"; then
+        log "DMG: ${DMG_OUT} ($(du -h "${DMG_OUT}" | cut -f1))"
+        return 0
+    fi
+
+    # Fallback. If create-dmg's own 5-retry loop still couldn't get
+    # past the busy disk, salvage the read-write image it leaves at
+    # /tmp/rw.*.dmg (that file IS already a valid disk image — it
+    # just never made it to the UDZO compression pass).
+    local _rw_img
+    _rw_img=$(ls -t /tmp/rw.*."${DMG_NAME}" 2>/dev/null | head -1)
+    if [[ -n "${_rw_img}" && -f "${_rw_img}" ]]; then
+        log "salvaging rw DMG: ${_rw_img}"
+        if hdiutil convert "${_rw_img}" -format UDZO -o "${DMG_OUT}" -ov; then
+            log "DMG: ${DMG_OUT} ($(du -h "${DMG_OUT}" | cut -f1)) [salvaged]"
+            return 0
+        fi
+    fi
+
+    # Final fallback. `hdiutil create -srcfolder` skips the
+    # AppleScript window-layout step entirely (the most hang-prone
+    # piece of create-dmg). The user gets a working installer without
+    # the drag-to-Applications visual — better than failing the whole
+    # release.
     log "create-dmg unrecoverable; building plain DMG with hdiutil"
     local _stage
     _stage=$(mktemp -d -t digi-setu-dmg.XXXXXX)
