@@ -225,13 +225,50 @@ build_frontend() {
 # ── Step 3: ensure remote layout exists (idempotent) ──────────────
 ensure_remote_dirs() {
   ssh_remote "set -e
-sudo install -d -m 0700 /opt/pi
-sudo install -d -m 0755 /opt/pi/caddy
-sudo install -d -m 0755 /opt/pi/systemd
-sudo install -d -m 0755 /opt/pi/nftables
-sudo install -d -m 0755 /opt/pi/scripts
 U=\$(id -un); G=\$(id -gn)
+
+# Reset ownership BEFORE \`install -d\` so the directory we're about
+# to mutate is one we already own. Without this leading reclaim,
+# /opt/pi can be left root-owned-mode-0700 after a previous pipeline
+# that ran as a different OS Login user (each fresh CI session
+# under a rotated/renamed service account gets its own
+# sa_<numeric>_<project> username, and chown by user X has no
+# effect on a dir Y already owns 0700). On the next deploy, every
+# scp into /opt/pi/* dies with 'dest open: Permission denied' and
+# the only visible symptom is a single failing file scp deep into
+# push_stack(). The reclaim is gated on /opt/pi already existing —
+# on a fresh VM this is a harmless no-op.
+if sudo test -d /opt/pi; then
+  sudo chown -R \"\${U}:\${G}\" /opt/pi || true
+fi
+
+# Pass -o/-g to install so a freshly-created /opt/pi is owned by
+# the CI user from the outset (saves us one chown round-trip on
+# the brand-new-VM path).
+sudo install -d -m 0700 -o \"\${U}\" -g \"\${G}\" /opt/pi
+sudo install -d -m 0755 -o \"\${U}\" -g \"\${G}\" /opt/pi/caddy
+sudo install -d -m 0755 -o \"\${U}\" -g \"\${G}\" /opt/pi/systemd
+sudo install -d -m 0755 -o \"\${U}\" -g \"\${G}\" /opt/pi/nftables
+sudo install -d -m 0755 -o \"\${U}\" -g \"\${G}\" /opt/pi/scripts
+
+# Belt-and-braces: a recursive chown in case install -d skipped a
+# pre-existing subdir (it sets mode on existing dirs but not
+# ownership when -o/-g matches the current state); also normalises
+# any stale individual files left by a prior pipeline's partial run.
 sudo chown -R \"\${U}:\${G}\" /opt/pi
+sudo find /opt/pi -type f ! -name 'stack.env*' -exec chmod u+w {} +
+
+# Fail LOUD if ownership is still wrong. Without this assertion a
+# downstream scp failure shows up as a cryptic 'dest open: Permission
+# denied' 80 lines further down the pipeline log, with no hint at
+# the actual cause. With it, you get a clear 'wrong owner' error on
+# the very next line.
+owner=\$(stat -c '%U' /opt/pi)
+if [[ \"\${owner}\" != \"\${U}\" ]]; then
+  echo \"[ensure-dirs] FATAL: /opt/pi owner '\${owner}' != ssh user '\${U}'\" >&2
+  sudo ls -la /opt/pi >&2
+  exit 70
+fi
 
 # /srv layout the pi-prepare.service later re-asserts.
 sudo install -d -m 0700 -o 0    -g 0    /srv/pi/state
