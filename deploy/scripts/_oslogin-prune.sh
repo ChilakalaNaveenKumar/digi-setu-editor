@@ -36,12 +36,28 @@
 #
 # Concurrency safety
 # ──────────────────
-# Bitbucket Pipelines runs deploy steps serially per branch, and
-# the GHA build matrix runs each runner in its own VM with its own
-# keypair → no two runners share a "current" fingerprint. The worst-
-# case race is one runner pruning a sibling runner's still-in-flight
-# key; that runner's next gcloud call simply re-adds it (gcloud is
-# idempotent on add). Net effect: at most one ssh retry.
+# The GHA macos-arm + macos-intel jobs run in PARALLEL, both
+# authenticated as the same CI service account, and each runner is
+# fresh (no ~/.ssh/google_compute_engine.pub yet). Sequential
+# Bitbucket Pipelines steps have the same problem because each
+# step is a fresh container. When two such runners hit this helper
+# in close succession:
+#   1. Runner A's gcloud adds key K_A to the OS Login profile.
+#   2. Runner B starts. Its keep_fp="" (fresh runner). It lists the
+#      profile and sees K_A, which doesn't match keep_fp → REMOVES
+#      K_A. Then its own gcloud adds K_B.
+#   3. Runner A's NEXT gcloud command tries to ssh with K_A, but
+#      K_A is no longer in the profile → "Permission denied
+#      (publickey)". Even worse, OS Login → sshd propagation is
+#      async (~10-30 s), so a runner that re-adds its own key can
+#      still hit Permission denied for a window after the add.
+#
+# Guard: only prune when the profile actually approaches the 32 KiB
+# cap. The cap fits ~60 SSH keys; we gate on PRUNE_FLOOR (default 20)
+# so day-to-day runs with a handful of keys are a hard no-op. The
+# safety value the helper provides (avoiding "Login profile size
+# exceeds 32 KiB" lockouts) is intact — we just stop churning
+# concurrent runners' keys when there's plenty of headroom.
 #
 # Locality
 # ────────
@@ -85,10 +101,25 @@ PY
     return 0
   fi
 
-  local total=0 removed=0 kept=0 failed=0
+  # Count first, prune only if we're approaching the 32 KiB cap.
+  # Override via PRUNE_FLOOR env var if you need to force aggressive
+  # cleanup (e.g. PRUNE_FLOOR=0 in a one-off recovery script).
+  local total=0
   while IFS= read -r fp; do
     [[ -z "${fp}" ]] && continue
     total=$((total + 1))
+  done <<< "${fps}"
+
+  local floor="${PRUNE_FLOOR:-20}"
+  if (( total < floor )); then
+    printf '[oslogin-prune] total=%d floor=%d — no-op (well under 32 KiB cap)\n' \
+      "${total}" "${floor}"
+    return 0
+  fi
+
+  local removed=0 kept=0 failed=0
+  while IFS= read -r fp; do
+    [[ -z "${fp}" ]] && continue
     if [[ -n "${keep_fp}" && "${fp}" == "${keep_fp}" ]]; then
       kept=$((kept + 1))
       continue
@@ -100,9 +131,15 @@ PY
     fi
   done <<< "${fps}"
 
-  if (( total > 0 )); then
-    printf '[oslogin-prune] total=%d removed=%d kept=%d failed=%d%s\n' \
-      "${total}" "${removed}" "${kept}" "${failed}" \
-      "$( [[ -n "${keep_fp}" ]] && printf ' keep_fp=%.12s…' "${keep_fp}" || printf ' (no local pubkey)' )"
+  printf '[oslogin-prune] total=%d removed=%d kept=%d failed=%d%s\n' \
+    "${total}" "${removed}" "${kept}" "${failed}" \
+    "$( [[ -n "${keep_fp}" ]] && printf ' keep_fp=%.12s…' "${keep_fp}" || printf ' (no local pubkey)' )"
+
+  # We just removed keys; OS Login → sshd propagation is async (~10-30 s).
+  # Sleep briefly so the caller's first ssh attempt doesn't race the
+  # profile update. Cheap insurance — only fires on the rare prune path,
+  # not the no-op floor branch above.
+  if (( removed > 0 )); then
+    sleep 15
   fi
 }
