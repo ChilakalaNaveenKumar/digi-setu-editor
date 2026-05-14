@@ -97,30 +97,6 @@ if [[ -n "${APPLE_SIGN_P12_BASE64:-}" ]]; then
     printf '%s' "$APPLE_SIGN_P12_BASE64" | base64 --decode > "$P12"
     chmod 600 "$P12"
 
-    # ── DIAGNOSTIC (remove once .p12 import is reliable) ───────────
-    # Lets us compare the bytes the runner sees against the bytes we
-    # uploaded from a developer laptop (sha256 + size). Also tries
-    # openssl pkcs12 as a parallel validator: if openssl can parse the
-    # file but `security import` can't, the issue is Apple-specific
-    # (cipher / curve / key-usage); if openssl ALSO chokes, the file
-    # itself is corrupt or the password mismatches.
-    echo "::group::p12 diagnostic"
-    echo "APPLE_SIGN_P12_BASE64 length (chars): ${#APPLE_SIGN_P12_BASE64}"
-    echo "APPLE_SIGN_P12_PASSWORD length (chars): ${#APPLE_SIGN_P12_PASSWORD}"
-    echo "decoded p12 size (bytes): $(wc -c <"$P12" | tr -d ' ')"
-    echo "decoded p12 sha256: $(shasum -a 256 "$P12" | awk '{print $1}')"
-    echo "decoded p12 file(1): $(file "$P12")"
-    echo "first 64 hex bytes of decoded p12:"
-    xxd -l 64 "$P12" || head -c 64 "$P12" | xxd
-    echo "openssl pkcs12 parse attempt:"
-    if /usr/bin/openssl pkcs12 -in "$P12" -passin "pass:$APPLE_SIGN_P12_PASSWORD" -nokeys -info -noout 2>&1; then
-        echo "openssl: OK"
-    else
-        echo "openssl: FAILED"
-    fi
-    echo "::endgroup::"
-    # ── /DIAGNOSTIC ───────────────────────────────────────────────
-
     security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
     # 21600 s = 6 h. Generous enough for any single CI job; auto-locks
     # afterwards so a runner that hangs around doesn't expose the key.
@@ -128,9 +104,15 @@ if [[ -n "${APPLE_SIGN_P12_BASE64:-}" ]]; then
     security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
 
     # `-T /usr/bin/codesign` lets codesign use the imported key without
-    # prompting for keychain access. Required for non-interactive CI.
+    # prompting. `-A` ALSO lets every other tool — notably `security
+    # find-identity` itself — read the cert/key. Without -A, the
+    # access-control list on the imported key restricts read access
+    # to codesign only, so `find-identity` reports 0 identities even
+    # though the key + cert ARE in the keychain. We're in an
+    # ephemeral, single-job-scoped keychain with no other secrets,
+    # so "allow any" carries zero practical risk.
     security import "$P12" -k "$KEYCHAIN" -P "$APPLE_SIGN_P12_PASSWORD" \
-        -T /usr/bin/codesign
+        -T /usr/bin/codesign -A
 
     # Required on macOS 10.12+ — without this, codesign hits a
     # "User Interaction Is Not Allowed" UI prompt the first time it
@@ -146,34 +128,20 @@ if [[ -n "${APPLE_SIGN_P12_BASE64:-}" ]]; then
     security list-keychains -d user -s "$KEYCHAIN" $existing
     security default-keychain -s "$KEYCHAIN"
 
-    # ── DIAGNOSTIC: dump everything we can see in the keychain ─────
-    echo "::group::keychain inventory"
-    echo "[all certs in build keychain]"
-    security find-certificate -a "$KEYCHAIN" 2>&1 | grep -E '"alis"|"labl"' | head -40 || true
-    echo
-    echo "[identities, ALL — no -v filter]"
-    security find-identity -p codesigning "$KEYCHAIN" 2>&1 || true
-    echo
-    echo "[identities, VALID-ONLY — -v filter]"
-    security find-identity -v -p codesigning "$KEYCHAIN" 2>&1 || true
-    echo
-    echo "[identities, ALL keychains in search list]"
-    security find-identity -p codesigning 2>&1 || true
-    echo "::endgroup::"
-    # ── /DIAGNOSTIC ───────────────────────────────────────────────
-
-    # Use ALL keychains (not just our build keychain) so cert chain
-    # validation can reach Apple's intermediate + root certs that
-    # ship in the runner's System.keychain. Drop the -v filter
-    # because GHA hosted runners often fail OCSP/CRL revocation
-    # checks (network policy) and would mark the cert "invalid" even
-    # though codesign itself will accept it (codesign re-runs its
-    # own chain validation at sign time using cached/offline trust).
-    identity="$(security find-identity -p codesigning "$KEYCHAIN" \
+    # Search across ALL keychains in the user search list (we put our
+    # build keychain at the front a few lines above), NOT just the
+    # build keychain in isolation. find-identity with an explicit
+    # `$KEYCHAIN` arg restricts cert-chain validation to just that
+    # keychain, and on GHA hosted runners the chain validator wants
+    # to reach Apple's trust roots in other keychains — even with
+    # the intermediate present in the build keychain, the explicit-
+    # keychain query reports 0 identities. Searching across the
+    # search list gives the validator everything it needs.
+    identity="$(security find-identity -p codesigning \
         | awk -F'"' '/Developer ID Application/{print $2; exit}')"
 
     if [[ -z "$identity" ]]; then
-        echo "::error::no Developer ID Application identity found in imported .p12"
+        echo "::error::no Developer ID Application identity found"
         echo "[full identity dump for debugging]" >&2
         security find-identity -p codesigning "$KEYCHAIN" >&2
         security find-identity -p codesigning >&2
