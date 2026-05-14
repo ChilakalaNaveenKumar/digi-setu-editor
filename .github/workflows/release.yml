@@ -418,16 +418,48 @@ jobs:
 
       - name: Build x86_64 sidecar under Rosetta
         run: |
+          # Every step of the venv lifecycle must run as x86_64. If only
+          # PyInstaller runs under `arch -x86_64` (as we did before), the
+          # venv was created with the default ARM Python and pip pulled
+          # ARM wheels for every native dep (pydantic_core, _cffi_backend,
+          # numpy, PIL, pandas, lxml, …). PyInstaller then crashes loading
+          # each one with "mach-o file, but is an incompatible architecture
+          # (have 'arm64', need 'x86_64')". setup-python@v5 installs
+          # python.org's universal2 build at /Library/Frameworks/…, so
+          # `arch -x86_64 python3` runs the SAME binary in x86_64 mode and
+          # pip sees platform.machine() == 'x86_64' → fetches x86_64 wheels.
+          #
+          # Hard-reset .venv so a previous job's cached ARM wheels can't
+          # contaminate this build. Cheap (CI cache key is keyed off
+          # requirements.txt + pyinstaller version, not the venv tree).
           cd desktop/backend
-          python3 -m venv .venv
+          rm -rf .venv
+          arch -x86_64 python3 -m venv .venv
           source .venv/bin/activate
-          pip install --quiet --disable-pip-version-check -r requirements.txt
-          pip install --quiet "pyinstaller>=6.10,<7"
+          arch -x86_64 python -m pip install --quiet --upgrade pip
+          arch -x86_64 python -m pip install --quiet --disable-pip-version-check -r requirements.txt
+          arch -x86_64 python -m pip install --quiet "pyinstaller>=6.10,<7"
+
+          # Sanity check: a native wheel must dlopen() as x86_64 INSIDE the
+          # venv under Rosetta. If it doesn't, fail loud HERE with a clear
+          # message instead of letting PyInstaller crash with a 200-line
+          # traceback 30 seconds later.
+          arch -x86_64 python -c "import pydantic_core, _cffi_backend, numpy; print('venv wheels load OK as x86_64')"
+
           cd ../sidecar
-          # Run PyInstaller under Rosetta so the frozen binary is x86_64
           arch -x86_64 python -m PyInstaller --clean --noconfirm pyinstaller.spec
-          # Tauri expects the platform-suffixed name
+
           DIST="$(pwd)/dist"
+          # Verify the frozen binary really is x86_64-only (or universal
+          # incl. x86_64). lipo -info exits non-zero if the file isn't a
+          # mach-o, which is also a failure we want to surface here.
+          lipo -info "$DIST/pi-typst-sidecar"
+          if ! lipo -info "$DIST/pi-typst-sidecar" | grep -qE '(x86_64|i386)'; then
+            echo "::error::sidecar binary is not x86_64 — Rosetta venv path is broken"
+            exit 1
+          fi
+
+          # Tauri's externalBin config picks up `pi-typst-sidecar-<target-triple>`.
           cp "$DIST/pi-typst-sidecar" "$DIST/pi-typst-sidecar-x86_64-apple-darwin"
 
       - name: Build x86_64 DMG (release.sh --mac --local-env --no-upload --skip-sidecar)
