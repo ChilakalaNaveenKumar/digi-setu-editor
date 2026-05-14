@@ -97,6 +97,30 @@ if [[ -n "${APPLE_SIGN_P12_BASE64:-}" ]]; then
     printf '%s' "$APPLE_SIGN_P12_BASE64" | base64 --decode > "$P12"
     chmod 600 "$P12"
 
+    # ── DIAGNOSTIC (remove once .p12 import is reliable) ───────────
+    # Lets us compare the bytes the runner sees against the bytes we
+    # uploaded from a developer laptop (sha256 + size). Also tries
+    # openssl pkcs12 as a parallel validator: if openssl can parse the
+    # file but `security import` can't, the issue is Apple-specific
+    # (cipher / curve / key-usage); if openssl ALSO chokes, the file
+    # itself is corrupt or the password mismatches.
+    echo "::group::p12 diagnostic"
+    echo "APPLE_SIGN_P12_BASE64 length (chars): ${#APPLE_SIGN_P12_BASE64}"
+    echo "APPLE_SIGN_P12_PASSWORD length (chars): ${#APPLE_SIGN_P12_PASSWORD}"
+    echo "decoded p12 size (bytes): $(wc -c <"$P12" | tr -d ' ')"
+    echo "decoded p12 sha256: $(shasum -a 256 "$P12" | awk '{print $1}')"
+    echo "decoded p12 file(1): $(file "$P12")"
+    echo "first 64 hex bytes of decoded p12:"
+    xxd -l 64 "$P12" || head -c 64 "$P12" | xxd
+    echo "openssl pkcs12 parse attempt:"
+    if /usr/bin/openssl pkcs12 -in "$P12" -passin "pass:$APPLE_SIGN_P12_PASSWORD" -nokeys -info -noout 2>&1; then
+        echo "openssl: OK"
+    else
+        echo "openssl: FAILED"
+    fi
+    echo "::endgroup::"
+    # ── /DIAGNOSTIC ───────────────────────────────────────────────
+
     security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
     # 21600 s = 6 h. Generous enough for any single CI job; auto-locks
     # afterwards so a runner that hangs around doesn't expose the key.
