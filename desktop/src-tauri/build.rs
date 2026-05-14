@@ -131,11 +131,11 @@ fn main() {
                         the desktop only needs the publishable key (recommended).\n\
                       • Use a Clerk *test* secret (sk_test_…) for desktop builds and \n\
                         keep prod auth cloud-only.\n\
-                      • For an internal/test build only, set \n\
-                        DIGI_SETU_ALLOW_EMBED_LIVE_SECRET=1 to acknowledge the risk \n\
-                        and bypass this guard. NEVER set this in a public-release \n\
-                        pipeline.\n\n\
-                    See SECURITY-RELEASE.md for the full migration plan.\n\n"
+                      • For an internal/early-access build, set \n\
+                        DIGI_SETU_ALLOW_EMBED_LIVE_SECRET=1 to acknowledge the \n\
+                        risk and bypass this guard. The CI workflow sets it at \n\
+                        env-block scope; do the same locally only when you \n\
+                        intentionally want a live-tenant build.\n\n"
                 );
             }
         }

@@ -103,6 +103,38 @@ on:
 env:
   APP_VERSION: 0.1.0   # Keep in sync with tauri.conf.json + Download.vue
 
+  # Opt-in to the build.rs live-secret guard's escape hatch.
+  #
+  # Why: digi-setu is shipped as a thick desktop client. The Clerk Vue
+  # SDK on the renderer side AND the FastAPI sidecar both need a
+  # working Clerk client; the sidecar in particular calls
+  # clerk_backend_api.Clerk(bearer_auth=CLERK_SECRET_KEY) to verify
+  # session JWTs, fetch user emails, mint desktop-bridge tickets, etc.
+  # Until that server-side surface moves to a cloud worker that owns
+  # the secret, the desktop binary has to embed CLERK_SECRET_KEY_PROD
+  # to keep prod-tenant auth working end-to-end.
+  #
+  # Risk acknowledged: anyone with the .app/.exe can `strings` the
+  # binary and recover the live secret. Mitigation discipline:
+  #   1. Treat every released DMG/EXE as if the secret has been
+  #      published — i.e. the secret IS public the moment a build
+  #      hits a public URL. Distribution lists must be controlled
+  #      (early-access waitlist, signed downloads, etc.) until the
+  #      cloud-side migration lands.
+  #   2. If a leak is suspected, immediately rotate
+  #      CLERK_SECRET_KEY_PROD in the Clerk dashboard, regenerate
+  #      this repo secret, and ship a new release. All older DMGs
+  #      become useless against the rotated key.
+  #   3. Migration target: move JWT verify + session refresh +
+  #      user fetch out of desktop/backend/services/auth.py and
+  #      desktop/backend/routes/desktop_auth.py into a cloud worker.
+  #      Once the desktop only needs pk_live_, delete this env var.
+  #
+  # Set to "0" or remove to re-enable the guard once the migration
+  # ships. The guard panic message in desktop/src-tauri/build.rs
+  # restates the same context for anyone hitting it locally.
+  DIGI_SETU_ALLOW_EMBED_LIVE_SECRET: "1"
+
 jobs:
   windows:
     runs-on: windows-latest
