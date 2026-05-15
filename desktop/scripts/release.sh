@@ -404,7 +404,6 @@ sign_app_mac() {
         log "signing with Developer ID identity: ${identity}"
         local sign_args=(
             --force
-            --deep
             --options runtime
             --timestamp
             --sign "${identity}"
@@ -414,6 +413,32 @@ sign_app_mac() {
         else
             warn "no Entitlements.plist at ${entitlements}; the .app will fail notarization (V8/dyld blocked by Hardened Runtime)"
         fi
+
+        # `codesign --deep` recurses into Frameworks/, MacOS/, Plugins/,
+        # Helpers/ — but NOT arbitrary files in Resources/. Tauri places
+        # our PyInstaller sidecar at
+        #   Contents/Resources/sidecar/dist/pi-typst-sidecar-<triple>
+        # plus ~50 .dylib/.so files PyInstaller carries (cryptography,
+        # pydantic_core, lxml, …). All of these need to be signed
+        # individually with Developer ID + Hardened Runtime + secure
+        # timestamp + entitlements, or Apple notary rejects the bundle
+        # with "binary is not signed with a valid Developer ID
+        # certificate". Apple's recommended order is inner-out: sign
+        # every nested Mach-O first, then sign the outer .app.
+        log "signing nested Mach-O binaries inside ${APP_PATH##*/}"
+        local nested signed=0
+        while IFS= read -r -d '' nested; do
+            # `file` is the cheapest way to detect Mach-O (executables
+            # AND dylibs). Skip text/binary plists, icons, scripts,
+            # JSON, etc.
+            if file -b "${nested}" 2>/dev/null | grep -qE '^Mach-O'; then
+                codesign "${sign_args[@]}" "${nested}"
+                signed=$((signed + 1))
+            fi
+        done < <(find "${APP_PATH}/Contents" -type f -print0)
+        log "signed ${signed} nested Mach-O binaries"
+
+        log "signing outer ${APP_PATH##*/}"
         codesign "${sign_args[@]}" "${APP_PATH}"
     else
         log "no APPLE_SIGNING_IDENTITY set; falling back to ad-hoc signature"

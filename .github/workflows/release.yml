@@ -251,11 +251,27 @@ jobs:
           GCP_VM:      ${{ secrets.GCP_VM      || 'digi-setu-live' }}
           GCP_ZONE:    ${{ secrets.GCP_ZONE    || 'us-central1-a' }}
         run: |
+          # On Windows runners, gcloud's plink wrapper sometimes exits
+          # 127 ("command not found") AFTER a successful upload — the
+          # SHA-verified file is on the VM, the public URL is printed,
+          # then plink dies during cleanup with a stale "Store key in
+          # cache?" prompt. Treat "[upload] OK — sha256 matches" + a
+          # "Public URL:" line as truth-of-success regardless of the
+          # wrapper's exit code, so the workflow doesn't fail on a
+          # post-upload teardown glitch.
           for f in "$RUNNER_TEMP/Digi-Setu-${APP_VERSION}-x64-setup.exe" "$RUNNER_TEMP/Digi-Setu-${APP_VERSION}-x64.msi"; do
-            if [[ -f "$f" ]]; then
-              bash deploy/scripts/upload-installer.sh "$f"
-            else
+            if [[ ! -f "$f" ]]; then
               echo "::warning::missing artefact: $f"
+              continue
+            fi
+            log_file="$RUNNER_TEMP/upload-$(basename "$f").log"
+            up_rc=0
+            bash deploy/scripts/upload-installer.sh "$f" 2>&1 | tee "$log_file" || up_rc=$?
+            if grep -q '\[upload\] OK' "$log_file" && grep -q '^Public URL:' "$log_file"; then
+              echo "::notice::upload of $(basename "$f") confirmed (sha256 matched on VM); ignoring teardown rc=${up_rc}"
+            else
+              echo "::error::upload of $(basename "$f") failed (rc=${up_rc})"
+              exit "${up_rc:-1}"
             fi
           done
 
