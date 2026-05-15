@@ -65,8 +65,8 @@ async def set_permission_mode(
     payload: PermissionModeUpdate,
     user_id: str = Depends(require_user),
 ) -> dict[str, Any]:
-    # Accept canonical IDs (auto / ask / cautious) AND legacy aliases
-    # (approve_risky / approve_all). Anything else is a 400 so the
+    # Accept canonical IDs (auto / approve_all / manual) AND legacy
+    # aliases (ask, cautious, approve_risky). Anything else is a 400 so the
     # frontend learns its picker drifted from the backend after a
     # deploy.
     canonical = normalize_permission_mode(payload.mode)

@@ -430,16 +430,29 @@ async def post_prompt(
     if rt._pi is None and not rl.try_take(user_id, "pi.spawn"):  # noqa: SLF001
         raise HTTPException(status_code=429, detail=bridge_error("rate_limit"))
 
+    # Probe the user's machine + seed `.digi-setu/AGENTS.md` + the
+    # `compile-loop` skill on first prompt per workspace (or whenever
+    # AGENTS.md is older than a week). Fire-and-forget on errors —
+    # missing skills should never block a chat.
+    try:
+        from services import skills as _skills
+
+        await _skills.ensure_workspace_skills(Path(rt.workspace_path))
+        prefix = _skills.assemble_turn_prefix(Path(rt.workspace_path), body.message)
+    except Exception as exc:  # pragma: no cover — defensive
+        print(f"[chat_sse] skill prep failed: {exc}", file=sys.stderr)
+        prefix = ""
+
+    augmented_message = (prefix + body.message) if prefix else body.message
+
     # Auto-title the chat from the first user prompt. Idempotent across
     # subsequent prompts in the same runtime — see `_kick_title_flow`
-    # for the matrix. Runs BEFORE send_prompt so the heuristic title
-    # is in the registry the moment the prompt round-trips, and so the
-    # `_session_titled` envelope is queued before any agent_start
-    # event from pi (UI stores can rely on the order).
+    # for the matrix. Title generation reads the raw user text, not the
+    # skill-augmented one.
     _kick_title_flow(rt, body.message)
 
     try:
-        request_id = await rt.send_prompt(body.message, request_id=body.request_id)
+        request_id = await rt.send_prompt(augmented_message, request_id=body.request_id)
     except RuntimeError as exc:
         # session runtime closed mid-flight (raced with reaper)
         log_error(

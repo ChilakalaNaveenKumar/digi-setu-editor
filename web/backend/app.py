@@ -78,6 +78,7 @@ from routes import (
     typst_docs,
     prefs,
     sessions,
+    skills as skills_route,
     snapshots,
     usage,
     workspaces,
@@ -301,6 +302,7 @@ def create_app() -> FastAPI:
     app.include_router(models_route.router)
     app.include_router(billing.router)
     app.include_router(prefs.router)
+    app.include_router(skills_route.router)
 
     return app
 

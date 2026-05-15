@@ -13,14 +13,19 @@
  * chokepoint for outgoing decisions.
  *
  * Permission modes (canonical IDs):
- *   auto      Run every tool without asking; audit log records all.
- *   ask       Ask before bash / write / edit / process. Reads silent.
- *             (Default — matches Cursor / Cline / Claude Code default.)
- *   cautious  Ask before every tool call, including reads.
+ *   auto         Prompt for risky tools (bash, write, edit, process);
+ *                auto-approve after 15s if no click. Reads silent.
+ *                DEFAULT — visible audit trail without the blocked-
+ *                modal failure mode.
+ *   approve_all  No prompt at all, every tool runs instantly.
+ *   manual       Prompt + wait forever for an explicit click. Never
+ *                auto-approves. UI label "Ask each time".
  *
- * Legacy IDs (`approve_risky` ≡ `ask`, `approve_all` ≡ `cautious`)
- * are accepted on input and remapped in the backend's user_prefs
- * service so a stale prefs.json keeps working through the upgrade.
+ * Legacy IDs (`ask` → `auto`, `cautious` → `manual`, `approve_risky`
+ * → `auto`) are remapped here AND in the backend's user_prefs service,
+ * so a stale prefs.json / live mode file keeps working through the
+ * upgrade. We map to the same or stricter security level — never
+ * looser.
  */
 
 import { defineStore } from "pinia";
@@ -32,21 +37,25 @@ export type PermissionDecision =
   | "deny_once"
   | "deny_session";
 
-export type PermissionMode = "auto" | "ask" | "cautious";
+export type PermissionMode = "auto" | "approve_all" | "manual";
 
 /** Map any legacy mode ID we receive over the wire to the canonical one. */
 export function normalizeMode(raw: string): PermissionMode {
   switch (raw) {
     case "auto":
-    case "ask":
-    case "cautious":
-      return raw;
-    case "approve_risky":
-      return "ask";
     case "approve_all":
-      return "cautious";
+    case "manual":
+      return raw;
+    // Previous canonical names (auto / ask / cautious era):
+    case "ask":
+      return "auto"; // same prompt+15s behaviour
+    case "cautious":
+      return "manual"; // strictest → strictest
+    // Even older 2-mode aliases:
+    case "approve_risky":
+      return "auto";
     default:
-      return "ask";
+      return "auto";
   }
 }
 
@@ -70,7 +79,7 @@ export interface PermissionRequest {
 
 export const usePermissionsStore = defineStore("permissions", () => {
   const queue = ref<PermissionRequest[]>([]);
-  const sessionMode = ref<PermissionMode>("ask");
+  const sessionMode = ref<PermissionMode>("auto");
 
   const current = computed<PermissionRequest | null>(
     () => queue.value[0] ?? null,

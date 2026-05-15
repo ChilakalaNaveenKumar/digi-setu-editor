@@ -116,17 +116,17 @@
     "appliesToChat": "Applies to {bold} from the next tool call onward.",
     "thisChat": "this chat",
     "mode": {
+      "approve_all": {
+        "label": "Approve all",
+        "blurb": "No prompts — every tool runs instantly. Audit log still records every action."
+      },
       "auto": {
         "label": "Auto",
-        "blurb": "Run every tool without asking. Every action is still recorded in the audit log."
+        "blurb": "Prompt for shell commands, file edits, and background processes. Auto-approve after 15s if you don't click. Reads pass silently."
       },
-      "ask": {
-        "label": "Ask",
-        "blurb": "Ask before shell commands, file edits, and background processes. Reads pass silently."
-      },
-      "cautious": {
-        "label": "Cautious",
-        "blurb": "Ask before every tool call, including reads and searches. Most cautious."
+      "manual": {
+        "label": "Ask each time",
+        "blurb": "Prompt for risky tools and wait for your click — no timeout, no auto-approval."
       }
     },
     "prompt": {

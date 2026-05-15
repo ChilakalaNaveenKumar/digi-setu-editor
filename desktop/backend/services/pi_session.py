@@ -410,7 +410,7 @@ class PiSession:
         provider: Optional[str] = None,
         model: Optional[str] = None,
         session_dir: Optional[Path] = None,
-        permission_mode: str = "ask",
+        permission_mode: str = "auto",
         permission_mode_file: Optional[Path] = None,
         user_id: Optional[str] = None,
         use_cloud_relay: bool = False,
@@ -452,10 +452,10 @@ class PiSession:
         self._provider = provider or full_env.get("PI_PROVIDER", "anthropic-vertex")
         self._model = model or full_env.get("PI_MODEL", "claude-sonnet-4-6")
 
-        # Accept canonical IDs (auto / ask / cautious) AND legacy
-        # aliases (approve_risky / approve_all) so a stale spawn from
-        # an older client doesn't blow up; user_prefs.normalize_-
-        # permission_mode is the single source of truth for the mapping.
+        # Accept canonical IDs (auto / approve_all / manual) AND
+        # legacy aliases (ask, cautious, approve_risky) so a stale
+        # spawn from an older client doesn't blow up; user_prefs.
+        # normalize_permission_mode is the single source of truth.
         try:
             from services.user_prefs import normalize_permission_mode  # local import to avoid cycle
         except Exception:  # noqa: BLE001
@@ -463,13 +463,13 @@ class PiSession:
         cleaned: Optional[str] = None
         if normalize_permission_mode is not None:
             cleaned = normalize_permission_mode(permission_mode or "")
-        self._permission_mode = cleaned or "ask"
+        self._permission_mode = cleaned or "auto"
 
         # Materialise the permission_mode_file with mode 0644 so the
         # container's sandbox uid (1000) can read it via the bind mount.
-        # The mode token itself ("auto" / "ask" / "cautious") is not a
-        # secret — it's a UI preference — so widening read perms does
-        # not leak anything sensitive.
+        # The mode token itself ("auto" / "approve_all" / "manual") is
+        # not a secret — it's a UI preference — so widening read perms
+        # does not leak anything sensitive.
         self._permission_mode_file_host: Optional[Path] = None
         if permission_mode_file is not None:
             try:
@@ -913,17 +913,42 @@ class PiSession:
             env["NODE_PATH"] = str(_pi_dir / "node_modules")
             return cmd, str(self.workspace_path), env
 
+        # Dev fallback: extensions live in the repo's `extensions/` folder,
+        # not inside the user-picked workspace. Resolve them as ABSOLUTE
+        # paths off this file's location so pi finds them no matter which
+        # folder the user opens. The old relative-path version
+        # (`./extensions/typst-tools.ts`) resolved against pi's cwd (the
+        # workspace) and crashed with "Extension path does not exist".
+        from pathlib import Path as _Path
+        _repo_root = _Path(__file__).resolve().parent.parent.parent.parent
+        _dev_ext_typst = _repo_root / "extensions" / "typst-tools.ts"
+        _dev_ext_perm = _repo_root / "extensions" / "permission.ts"
+        # Also locate the dev APPEND_SYSTEM.md (the slim base prompt) so
+        # the prompt is loaded in dev exactly like the bundled binary
+        # would inject it. Without this dev-loop runs with whatever
+        # defaults pi has built-in, which deviates from prod.
+        _dev_append_md = (
+            _Path(__file__).resolve().parent.parent / ".pi" / "APPEND_SYSTEM.md"
+        )
         cmd = [
             "pi",
             "--mode", "rpc",
             "--provider", self._provider,
             "--model", self._model,
             "--session-dir", str(self.session_dir),
-            # See the docker-mode `--continue` rationale above.
             "--continue",
-            "--extension", "./extensions/typst-tools.ts",
-            "--extension", "./extensions/permission.ts",
         ]
+        if _dev_ext_typst.exists():
+            cmd += ["--extension", str(_dev_ext_typst)]
+        if _dev_ext_perm.exists():
+            cmd += ["--extension", str(_dev_ext_perm)]
+        if _dev_append_md.exists():
+            try:
+                _txt = _dev_append_md.read_text(encoding="utf-8")
+                if _txt.strip():
+                    cmd += ["--append-system-prompt", _txt]
+            except OSError:
+                pass
         return cmd, str(self.workspace_path), env
 
     async def close(self) -> None:

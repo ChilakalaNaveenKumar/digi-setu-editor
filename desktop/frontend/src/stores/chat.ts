@@ -480,7 +480,7 @@ export const useChatStore = defineStore("chat", () => {
     if (evt.type === "permission_request") {
       const id = String(evt.id ?? "");
       const tool = String(evt.tool ?? "tool");
-      const mode = (typeof evt.mode === "string" ? evt.mode : "ask") as PermissionMode;
+      const mode = (typeof evt.mode === "string" ? evt.mode : "auto") as PermissionMode;
       if (!id) return;
       usePermissionsStore().enqueue({
         id,

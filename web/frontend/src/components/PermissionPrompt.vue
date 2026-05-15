@@ -64,10 +64,16 @@ const expanded = ref(false);
 // ─── Auto-allow countdown ────────────────────────────────────────
 //
 // Keep this in sync with TIMEOUT_MS in extensions/permission.ts —
-// the frontend fires its allow_once a comfortable margin BEFORE the
-// backend safety-net would (currently FE=30s, BE=60s). Update both
-// sides if either changes.
-const AUTO_ALLOW_SECONDS = 30;
+// the frontend fires its allow_once a hair BEFORE the backend
+// safety-net would so the visible countdown matches the action.
+// Currently both sides are 15s (the spec users locked in 2026-05).
+// Update both if either changes.
+//
+// The countdown is SKIPPED entirely when the active request's mode
+// is `manual` ("Ask each time") — that mode's whole point is to
+// wait forever for an explicit click, so the modal stays open with
+// no ticker and no auto-allow.
+const AUTO_ALLOW_SECONDS = 15;
 
 // Seconds remaining for the current prompt. -1 sentinel = no active
 // countdown (no current prompt / paused / fired). 0 = about to fire.
@@ -85,6 +91,15 @@ function stopTimer(): void {
 
 function startTimer(): void {
   stopTimer();
+  // `manual` ("Ask each time") deliberately has no timeout — the
+  // agent waits for an explicit click no matter how long it takes.
+  // We park `secondsLeft` at the -1 sentinel so the countdown chip
+  // stays hidden and no auto-allow fires.
+  const mode = current.value?.mode;
+  if (mode === "manual") {
+    secondsLeft.value = -1;
+    return;
+  }
   secondsLeft.value = AUTO_ALLOW_SECONDS;
   tickHandle = window.setInterval(() => {
     // Pause while expanded or while the tab is hidden — both are
@@ -159,7 +174,7 @@ function toolIcon(tool: string): string {
 }
 
 /** Render the permission-mode chip label for any mode ID — accepts
- *  canonical IDs (auto / ask / cautious) AND legacy aliases. */
+ *  canonical IDs (auto / approve_all / manual) AND legacy aliases. */
 function modeChip(mode: string): string {
   const canonical = normalizeMode(mode);
   return t(`permission.mode.${canonical}.label`);

@@ -75,6 +75,7 @@ from routes import (
     models as models_route,
     prefs,
     sessions,
+    skills as skills_route,
     snapshots,
     usage,
     workspaces,
@@ -223,6 +224,7 @@ def create_app() -> FastAPI:
     app.include_router(models_route.router)
     app.include_router(billing.router)
     app.include_router(prefs.router)
+    app.include_router(skills_route.router)
     # Localhost LLM proxy — JWT-injecting forwarder for non-BYOK
     # signed-in users running pi locally. Targets the cloud relay at
     # ${PI_CLOUD_API_BASE}/v1/relay/* (see web/backend/routes/llm_relay.py).

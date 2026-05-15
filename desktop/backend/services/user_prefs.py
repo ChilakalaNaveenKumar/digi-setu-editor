@@ -2,46 +2,30 @@
 Per-user UI preferences.
 
 Tiny key/value store for things that aren't billing or auth — currently
-the permission_mode (auto / ask / cautious) and a few desktop-specific
-prefs (per-workspace last-used model, BYOK vs Cloud routing default).
-Designed so we can drop in more (theme, default model, default thinking
-level, etc.) without churning the API surface.
+the permission_mode (auto / approve_all / manual) and a few desktop-
+specific prefs (per-workspace last-used model, BYOK vs Cloud routing
+default). Designed so we can drop in more (theme, default model,
+default thinking level, etc.) without churning the API surface.
 
-Persistence is plain JSON at web/data/user_prefs.json. We chose flat
+Persistence is plain JSON at ~/.digi-setu/user_prefs.json. We chose flat
 JSON over SQLite because:
   - the dataset is tiny (one row per user, ~64 bytes)
   - it survives restarts without a migration story
   - it's trivial to inspect and bulk-edit during development
 
-If/when this hits ~10k users we'll move it into the same SQLite store
-the CreditLedger eventually wants.
-
 Permission-mode IDs (canonical → user-facing label):
-    auto       → "Auto"      Run every tool without asking; audit log
-                              records every action.
-    ask        → "Ask"       Ask before bash / write / edit / process.
-                              Reads pass silently. (Default.)
-    cautious   → "Cautious"  Ask before every tool call, including
-                              reads.
+    auto         → "Auto"          Prompt for risky tools (bash, write,
+                                    edit, process); auto-approve after 15s
+                                    if no click. Reads silent. (Default.)
+    approve_all  → "Approve all"   No prompt, every tool runs instantly.
+    manual       → "Ask each time" Prompt + wait forever for an explicit
+                                    click; never auto-approve.
 
-Legacy IDs ("approve_risky" ≡ "ask", "approve_all" ≡ "cautious") are
-accepted on read and silently rewritten to the canonical form on the
-first save — so a stale prefs.json keeps working through the upgrade
-without manual intervention.
-
-Default for the desktop app is `ask` for every plan, paired with the
-auto-allow safety net (30s visible countdown in the modal + 60s hard
-timeout server-side, both resolving to ALLOW). The brief stint at
-`auto` removed the silent-stall failure mode but also removed the
-speed bump for first-time users — they had no idea what tool calls
-the agent was running until the side-effects landed. `ask` puts a
-face on every bash / write / edit / process call without sacrificing
-the safety net: the modal auto-resolves to ALLOW after thirty
-seconds whether the user sees it or not, so the previous "prompt
-invisible AND wait forever" failure mode is impossible. Users who do
-want full silence can flip to `auto` from the chat settings menu;
-users who want to gate every read can flip to `cautious`. This
-matches the web product (see web/backend/services/user_prefs.py).
+Migration on read: see the same docstring in
+web/backend/services/user_prefs.py (this file mirrors it 1:1). The
+desktop copy lives separately because the desktop ships as a self-
+contained bundle and we don't want a runtime import across the two
+products.
 """
 
 from __future__ import annotations
@@ -66,14 +50,17 @@ PREFS_PATH = DATA_ROOT / "user_prefs.json"
 _USERS_DIR = DATA_ROOT / "users"
 
 # Canonical permission-mode IDs the rest of the codebase should use.
-VALID_PERMISSION_MODES = ("auto", "ask", "cautious")
+# Ordered least-restrictive → most-restrictive to match the picker
+# layout (relaxed at the top).
+VALID_PERMISSION_MODES = ("approve_all", "auto", "manual")
 
-# Legacy aliases. These appeared in earlier builds; we map them to the
-# canonical IDs on read (and rewrite on next save). Update this dict if
-# we ever need another rename — never expand the canonical tuple.
+# Legacy aliases — see web/backend/services/user_prefs.py for full
+# rationale. Maps stale IDs to the modern canonical set, always at
+# the same security level or stricter.
 _LEGACY_PERMISSION_ALIASES = {
-    "approve_risky": "ask",
-    "approve_all": "cautious",
+    "ask": "auto",         # old ask was prompt-risky+15s = new auto
+    "cautious": "manual",  # old cautious was prompt-all = stricter, map to manual
+    "approve_risky": "auto",
 }
 
 
@@ -89,16 +76,13 @@ def normalize_permission_mode(raw: str) -> Optional[str]:
     return _LEGACY_PERMISSION_ALIASES.get(cleaned)
 
 
-# Default first-launch posture for the desktop app. Matches the web
-# product: every new user starts at `auto` so the first bash call
-# doesn't stall behind a "do you want to allow this?" modal that
-# unfamiliar users misread as a hang. Users who want the safety bump
-# can pick `ask` or `cautious` from the chat settings menu. Override
-# with PI_PERMISSION_MODE_DEFAULT (e.g. `ask`) for a build that wants
-# the old posture without a code change.
+# Default first-launch posture for the desktop app: `auto`. The agent
+# prompts for risky tools and auto-approves after 15s if no click —
+# visible audit trail without the blocked-modal failure mode. Override
+# with PI_PERMISSION_MODE_DEFAULT for an alternate build default.
 _DEFAULT_FROM_ENV = os.environ.get("PI_PERMISSION_MODE_DEFAULT", "").strip().lower()
 _DEFAULT_NORMALISED = normalize_permission_mode(_DEFAULT_FROM_ENV)
-DEFAULT_PERMISSION_MODE = _DEFAULT_NORMALISED if _DEFAULT_NORMALISED else "ask"
+DEFAULT_PERMISSION_MODE = _DEFAULT_NORMALISED if _DEFAULT_NORMALISED else "auto"
 
 # user_id from Clerk looks like "user_2abcXYZ..."; in dev we sometimes
 # pass "anon" or an email. Restrict to filesystem-safe chars to avoid
@@ -109,14 +93,15 @@ _SAFE_USER_ID = re.compile(r"[^A-Za-z0-9._-]")
 def _sanitize_user_id(user_id: str) -> str:
     return _SAFE_USER_ID.sub("_", user_id)[:128]
 
-# Plan tiers that get the lighter-touch default. Anything not listed falls
-# back to DEFAULT_PERMISSION_MODE.
-_AUTO_MODE_PLANS = frozenset({"pro", "enterprise"})
+# Plan-based default override hook (currently unused; see web copy).
+_PLAN_DEFAULTS: dict[str, str] = {}
 
 
 def _default_for_plan(plan_id: Optional[str]) -> str:
-    if plan_id and plan_id.lower() in _AUTO_MODE_PLANS:
-        return "auto"
+    if plan_id:
+        override = _PLAN_DEFAULTS.get(plan_id.lower())
+        if override:
+            return override
     return DEFAULT_PERMISSION_MODE
 
 

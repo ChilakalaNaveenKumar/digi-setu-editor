@@ -387,13 +387,27 @@ async def post_prompt(
     if rt._pi is None and not rl.try_take(user_id, "pi.spawn"):  # noqa: SLF001
         raise HTTPException(status_code=429, detail=bridge_error("rate_limit"))
 
+    # Skill resolution. Bundled compile-loop + any user-uploaded skills
+    # whose triggers match, plus any @mentions in the prompt body. Best-
+    # effort — a parse failure must never block the chat.
+    try:
+        from services import skills as _skills
+
+        prefix = _skills.assemble_turn_prefix(user_id, body.message)
+    except Exception as exc:  # pragma: no cover — defensive
+        import sys as _sys
+        print(f"[chat_sse] skill prep failed: {exc}", file=_sys.stderr)
+        prefix = ""
+
+    augmented_message = (prefix + body.message) if prefix else body.message
+
     # Auto-title the chat from the first user prompt. Idempotent across
     # subsequent prompts in the same runtime — see `_kick_title_flow`
-    # for the guards.
+    # for the guards. Uses the RAW user text, not the skill-augmented one.
     _kick_title_flow(rt, body.message)
 
     try:
-        request_id = await rt.send_prompt(body.message, request_id=body.request_id)
+        request_id = await rt.send_prompt(augmented_message, request_id=body.request_id)
     except RuntimeError as exc:
         # session runtime closed mid-flight (raced with reaper)
         log_error(

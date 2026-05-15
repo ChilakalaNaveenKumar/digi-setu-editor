@@ -36,13 +36,39 @@ import type {
 } from "@mariozechner/pi-coding-agent";
 
 // ── Configuration ───────────────────────────────────────────────────────────
+//
+// Three modes the user can pick. The names match what services/user_prefs.py
+// stores and what the picker dropdown writes to the live-mode file.
+//
+//   auto         (default) — prompt for risky tools, auto-approve after 15s
+//                            if the user doesn't click. SAFE_TOOLS still
+//                            silent. This is "training wheels" mode: the
+//                            modal shows so you can see what's running, but
+//                            an unattended chat doesn't stall.
+//
+//   approve_all            — no prompts at all. Every tool runs immediately.
+//                            For users who trust the agent and want a Cursor-
+//                            style experience. (The name is "approve_all" =
+//                            "approve every tool automatically", not "open
+//                            an approval modal for every tool"; the latter
+//                            would be insane for read/grep/ls.)
+//
+//   manual                 — prompt for risky tools and BLOCK INDEFINITELY
+//                            until the user clicks. No timeout. For users
+//                            who explicitly want to gate each risky call.
+//                            UI label: "Ask each time".
+//
+// Compatibility: the old token `approve_risky` is silently mapped to
+// `manual` so existing live-mode files / env vars keep working through the
+// rename. New writes always emit the new names.
 
-type Mode = "auto" | "approve_risky" | "approve_all";
+type Mode = "auto" | "approve_all" | "manual";
 
 function parseMode(raw: string | undefined): Mode | undefined {
 	if (!raw) return undefined;
 	const v = raw.trim().toLowerCase();
-	if (v === "auto" || v === "approve_risky" || v === "approve_all") return v;
+	if (v === "auto" || v === "approve_all" || v === "manual") return v as Mode;
+	if (v === "approve_risky") return "manual"; // legacy alias
 	return undefined;
 }
 
@@ -53,10 +79,10 @@ const SPAWN_MODE: Mode = (() => {
 	if (process.env.PI_PERMISSION_MODE) {
 		console.error(
 			`[permission] unknown PI_PERMISSION_MODE=${process.env.PI_PERMISSION_MODE}, ` +
-				"falling back to approve_risky",
+				"falling back to auto",
 		);
 	}
-	return "approve_risky";
+	return "auto";
 })();
 
 // Live file the backend updates whenever the user flips the picker. Single
@@ -76,36 +102,32 @@ function currentMode(): Mode {
 	}
 }
 
-// Hard timeout on `ctx.ui.select`. This is a *safety net*, not the
-// primary auto-accept mechanism — the frontend modal counts down a
-// shorter (30s) visible timer and fires `allow_once` at 0 so the
-// user can see what's about to happen and intervene. We hold this
-// backend-side timeout 2× longer (60s) to absorb network round-trips
-// and to catch the "frontend never received the prompt" failure mode
-// (the streaming bug that bit Nicholas Bian on 2026-05). Without a
-// backend timeout the extension would block forever in that case;
-// without a SHORT backend timeout the user has to wait 2 min to see
-// why the agent stalled.
+// Hard timeout on `ctx.ui.select` for the `auto` mode. The modal still
+// opens so the user can see what's about to run, but if they don't click
+// within 15s we allow on their behalf — long enough to read and click,
+// short enough that an unattended chat doesn't stall.
 //
 // On timeout we deliberately resolve to ALLOW rather than DENY. The
 // older default-deny path was correct in a single-user dev setup
 // (better to fail closed than to run a stray `rm -rf` while the
-// developer was at lunch) but it's the wrong default for the hosted
-// product: web users hitting their very first tool call had no way
-// to see the prompt due to an SSE buffering issue, so "no response"
-// almost always meant "the prompt never arrived" rather than "the
-// user actively chose to do nothing". Allowing on timeout fixes the
-// silent-stall failure mode and matches the policy users set when
-// they pick `auto` mode anyway.
+// developer was at lunch) but it's the wrong default for an active
+// chat: a SSE buffering or focus-loss issue can make "no response"
+// mean "the modal never showed" rather than "the user actively chose
+// to do nothing".
+//
+// The `manual` mode INTENTIONALLY ignores this timeout (passes Infinity
+// to ctx.ui.select). That's the whole point — a user who picks "Ask
+// each time" wants the agent to wait, forever if necessary, rather than
+// silently run something they wanted to vet.
 const TIMEOUT_MS = (() => {
-	const n = Number(process.env.PI_PERMISSION_TIMEOUT_MS || "60000");
-	return Number.isFinite(n) && n > 0 ? n : 60_000;
+	const n = Number(process.env.PI_PERMISSION_TIMEOUT_MS || "15000");
+	return Number.isFinite(n) && n > 0 ? n : 15_000;
 })();
 
 /** Tools that are always safe to run without asking. Read-only filesystem ops. */
 const SAFE_TOOLS: ReadonlySet<string> = new Set(["read", "grep", "find", "ls"]);
 
-/** Tools that always require approval in approve_risky mode. */
+/** Tools that require approval in `auto` and `manual` modes (`approve_all` skips). */
 const RISKY_TOOLS: ReadonlySet<string> = new Set([
 	"bash",
 	"write",
@@ -187,10 +209,21 @@ interface PermissionPayload {
 }
 
 function shouldPrompt(toolName: string, mode: Mode): boolean {
-	if (mode === "auto") return false;
-	if (mode === "approve_all") return !SAFE_TOOLS.has(toolName);
-	// approve_risky
+	// approve_all: trust the agent completely, never prompt.
+	if (mode === "approve_all") return false;
+	// auto and manual: prompt only for risky tools. SAFE_TOOLS
+	// (read/grep/find/ls) always run silently — prompting for
+	// every file read would be unusable in either mode.
 	return RISKY_TOOLS.has(toolName);
+}
+
+/** Returns the modal timeout for `mode`, or `undefined` for "wait forever". */
+function timeoutFor(mode: Mode): number | undefined {
+	// `manual` = "Ask each time". The user explicitly opted into vetting
+	// each risky call, so we never auto-allow — the agent will sit idle
+	// until they click. Everywhere else gets the 15s grace period.
+	if (mode === "manual") return undefined;
+	return TIMEOUT_MS;
 }
 
 // ── Extension factory ───────────────────────────────────────────────────────
@@ -199,7 +232,8 @@ export default function (pi: ExtensionAPI): void {
 	console.error(
 		`[permission] loaded spawn_mode=${SPAWN_MODE} live_file=${MODE_FILE ?? "<none>"} ` +
 			`timeout=${TIMEOUT_MS}ms ` +
-			`(set PI_PERMISSION_MODE=auto|approve_risky|approve_all to change spawn default)`,
+			`(set PI_PERMISSION_MODE=auto|approve_all|manual to change spawn default; ` +
+			`approve_risky is a legacy alias for manual)`,
 	);
 
 	pi.on("message_update", (evt) => {
@@ -237,12 +271,12 @@ export default function (pi: ExtensionAPI): void {
 
 		// Re-read the live mode file every tool call. This is what makes
 		// the picker in the browser apply to the running pi — the user
-		// flips approve_risky → auto and the very next tool stops
+		// flips auto → approve_all and the very next tool stops
 		// prompting, no respawn needed.
 		const mode = currentMode();
 
 		if (!shouldPrompt(toolName, mode)) {
-			return undefined; // mode=auto, or read/grep/find/ls
+			return undefined; // mode=approve_all, or SAFE_TOOLS (read/grep/find/ls)
 		}
 
 		// In RPC mode hasUI is true (the host translates ctx.ui.* into RPC events).
@@ -277,10 +311,15 @@ export default function (pi: ExtensionAPI): void {
 		const title = `${PERMISSION_PREFIX}${JSON.stringify(payload)}`;
 		const message = `pi wants to call \`${toolName}\` with arguments:\n${JSON.stringify(input, null, 2)}`;
 
+		const modalTimeout = timeoutFor(mode);
 		const choice = await ctx.ui.select(
 			title,
 			["allow_once", "allow_session", "deny_once", "deny_session"],
-			{ timeout: TIMEOUT_MS },
+			// Omit the `timeout` option entirely in manual mode — pi's
+			// select() treats absence as "wait forever". Passing
+			// `Infinity` would also work but trips the Number.isFinite
+			// guard some pi versions use to validate the option.
+			modalTimeout === undefined ? {} : { timeout: modalTimeout },
 		);
 
 		// Explicit allow → run.
@@ -300,11 +339,18 @@ export default function (pi: ExtensionAPI): void {
 			denySession.add(fp);
 			return { block: true, reason: "user denied (session)" };
 		}
-		// Undefined → the modal closed without a decision (timed out or
-		// the user navigated away). Allow on timeout: see the rationale
-		// above the TIMEOUT_MS declaration. The audit log still records
-		// the tool call as `auto-allowed (timeout)` so a deny-on-timeout
-		// policy can be reinstated by reading those audit entries.
+		// Undefined → the modal closed without a decision (timed out
+		// or the user navigated away). In `manual` mode this should
+		// never happen because we passed no timeout; if it does (e.g.
+		// the host UI bridge died), treat it as a deny so we don't
+		// silently violate the user's stated policy. In `auto` mode
+		// allow on timeout — see the rationale above TIMEOUT_MS.
+		if (mode === "manual") {
+			console.error(
+				`[permission] modal closed without decision in manual mode for ${toolName} (${fp}) — denying`,
+			);
+			return { block: true, reason: "modal closed in manual mode" };
+		}
 		console.error(
 			`[permission] timeout reached for ${toolName} (${fp}) — auto-allowing`,
 		);

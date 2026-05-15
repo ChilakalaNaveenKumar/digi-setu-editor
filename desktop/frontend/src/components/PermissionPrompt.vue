@@ -75,7 +75,7 @@ function toolIcon(tool: string): string {
 }
 
 /** Render the permission-mode chip label for any mode ID — accepts
- *  canonical IDs (auto / ask / cautious) AND legacy aliases. */
+ *  canonical IDs (auto / approve_all / manual) AND legacy aliases. */
 function modeChip(mode: string): string {
   const canonical = normalizeMode(mode);
   return t(`permission.mode.${canonical}.label`);

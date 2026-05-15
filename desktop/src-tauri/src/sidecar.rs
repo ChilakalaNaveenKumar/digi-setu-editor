@@ -430,7 +430,11 @@ pub async fn spawn_sidecar(
         // Default the AI's permission posture to the Cursor-style
         // approve-risky mode. The user can toggle it from the UI;
         // this is just the first-launch default.
-        .env("PI_PERMISSION_MODE_DEFAULT", "approve_risky")
+        // First-launch default: `auto` — prompt for risky tools and
+        // auto-approve after 15s if no click. Users can switch to
+        // `approve_all` (silent) or `manual` (block until clicked) from
+        // the chat settings picker. The picker persists per-user.
+        .env("PI_PERMISSION_MODE_DEFAULT", "auto")
         // CORS: in desktop the SPA is served from tauri://localhost
         // (custom protocol). Add it to the allow-list so the FastAPI
         // CORSMiddleware doesn't refuse the SPA's first call.

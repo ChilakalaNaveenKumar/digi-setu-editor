@@ -6,7 +6,7 @@
   on narrow widths.
 
   What lives here:
-    - Permission mode picker (auto / approve_risky / approve_all)
+    - Permission mode picker (approve_all / auto / manual)
     - Plan + credit usage with progress bar + Upgrade button
     - Quick links to /pricing and "Open billing portal"
 

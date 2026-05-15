@@ -2,10 +2,10 @@
 Per-user UI preferences.
 
 Tiny key/value store for things that aren't billing or auth — currently
-the permission_mode (auto / ask / cautious) and a few desktop-specific
-prefs (per-workspace last-used model, BYOK vs Cloud routing default).
-Designed so we can drop in more (theme, default model, default thinking
-level, etc.) without churning the API surface.
+the permission_mode (auto / approve_all / manual) and a few desktop-
+specific prefs (per-workspace last-used model, BYOK vs Cloud routing
+default). Designed so we can drop in more (theme, default model,
+default thinking level, etc.) without churning the API surface.
 
 Persistence is plain JSON at web/data/user_prefs.json. We chose flat
 JSON over SQLite because:
@@ -17,32 +17,40 @@ If/when this hits ~10k users we'll move it into the same SQLite store
 the CreditLedger eventually wants.
 
 Permission-mode IDs (canonical → user-facing label):
-    auto       → "Auto"      Run every tool without asking; audit log
-                              records every action.
-    ask        → "Ask"       Ask before bash / write / edit / process.
-                              Reads pass silently. (Default.)
-    cautious   → "Cautious"  Ask before every tool call, including
-                              reads.
+    auto         → "Auto"          Prompt for risky tools (bash, write,
+                                    edit, process) so the user sees what's
+                                    about to run; auto-approve after 15s
+                                    if no click. Reads / greps / lists are
+                                    silent. THIS IS THE DEFAULT — fastest
+                                    UX with the modal still acting as a
+                                    visible audit trail.
 
-Legacy IDs ("approve_risky" ≡ "ask", "approve_all" ≡ "cautious") are
-accepted on read and silently rewritten to the canonical form on the
-first save — so a stale prefs.json keeps working through the upgrade
-without manual intervention.
+    approve_all  → "Approve all"   No prompt at all, every tool runs
+                                    instantly. For users who trust the
+                                    agent fully and want a pure Cursor-
+                                    style experience.
 
-Default for the hosted web app is `ask` for every plan, paired with
-the auto-allow safety net (30s visible countdown in the modal +
-60s hard timeout server-side, both resolving to ALLOW). The brief
-stint at `auto` removed the silent-stall failure mode but also
-removed the speed bump for first-time users — they had no idea
-what tool calls the agent was running until the side-effects landed.
-`ask` puts a face on every bash / write / edit / process call
-without sacrificing the safety net: the modal auto-resolves to
-ALLOW after thirty seconds whether the user sees it or not, so the
-previous "prompt invisible AND wait forever" failure mode is
-impossible. Users who do want full silence can flip to `auto` from
-the chat settings menu; users who want to gate every read can flip
-to `cautious`. Desktop matches this default for the same reasons
-(its copy of this file).
+    manual       → "Ask each time" Prompt for risky tools AND wait
+                                    forever for an explicit click — the
+                                    agent will sit idle rather than
+                                    auto-approve. For users who want to
+                                    vet every risky call individually.
+
+Migration on read (mapping older / legacy IDs to the current canonical
+set, applied silently and rewritten on first save):
+
+    old "auto" (silent)         → "auto" kept as-is; the user gets a
+                                  modal+15s where before there was
+                                  silence. This is a safer default
+                                  (more visibility, never blocks).
+    old "ask"                   → "auto"   (same prompt+15s behaviour)
+    old "cautious"              → "manual" (strictest → strictest)
+    legacy "approve_risky"      → "auto"
+    legacy "approve_all" (old)  → "manual" (was prompt-all; now becomes
+                                  the strict mode, never auto-approve)
+
+Default for both web and desktop is `auto` — the spec the operator
+locked in 2026-05 after Nicholas Bian's blocked-modal incident.
 """
 
 from __future__ import annotations
@@ -67,14 +75,33 @@ PREFS_PATH = DATA_ROOT / "user_prefs.json"
 _USERS_DIR = DATA_ROOT / "users"
 
 # Canonical permission-mode IDs the rest of the codebase should use.
-VALID_PERMISSION_MODES = ("auto", "ask", "cautious")
+# Keep the tuple ordered least-restrictive → most-restrictive — the
+# picker reads it in this order so the row layout matches Cursor /
+# Cline / Continue conventions (relaxed at the top).
+VALID_PERMISSION_MODES = ("approve_all", "auto", "manual")
 
-# Legacy aliases. These appeared in earlier builds; we map them to the
-# canonical IDs on read (and rewrite on next save). Update this dict if
-# we ever need another rename — never expand the canonical tuple.
+# Migration table for older / legacy IDs. The mapping must always go
+# from a previous canonical name (or an even older legacy alias) to a
+# current canonical name. We deliberately map at the "same security
+# level or stricter" — never relax — so a stale prefs file can't
+# silently weaken a user's previous choice.
 _LEGACY_PERMISSION_ALIASES = {
-    "approve_risky": "ask",
-    "approve_all": "cautious",
+    # Previous canonical names (3-mode auto/ask/cautious era):
+    "ask": "auto",         # old ask was prompt-risky+15s → new auto is the same
+    "cautious": "manual",  # old cautious prompted for everything → new manual is the strictest mode
+    # Even older aliases used by 2-mode era extensions:
+    "approve_risky": "auto",
+    # NOTE: there is intentionally no mapping for the legacy
+    # "approve_all" value here — in the OLD scheme `approve_all` was an
+    # alias for `cautious` (prompt for all) but in the NEW scheme
+    # `approve_all` is the silent-run-everything mode. If a stale
+    # prefs file literally contains "approve_all" we want it to mean
+    # the new (correct) thing, not the old one, because:
+    #   1. the picker has always presented it under a "less prompting"
+    #      label, so user intent is preserved
+    #   2. defaulting to the new meaning matches the renamed extension
+    # If you genuinely need to preserve the old "prompt-for-everything"
+    # semantics for a specific user, write `manual` to their prefs.
 }
 
 
@@ -90,17 +117,18 @@ def normalize_permission_mode(raw: str) -> Optional[str]:
     return _LEGACY_PERMISSION_ALIASES.get(cleaned)
 
 
-# Default first-launch posture for the hosted web app. We pick `auto`
-# so the agent's bash / write / edit calls don't stall behind an
-# approval modal the user might never see (the modal piggybacks on the
-# same SSE stream the assistant uses, so any drop also drops the
-# prompt). Users who want the speed bump can flip to `ask` or
-# `cautious` from the chat settings menu and the choice persists.
-# Override with PI_PERMISSION_MODE_DEFAULT (e.g. `ask`) if a particular
-# deploy wants to restore the old posture without a code change.
+# Default first-launch posture: `auto`. The agent prompts for risky
+# tools (bash / write / edit / process) and auto-approves after 15s if
+# the user doesn't click — the modal serves as a visible audit trail
+# without becoming the "blocked modal" failure mode Nicholas Bian hit
+# in 2026-05 (a 58-message loop where every bash call stalled behind
+# an off-screen prompt). Users who want full silence flip to
+# `approve_all`; users who want to vet every call flip to `manual`.
+# Override with PI_PERMISSION_MODE_DEFAULT to restore a non-auto
+# default without a code change.
 _DEFAULT_FROM_ENV = os.environ.get("PI_PERMISSION_MODE_DEFAULT", "").strip().lower()
 _DEFAULT_NORMALISED = normalize_permission_mode(_DEFAULT_FROM_ENV)
-DEFAULT_PERMISSION_MODE = _DEFAULT_NORMALISED if _DEFAULT_NORMALISED else "ask"
+DEFAULT_PERMISSION_MODE = _DEFAULT_NORMALISED if _DEFAULT_NORMALISED else "auto"
 
 # user_id from Clerk looks like "user_2abcXYZ..."; in dev we sometimes
 # pass "anon" or an email. Restrict to filesystem-safe chars to avoid
@@ -111,14 +139,23 @@ _SAFE_USER_ID = re.compile(r"[^A-Za-z0-9._-]")
 def _sanitize_user_id(user_id: str) -> str:
     return _SAFE_USER_ID.sub("_", user_id)[:128]
 
-# Plan tiers that get the lighter-touch default. Anything not listed falls
-# back to DEFAULT_PERMISSION_MODE.
-_AUTO_MODE_PLANS = frozenset({"pro", "enterprise"})
+# Plan-based default override.
+#
+# Historically we used this to bump paid plans onto a stricter or
+# looser default than free users. With the current 3-mode set the
+# `auto` default already gives every plan the right UX (visible
+# prompts with a 15s safety net), so this hook is a no-op for now.
+# Kept as a vector for future tiering — if e.g. enterprise wants
+# `manual` by default for compliance reasons, add the plan id to
+# `_PLAN_DEFAULTS` below.
+_PLAN_DEFAULTS: dict[str, str] = {}
 
 
 def _default_for_plan(plan_id: Optional[str]) -> str:
-    if plan_id and plan_id.lower() in _AUTO_MODE_PLANS:
-        return "auto"
+    if plan_id:
+        override = _PLAN_DEFAULTS.get(plan_id.lower())
+        if override:
+            return override
     return DEFAULT_PERMISSION_MODE
 
 

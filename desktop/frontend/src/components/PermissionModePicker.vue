@@ -4,16 +4,18 @@
   Three modes (the persisted IDs are the wire format; labels are
   what the user sees):
 
-    auto      → "Auto"      Run every tool without asking. Audit log
-                            still records every action.
-    ask       → "Ask"       Ask before shell commands, file edits, and
-                            background processes. Reads pass silently.
-                            (Default — matches Cursor/Cline default.)
-    cautious  → "Cautious"  Ask before every tool call, including
-                            reads and searches.
+    auto         → "Auto"          Prompt for shell commands, file edits,
+                                    and background processes; auto-approve
+                                    after 15s if no click. Reads pass
+                                    silently. (Default.)
+    approve_all  → "Approve all"   No prompt at all, every tool runs
+                                    instantly. Pure Cursor-style.
+    manual       → "Ask each time" Prompt for risky tools AND wait
+                                    forever for an explicit click. Never
+                                    auto-approves.
 
-  Backwards-compat: the picker ALSO accepts the legacy IDs
-  (`approve_risky`, `approve_all`) on read; the backend's user_prefs
+  Backwards-compat: the picker ALSO accepts the legacy IDs (`ask`,
+  `cautious`, `approve_risky`) on read; the backend's user_prefs
   service maps them to the new canonical IDs on first save.
 
   The picker writes to /api/me/prefs/permission_mode (persisted per
@@ -65,7 +67,7 @@ function blurb(mode: PermissionMode): string {
 // Order matters — least → most cautious so the user reads the spectrum
 // top-down. This is the exact order Claude Code, Cursor, and Continue
 // all use in their pickers.
-const MODE_ORDER: PermissionMode[] = ["auto", "ask", "cautious"];
+const MODE_ORDER: PermissionMode[] = ["approve_all", "auto", "manual"];
 
 const popoverStyle = ref<Record<string, string>>({});
 
