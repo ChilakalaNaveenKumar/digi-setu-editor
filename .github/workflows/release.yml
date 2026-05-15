@@ -298,7 +298,12 @@ jobs:
   # un-configured forks still produce a working artefact.
   macos-arm:
     runs-on: macos-15            # M-series; arm64 native
-    timeout-minutes: 60
+    # 60 min was too tight: build (~6 min) + sign (~3 min, 50+ nested
+    # Mach-O binaries need individual timestamp+entitlements signs) +
+    # DMG (~1 min) + notarize-wait (commonly 1–5 min, but Apple's
+    # queue spikes to 30+ min during US business hours) + staple-
+    # retry (up to 2 min). 120 min gives us headroom on a bad day.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
@@ -445,7 +450,10 @@ jobs:
   # gets shared via upload-artifact / download-artifact.
   macos-intel:
     runs-on: macos-15            # M-series; cross-compiles via Rosetta
-    timeout-minutes: 60
+    # See macos-arm timeout-minutes comment for the rationale; intel
+    # is slower because Rust + sidecar are cross-compiled under
+    # Rosetta, so allow even more headroom.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 

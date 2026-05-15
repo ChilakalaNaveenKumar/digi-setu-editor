@@ -484,12 +484,18 @@ notarize_dmg_mac() {
     # Apple's notary service is generally fast (~1 min) but spikes to
     # 10–15 min during US-hours backlogs; the GHA runner timeout
     # accommodates this.
+    # `--timeout 90m` caps the wall-clock spent waiting for Apple's
+    # verdict so the script returns a clean error if Apple's queue
+    # is genuinely backlogged, rather than letting the surrounding
+    # GHA runner kill the whole job (which leaves us with no log of
+    # what happened — the runner-kill path eats stderr/stdout).
     local notary_rc=0
     xcrun notarytool submit "${DMG_OUT}" \
         --key "${APPLE_NOTARY_API_KEY}" \
         --key-id "${APPLE_NOTARY_API_KEY_ID}" \
         --issuer "${APPLE_NOTARY_API_ISSUER}" \
         --wait \
+        --timeout 90m \
         --output-format plist > /tmp/notary-result.plist || notary_rc=$?
 
     local sub_id sub_status
