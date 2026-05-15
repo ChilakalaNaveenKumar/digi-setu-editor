@@ -73,6 +73,18 @@ from services.file_watcher import WatcherRegistry
 from services.models_registry import get_model
 from services.pi_session import PiSession
 
+# Billing hooks. Imported here (not lazily) because every assistant
+# turn must charge — if the import fails we want to know at startup,
+# not silently free-tier hundreds of prompts the way the WS→SSE
+# migration accidentally did between 2026-05-11 and 2026-05-15.
+from services.billing import (
+    CreditLedger,
+    estimate_prompt_cost,
+    extract_sub_llm_usage,
+    usage_token_total,
+)
+from services.rate_limit import RateLimiter
+
 
 # Ring buffer: drop oldest events past this many. ~1 KB avg event ×
 # 1000 events ≈ 1 MB per session. With 100 active sessions that's
@@ -180,6 +192,14 @@ class SessionRuntime:
         # tool execution that produces no client-facing events for a
         # few minutes).
         self._in_flight = False
+
+        # Wall-clock start of the current assistant turn. Captured on
+        # `agent_start` / `turn_start`, consumed on `message_end` so
+        # `estimate_prompt_cost` can amortise the VM hourly across
+        # actual time spent. None means "no turn currently running"
+        # — `_charge_assistant_turn` falls back to 0 seconds in that
+        # case (still bills LLM tokens, just no VM amortisation).
+        self._turn_started_at: Optional[float] = None
 
         # Outstanding permission requests pi has emitted but the user
         # hasn't answered yet. Stored so a reconnecting client can
@@ -556,6 +576,160 @@ class SessionRuntime:
                 # with the silent tick.
                 continue
 
+    # ── internal: billing side-effects ──────────────────────────────
+    #
+    # These mirror routes/chat_ws.py:_maybe_charge_usage and
+    # _maybe_charge_tool_sub_llm, which were lost when the WS path
+    # was retired in favour of the SSE path. The migration ported
+    # transport, fanout, watchdog, and title-gen but missed billing,
+    # so every chat turn between 2026-05-11 and the fix was free.
+    # Keep both helpers parameter-compatible with the WS originals
+    # so future helpers (sub-agent billing, BYOK split) can stay in
+    # services/billing.py without forking per-transport branches.
+
+    def _charge_assistant_turn(self, evt: dict[str, Any]) -> None:
+        """On `message_end` from an assistant turn, charge the LLM
+        cost + VM amortisation to the user's monthly credit and
+        increment their daily token bucket.
+
+        Charges happen unconditionally — we never amputate a half-
+        finished answer the user already paid for. Cap enforcement
+        lives in the `pi.spawn` / `ws.connect` rate-limit gates on
+        the NEXT prompt (see chat_sse.post_prompt). Pi already wrote
+        the assistant text to JSONL by this point so a crash here
+        leaves the user with a complete answer.
+
+        `usage.cost.total` is trusted if present (pi-mono populates
+        it via models.ts:calculateCost so we don't drift if pi's
+        model table moves before ours does). Otherwise we recompute
+        from the four token classes."""
+        if evt.get("type") != "message_end":
+            return
+        message = evt.get("message") or {}
+        if not isinstance(message, dict):
+            return
+        if message.get("role") not in (None, "assistant"):
+            return
+
+        # Capture wall time of the turn (for VM amortisation) and
+        # immediately clear the marker so a sub-agent message_end
+        # arriving later doesn't double-count VM seconds.
+        wall_seconds = 0.0
+        started = self._turn_started_at
+        if started is not None:
+            wall_seconds = max(0.0, asyncio.get_event_loop().time() - started)
+            self._turn_started_at = None
+
+        usage = message.get("usage") or {}
+        if not isinstance(usage, dict):
+            return
+
+        total_tokens = usage_token_total(usage)
+        if total_tokens > 0:
+            RateLimiter.instance().charge_tokens(self.user_id, total_tokens)
+
+        cost = estimate_prompt_cost(
+            usage,
+            model_id=self.model_id,
+            wall_seconds=wall_seconds,
+        )
+        # Always log the event — even on $0 turns — so the activity
+        # table shows the user something happened. The aggregate
+        # spent_usd / prompts counter is gated inside note_cost.
+        CreditLedger.instance().note_cost(
+            self.user_id,
+            cost.total_usd,
+            source="chat",
+            model=cost.model_id,
+            session_id=self.session_id,
+            workspace_id=self.workspace_id,
+            usage=usage,
+            breakdown={
+                "llm_usd": cost.llm_usd,
+                "vm_usd": cost.vm_usd,
+                "margin_usd": cost.margin_usd,
+                "total_usd": cost.total_usd,
+            },
+        )
+
+        # ── BYOK ledger (desktop sidecar uses the same code path;
+        # web's BYOK_MODE is always False so this is a no-op here,
+        # but the desktop SessionRuntime imports the same module).
+        # Keeping the branch keeps web/desktop session_runtime files
+        # behaviour-equivalent so a future refactor that hoists the
+        # runtime into a shared package doesn't regress desktop.
+        try:
+            from config import BYOK_MODE  # noqa: PLC0415 — lazy to avoid cycles
+        except Exception:
+            BYOK_MODE = False
+        if BYOK_MODE:
+            try:
+                from services.byok import byok_provider_for  # noqa: PLC0415
+                from services.byok_usage import record as _byok_record  # noqa: PLC0415
+
+                spec = get_model(self.model_id)
+                pick = byok_provider_for(spec) if spec is not None else None
+                if pick is not None:
+                    _byok_record(
+                        session_id=self.session_id,
+                        workspace_id=self.workspace_id,
+                        provider=pick[1],
+                        model_id=self.model_id,
+                        input_tokens=int(usage.get("input") or 0),
+                        output_tokens=int(usage.get("output") or 0),
+                        cache_read=int(usage.get("cacheRead") or 0),
+                        cache_write=int(usage.get("cacheWrite") or 0),
+                    )
+            except Exception as exc:  # noqa: BLE001 — BYOK is best-effort
+                log_error(
+                    "internal",
+                    session_id=self.session_id,
+                    user_id=self.user_id,
+                    exc=exc,
+                    where="session_runtime.byok_record",
+                )
+
+    def _charge_tool_sub_llm(self, evt: dict[str, Any]) -> None:
+        """Bill provider calls made INSIDE tool execute() bodies.
+
+        The parent assistant turn's `message_end` only carries the
+        parent model's tokens; tools that spawn their own provider
+        call (Haiku for search_docs, Gemini grounded search for
+        web_search) need a separate ledger entry — otherwise the
+        tools that cost the most money are free for users.
+
+        Pure logic lives in services/billing.extract_sub_llm_usage
+        so it can be unit-tested without spinning up a runtime.
+        This thin wrapper applies the rate-limit + ledger side
+        effects with the same fields the WS path used.
+        """
+        usage = extract_sub_llm_usage(evt)
+        if usage is None:
+            return
+        total = usage_token_total(usage)
+        if total <= 0:
+            return
+        RateLimiter.instance().charge_tokens(self.user_id, total)
+        sub_model = str(usage.get("model") or "")
+        cost = estimate_prompt_cost(usage, model_id=sub_model or self.model_id)
+        tool_name = str(evt.get("toolName") or "tool")
+        CreditLedger.instance().note_cost(
+            self.user_id,
+            cost.total_usd,
+            source="tool",
+            tool=tool_name,
+            model=cost.model_id,
+            session_id=self.session_id,
+            workspace_id=self.workspace_id,
+            usage=usage,
+            breakdown={
+                "llm_usd": cost.llm_usd,
+                "vm_usd": cost.vm_usd,
+                "margin_usd": cost.margin_usd,
+                "total_usd": cost.total_usd,
+            },
+        )
+
     # ── internal: pi → ring pump ────────────────────────────────────
     async def _pump_pi_events(self) -> None:
         """Drain pi.events() into the ring buffer. Runs as a background task."""
@@ -568,12 +742,36 @@ class SessionRuntime:
                 t = evt.get("type")
                 if t in ("agent_start", "turn_start"):
                     self._in_flight = True
+                    # Stamp the wall-clock start so message_end can
+                    # bill VM time alongside LLM tokens. We only
+                    # arm this on the OUTER turn boundary — pi can
+                    # emit nested agent_start events when sub-agents
+                    # fire, and we want the wall time of the whole
+                    # user-visible turn, not the inner span.
+                    if self._turn_started_at is None:
+                        self._turn_started_at = asyncio.get_event_loop().time()
                 elif t in ("agent_end", "turn_end"):
                     self._in_flight = False
                 elif t == "permission_request":
                     pid = str(evt.get("id") or "")
                     if pid:
                         self._pending_permissions[pid] = dict(evt)
+
+                # Billing side-effects. Run BEFORE _enqueue so a
+                # billing crash never leaks unbilled events into the
+                # ring (the catch-all below logs + emits internal,
+                # same affordance as the WS path used to).
+                try:
+                    self._charge_assistant_turn(evt)
+                    self._charge_tool_sub_llm(evt)
+                except Exception as exc:  # noqa: BLE001
+                    log_error(
+                        "internal",
+                        session_id=self.session_id,
+                        user_id=self.user_id,
+                        exc=exc,
+                        where="session_runtime.charge",
+                    )
 
                 self._enqueue(evt)
         except asyncio.CancelledError:

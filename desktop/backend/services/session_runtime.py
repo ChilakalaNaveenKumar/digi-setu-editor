@@ -73,6 +73,26 @@ from services.file_watcher import WatcherRegistry
 from services.models_registry import get_model
 from services.pi_session import PiSession
 
+# Billing hooks. Imported here (not lazily) because every assistant
+# turn must charge — even though the desktop has no local
+# CreditLedger (cloud-relay turns are billed server-side by the cloud
+# CreditLedger when the relay services the request), we still need to:
+#   * `RateLimiter.charge_tokens` — per-machine fairness signal
+#     against runaway loops, distinct from the cloud's monthly $ cap.
+#   * `byok_usage.record` — token-only row for the Activity page so
+#     BYOK users (whose traffic never hits our cloud) can still see
+#     their usage. No $ figure because we don't know their provider
+#     price.
+# The WS→SSE migration on web silently dropped equivalent hooks and
+# free-tier'd ~4 days of prod chat; keep web/desktop in lockstep so
+# the same regression cannot recur on whichever surface ships first.
+from services.billing import (
+    estimate_prompt_cost,
+    extract_sub_llm_usage,
+    usage_token_total,
+)
+from services.rate_limit import RateLimiter
+
 
 # Ring buffer: drop oldest events past this many. ~1 KB avg event ×
 # 1000 events ≈ 1 MB per session. With 100 active sessions that's
@@ -180,6 +200,12 @@ class SessionRuntime:
         # tool execution that produces no client-facing events for a
         # few minutes).
         self._in_flight = False
+
+        # Wall-clock start of the current assistant turn. Captured on
+        # `agent_start` / `turn_start`, consumed on `message_end` so
+        # `estimate_prompt_cost` can amortise the VM hourly across
+        # actual time spent. None means "no turn currently running".
+        self._turn_started_at: Optional[float] = None
 
         # Outstanding permission requests pi has emitted but the user
         # hasn't answered yet. Stored so a reconnecting client can
@@ -548,6 +574,102 @@ class SessionRuntime:
                 continue
 
     # ── internal: pi → ring pump ────────────────────────────────────
+    # ── internal: billing side-effects ──────────────────────────────
+    #
+    # Mirrors routes/chat_ws.py:_maybe_charge_usage /
+    # _maybe_charge_tool_sub_llm. Hooks were lost during WS→SSE on
+    # web, free-tiering ~4 days of prod chat (2026-05-11→05-15);
+    # keep web/desktop in lockstep so the same regression cannot
+    # recur on whichever surface ships first.
+    #
+    # Desktop is BYOK by default: cloud-relay turns ($ accounting)
+    # are billed server-side by the cloud CreditLedger; BYOK turns
+    # don't flow through us so there's no $ figure here. What we
+    # DO need to track locally is the rate-limit token bucket
+    # (per-machine fairness signal) and the BYOK activity log
+    # (token-only, for the Activity page).
+
+    def _charge_assistant_turn(self, evt: dict[str, Any]) -> None:
+        """On `message_end`, advance the local rate-limit token bucket
+        and append a BYOK activity row when applicable. See chat_ws.py
+        :_maybe_charge_usage on web for the full rationale."""
+        if evt.get("type") != "message_end":
+            return
+        message = evt.get("message") or {}
+        if not isinstance(message, dict):
+            return
+        if message.get("role") not in (None, "assistant"):
+            return
+
+        # Clear the wall-clock marker. Desktop doesn't bill VM time
+        # locally (the cloud relay does, server-side) but we keep the
+        # marker for parity with web so a hypothetical "show wall
+        # time per turn" UI doesn't need a transport-specific path.
+        started = self._turn_started_at
+        if started is not None:
+            self._turn_started_at = None
+            _ = max(0.0, asyncio.get_event_loop().time() - started)  # reserved
+
+        usage = message.get("usage") or {}
+        if not isinstance(usage, dict):
+            return
+
+        total_tokens = usage_token_total(usage)
+        if total_tokens > 0:
+            RateLimiter.instance().charge_tokens(self.user_id, total_tokens)
+
+        # BYOK activity row. Only when BYOK_MODE is on AND the picked
+        # model has a path through the user's own keys. Cloud-relay
+        # turns are recorded by the cloud — recording them here too
+        # would double-count in the Activity page.
+        try:
+            from config import BYOK_MODE  # noqa: PLC0415
+        except Exception:
+            BYOK_MODE = False
+        if BYOK_MODE:
+            try:
+                from services.byok import byok_provider_for  # noqa: PLC0415
+                from services.byok_usage import record as _byok_record  # noqa: PLC0415
+
+                spec = get_model(self.model_id)
+                pick = byok_provider_for(spec) if spec is not None else None
+                if pick is not None:
+                    _byok_record(
+                        session_id=self.session_id,
+                        workspace_id=self.workspace_id,
+                        provider=pick[1],
+                        model_id=self.model_id,
+                        input_tokens=int(usage.get("input") or 0),
+                        output_tokens=int(usage.get("output") or 0),
+                        cache_read=int(usage.get("cacheRead") or 0),
+                        cache_write=int(usage.get("cacheWrite") or 0),
+                    )
+            except Exception as exc:  # noqa: BLE001
+                log_error(
+                    "internal",
+                    session_id=self.session_id,
+                    user_id=self.user_id,
+                    exc=exc,
+                    where="session_runtime.byok_record",
+                )
+
+    def _charge_tool_sub_llm(self, evt: dict[str, Any]) -> None:
+        """Advance the rate-limit token bucket for sub-LLM tool calls
+        (search_docs Haiku, web_search Gemini). No $ ledger on desktop;
+        cloud relay handles that server-side."""
+        usage = extract_sub_llm_usage(evt)
+        if usage is None:
+            return
+        total = usage_token_total(usage)
+        if total <= 0:
+            return
+        RateLimiter.instance().charge_tokens(self.user_id, total)
+        # Compute the cost so future code (e.g. surfacing it in the
+        # assistant bubble) has the helper warmed up; we don't write
+        # it locally — see the chat_ws docstring for the rationale.
+        sub_model = str(usage.get("model") or "")
+        _ = estimate_prompt_cost(usage, model_id=sub_model or self.model_id)
+
     async def _pump_pi_events(self) -> None:
         """Drain pi.events() into the ring buffer. Runs as a background task."""
         assert self._pi is not None
@@ -559,12 +681,29 @@ class SessionRuntime:
                 t = evt.get("type")
                 if t in ("agent_start", "turn_start"):
                     self._in_flight = True
+                    if self._turn_started_at is None:
+                        self._turn_started_at = asyncio.get_event_loop().time()
                 elif t in ("agent_end", "turn_end"):
                     self._in_flight = False
                 elif t == "permission_request":
                     pid = str(evt.get("id") or "")
                     if pid:
                         self._pending_permissions[pid] = dict(evt)
+
+                # Billing side-effects. Run BEFORE _enqueue so a
+                # billing crash never leaks unbilled events into the
+                # ring; the catch-all logs + falls through.
+                try:
+                    self._charge_assistant_turn(evt)
+                    self._charge_tool_sub_llm(evt)
+                except Exception as exc:  # noqa: BLE001
+                    log_error(
+                        "internal",
+                        session_id=self.session_id,
+                        user_id=self.user_id,
+                        exc=exc,
+                        where="session_runtime.charge",
+                    )
 
                 self._enqueue(evt)
         except asyncio.CancelledError:
