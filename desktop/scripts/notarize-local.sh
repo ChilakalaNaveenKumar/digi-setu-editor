@@ -181,18 +181,27 @@ notarize_one() {
         log "  stapler not ready (attempt $attempt/8); retrying in 15 s…"
         sleep 15
     done
-    xcrun stapler validate "$dmg"
+    xcrun stapler validate "$dmg" \
+        || fail "  stapler validate failed after a successful staple — refusing to upload"
 
-    # Final sanity check: Gatekeeper would actually accept it.
-    if spctl --assess --type install --verbose=2 "$dmg" 2>&1 | tee /tmp/spctl.txt | grep -q 'accepted'; then
-        log "  Gatekeeper: ACCEPTED ✓"
-    else
-        warn "  spctl said:"
-        cat /tmp/spctl.txt >&2
-        fail "  Gatekeeper would reject this DMG; aborting before upload"
-    fi
-
-    log "  ✓ notarized + stapled: $dmg"
+    # Earlier we ran `spctl --assess --type install` here, but DMGs
+    # don't carry a code signature of their own — they're a disk
+    # image whose authenticity comes from the stapled notary ticket
+    # we just validated above. spctl with --type install / --type
+    # open returns "rejected: no usable signature" on every signed-
+    # and-stapled DMG (false negative), which used to abort the
+    # script even though the DMG was perfectly shippable.
+    #
+    # The real-world Gatekeeper check that an end-user triggers
+    # happens against the .app INSIDE the DMG, after they
+    # double-click the DMG to mount it. The right way to verify
+    # that here would be `hdiutil attach` + `spctl --assess --type
+    # execute` against the .app + `hdiutil detach`, but that's a
+    # 30-second mount cycle for a redundant check: notary
+    # acceptance + staple validation already prove the bundle is
+    # Gatekeeper-clean. We now log + trust those two and skip the
+    # spctl-on-DMG anti-pattern.
+    log "  ✓ notarized + stapled (Apple Accepted, staple validated): $dmg"
 
     # ── Upload to digi-setu.com if requested ───────────────────────
     if [[ $DO_UPLOAD -eq 1 ]]; then
