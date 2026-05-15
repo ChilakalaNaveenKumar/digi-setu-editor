@@ -48,13 +48,14 @@
   auto-flushes the head of the queue when the previous turn ends.
 -->
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
 import { Icon } from "@iconify/vue";
 import { storeToRefs } from "pinia";
 import { useChatStore } from "../stores/chat";
 import { useWorkspaceStore } from "../stores/workspace";
 import { useFilesStore } from "../stores/files";
 import { useUiStore } from "../stores/ui";
+import { apiJson } from "../api/client";
 import { uploadAttachments } from "../api/attachments";
 import QueueStrip from "./QueueStrip.vue";
 import ModelPicker from "./ModelPicker.vue";
@@ -68,10 +69,146 @@ const ui = useUiStore();
 const { pendingAttachments, queuedMessages, connState, isStreaming, lastErrorCode } = storeToRefs(chat);
 
 const text = ref("");
+const textareaRef = ref<HTMLTextAreaElement | null>(null);
 const fileInput = ref<HTMLInputElement | null>(null);
 const isDragOver = ref(false);
 const isUploading = ref(false);
 const dragCounter = ref(0);
+
+// ── @-mention autocomplete state ───────────────────────────────────────
+//
+// When the user types `@x` (after a whitespace or at the start of the
+// input), we surface a small popup listing skills whose name contains
+// the query. Selecting one inserts `@skill-name ` (with a trailing
+// space) at the caret. The backend's `assemble_turn_prefix` reads
+// these mentions out of the prompt and inlines the matching SKILL.md
+// bodies into the system context for that turn — see
+// `web/backend/services/skills.py`.
+//
+// We deliberately do NOT prefetch the skill list on mount: the network
+// hop only happens the first time the user actually types `@`, so a
+// chat with no mentions never pays the cost.
+interface SkillSummary {
+  name: string;
+  description: string;
+  source: "bundled" | "user";
+}
+const skillsLoaded = ref(false);
+const skillsCatalogue = ref<SkillSummary[]>([]);
+const mentionQuery = ref<string | null>(null);
+const mentionStart = ref(0);
+const mentionSelectedIdx = ref(0);
+
+const mentionMatches = computed<SkillSummary[]>(() => {
+  if (mentionQuery.value === null) return [];
+  const q = mentionQuery.value.toLowerCase();
+  // Empty query (just `@`) → show everything. Otherwise prefer
+  // prefix matches first, then substring matches — same shape as
+  // the way most autocomplete UIs (VSCode, Slack) rank.
+  const all = skillsCatalogue.value;
+  if (!q) return all.slice(0, 8);
+  const prefix = all.filter((s) => s.name.startsWith(q));
+  const sub = all.filter((s) => !s.name.startsWith(q) && s.name.includes(q));
+  return [...prefix, ...sub].slice(0, 8);
+});
+
+async function loadSkillsCatalogue(): Promise<void> {
+  if (skillsLoaded.value) return;
+  try {
+    const r = await apiJson<{ skills: SkillSummary[] }>("/api/skills");
+    skillsCatalogue.value = r.skills || [];
+  } catch (exc) {
+    console.warn("[composer] skills load failed", exc);
+  } finally {
+    skillsLoaded.value = true;
+  }
+}
+
+// Walk backwards from the caret through `text` looking for an active
+// `@mention`. Returns the start index of the `@` plus the partial
+// query that follows, or null if the caret is not currently inside
+// a mention token (i.e. the most recent `@` is followed by whitespace,
+// or there is no `@` reachable without crossing whitespace).
+function detectMention(value: string, caret: number): { start: number; query: string } | null {
+  if (caret <= 0) return null;
+  // Walk back until we find `@` or a character that disqualifies the
+  // current position from being a mention (whitespace, newline). We
+  // cap the walk at 64 chars — skill names are 64 max.
+  const minStart = Math.max(0, caret - 64);
+  for (let i = caret - 1; i >= minStart; i -= 1) {
+    const ch = value[i];
+    if (ch === "@") {
+      // Mention must be preceded by start-of-string or whitespace,
+      // otherwise this is an `email@domain` shape and we should not
+      // popup. The character at i-1 is the predecessor.
+      const prev = i === 0 ? "" : value[i - 1];
+      if (prev !== "" && !/\s/.test(prev)) return null;
+      const query = value.slice(i + 1, caret);
+      // If the user typed punctuation INSIDE the query, bail —
+      // we only allow `[a-z0-9-]*` in the partial.
+      if (!/^[a-zA-Z0-9-]*$/.test(query)) return null;
+      return { start: i, query: query.toLowerCase() };
+    }
+    if (/\s/.test(ch)) return null;
+  }
+  return null;
+}
+
+function recomputeMentionState(): void {
+  const ta = textareaRef.value;
+  if (!ta) return;
+  const caret = ta.selectionStart ?? text.value.length;
+  const m = detectMention(text.value, caret);
+  if (!m) {
+    mentionQuery.value = null;
+    return;
+  }
+  if (!skillsLoaded.value) void loadSkillsCatalogue();
+  mentionStart.value = m.start;
+  mentionQuery.value = m.query;
+  mentionSelectedIdx.value = 0;
+}
+
+function onComposerInput(): void {
+  recomputeMentionState();
+}
+
+function onComposerSelectionChange(): void {
+  // Arrow keys / clicks may move the caret out of an active mention
+  // without changing the text. Re-evaluate so the popup hides.
+  recomputeMentionState();
+}
+
+function insertMention(name: string): void {
+  const ta = textareaRef.value;
+  if (!ta || mentionQuery.value === null) return;
+  const caret = ta.selectionStart ?? text.value.length;
+  const before = text.value.slice(0, mentionStart.value);
+  const after = text.value.slice(caret);
+  // Trailing space lets the user keep typing without manually adding
+  // one — same convention Slack / Discord use.
+  const inserted = `@${name} `;
+  const next = before + inserted + after;
+  text.value = next;
+  mentionQuery.value = null;
+  // Restore caret to right after the inserted token. Wait for v-model
+  // to flush before touching the DOM.
+  const newCaret = before.length + inserted.length;
+  void nextTick(() => {
+    const el = textareaRef.value;
+    if (!el) return;
+    el.focus();
+    el.setSelectionRange(newCaret, newCaret);
+  });
+}
+
+function closeMention(): void {
+  mentionQuery.value = null;
+}
+
+const mentionOpen = computed(
+  () => mentionQuery.value !== null && mentionMatches.value.length > 0,
+);
 
 const totalPendingBytes = computed(() =>
   pendingAttachments.value.reduce((s, a) => s + (a.size || 0), 0),
@@ -150,6 +287,35 @@ function submit(): void {
 }
 
 function onKeydown(e: KeyboardEvent): void {
+  // Mention popup intercepts navigation keys when open. We branch
+  // BEFORE the submit fallback so Enter inserts the highlighted
+  // skill instead of firing the prompt.
+  if (mentionOpen.value) {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      const n = mentionMatches.value.length;
+      mentionSelectedIdx.value = (mentionSelectedIdx.value + 1) % n;
+      return;
+    }
+    if (e.key === "ArrowUp") {
+      e.preventDefault();
+      const n = mentionMatches.value.length;
+      mentionSelectedIdx.value = (mentionSelectedIdx.value - 1 + n) % n;
+      return;
+    }
+    if (e.key === "Escape") {
+      e.preventDefault();
+      closeMention();
+      return;
+    }
+    if (e.key === "Enter" || e.key === "Tab") {
+      e.preventDefault();
+      const pick = mentionMatches.value[mentionSelectedIdx.value];
+      if (pick) insertMention(pick.name);
+      return;
+    }
+  }
+
   if (e.key !== "Enter") return;
   // Don't intercept Enter while the user is committing an IME
   // composition (CJK, accent menus, autocorrect popups). `isComposing`
@@ -166,6 +332,18 @@ function onKeydown(e: KeyboardEvent): void {
   e.preventDefault();
   submit();
 }
+
+onMounted(() => {
+  // Keep mention state in sync with caret movement that doesn't fire
+  // an `input` event (arrow keys, mouse click placing the caret). We
+  // attach to the document selectionchange because textarea has no
+  // dedicated event for this.
+  document.addEventListener("selectionchange", onComposerSelectionChange);
+});
+
+onUnmounted(() => {
+  document.removeEventListener("selectionchange", onComposerSelectionChange);
+});
 
 // ── attachment ingress: paste, drop, picker ────────────────────────────
 
@@ -366,17 +544,57 @@ const inputDisabled = computed(() => !!lastErrorCode.value);
 
       <!-- Textarea row. No visible border here — the parent card owns
            the border, the textarea owns the typing surface. -->
-      <textarea
-        v-model="text"
-        rows="3"
-        :placeholder="placeholder"
-        class="block w-full resize-none border-0 bg-transparent px-4 py-3 text-lead leading-relaxed text-foreground placeholder:text-muted-foreground/80 focus:outline-none font-sans"
-        :disabled="inputDisabled"
-        @keydown="onKeydown"
-        @paste="onPaste"
-        @focus="focused = true"
-        @blur="focused = false"
-      />
+      <div class="relative">
+        <textarea
+          ref="textareaRef"
+          v-model="text"
+          rows="3"
+          :placeholder="placeholder"
+          class="block w-full resize-none border-0 bg-transparent px-4 py-3 text-lead leading-relaxed text-foreground placeholder:text-muted-foreground/80 focus:outline-none font-sans"
+          :disabled="inputDisabled"
+          @input="onComposerInput"
+          @keydown="onKeydown"
+          @paste="onPaste"
+          @focus="focused = true"
+          @blur="focused = false"
+        />
+
+        <!-- @-mention skill picker. Anchored to the textarea, floats
+             above so the popup never gets clipped by the parent card.
+             Uses ChatGPT-style ranked list: prefix matches first, then
+             substring matches, capped at 8 to avoid scroll fatigue. -->
+        <div
+          v-if="mentionOpen"
+          class="absolute bottom-full left-2 right-2 z-20 mb-1 max-h-64 overflow-y-auto rounded-md border border-border bg-popover shadow-lg ring-1 ring-black/10"
+          @mousedown.prevent
+        >
+          <ul class="py-1">
+            <li
+              v-for="(sk, idx) in mentionMatches"
+              :key="sk.name"
+              class="cursor-pointer px-3 py-1.5"
+              :class="
+                idx === mentionSelectedIdx
+                  ? 'bg-primary/10 text-foreground'
+                  : 'text-foreground hover:bg-muted'
+              "
+              @mouseenter="mentionSelectedIdx = idx"
+              @click="insertMention(sk.name)"
+            >
+              <div class="flex items-center gap-2">
+                <code class="text-body font-semibold">@{{ sk.name }}</code>
+                <span
+                  class="rounded bg-muted px-1 text-caption text-muted-foreground"
+                >{{ sk.source }}</span>
+              </div>
+              <p
+                v-if="sk.description"
+                class="mt-0.5 truncate text-caption text-muted-foreground"
+              >{{ sk.description }}</p>
+            </li>
+          </ul>
+        </div>
+      </div>
 
       <!-- Toolbar row. Mode + model + settings on the left, attach +
            send/stop on the right. Same width as the textarea so

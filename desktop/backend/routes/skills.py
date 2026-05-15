@@ -19,6 +19,8 @@ disk (the SPA exposes a "Reveal in Finder" button via Tauri).
 
 from __future__ import annotations
 
+import platform
+import subprocess
 from pathlib import Path
 from typing import Any, Optional
 
@@ -97,3 +99,43 @@ async def refresh_workspace_skill_endpoint(
         "typst": profile.typst_version,
         "quarto": profile.quarto_version,
     }
+
+
+@router.post("/open_folder")
+async def open_skills_folder_endpoint(
+    user_id: str = Depends(require_user),
+) -> dict[str, Any]:
+    """Reveal the global skills folder in Finder / Explorer / Files.
+
+    Doing this server-side keeps the path resolution co-located with
+    the code that owns it (`services/skills.global_skills_dir()`) and
+    means the frontend doesn't have to know the on-disk layout.
+
+    Errors are surfaced as 500s rather than silently swallowed because
+    a broken "Open folder" button is worse than no button at all — the
+    user expects Finder to pop up and would otherwise stare at the
+    modal wondering if their click registered.
+    """
+    target = skills_svc.global_skills_dir()
+    target.mkdir(parents=True, exist_ok=True)
+    system = platform.system()
+    try:
+        if system == "Darwin":
+            subprocess.Popen(["open", str(target)])  # noqa: S603,S607
+        elif system == "Windows":
+            subprocess.Popen(["explorer", str(target)])  # noqa: S603,S607
+        else:
+            # Linux: prefer xdg-open (DE-agnostic). On dev machines
+            # without a DE we still want a useful error rather than
+            # a silent no-op, so we let the FileNotFoundError bubble.
+            subprocess.Popen(["xdg-open", str(target)])  # noqa: S603,S607
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"no file manager handler found ({exc})",
+        ) from exc
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500, detail=f"could not launch file manager: {exc}"
+        ) from exc
+    return {"ok": True, "path": str(target)}

@@ -48,7 +48,7 @@
   auto-flushes the head of the queue when the previous turn ends.
 -->
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import { Icon } from "@iconify/vue";
 import { storeToRefs } from "pinia";
 import { useChatStore } from "../stores/chat";
@@ -56,6 +56,7 @@ import { useConfigStore } from "../stores/config";
 import { useWorkspaceStore } from "../stores/workspace";
 import { useFilesStore } from "../stores/files";
 import { useUiStore } from "../stores/ui";
+import { apiJson } from "../api/client";
 import { uploadAttachments } from "../api/attachments";
 import QueueStrip from "./QueueStrip.vue";
 import ModelPicker from "./ModelPicker.vue";
@@ -83,16 +84,129 @@ function _onMenuFindInChat(): void {
 onMounted(() => {
   window.addEventListener("menu-focus-chat", _onMenuFocusChat);
   window.addEventListener("menu-find-in-chat", _onMenuFindInChat);
+  // Caret movement that doesn't change the text (arrow keys, mouse
+  // click placing the caret) still needs to update the mention popup
+  // visibility — textarea has no dedicated event for this so we
+  // hook the document-level signal.
+  document.addEventListener("selectionchange", onComposerSelectionChange);
 });
 onBeforeUnmount(() => {
   window.removeEventListener("menu-focus-chat", _onMenuFocusChat);
   window.removeEventListener("menu-find-in-chat", _onMenuFindInChat);
+  document.removeEventListener("selectionchange", onComposerSelectionChange);
 });
 
 const fileInput = ref<HTMLInputElement | null>(null);
 const isDragOver = ref(false);
 const isUploading = ref(false);
 const dragCounter = ref(0);
+
+// ── @-mention autocomplete state ───────────────────────────────────────
+//
+// Mirrors the web copy — see `web/frontend/src/components/Composer.vue`.
+// On desktop we additionally include workspace-scoped skills (typst
+// compile-loop seeded by the env probe + anything the user dropped into
+// `<workspace>/.digi-setu/skills/`) by passing `workspace_id` to the
+// listing endpoint.
+interface SkillSummary {
+  name: string;
+  description: string;
+  source: "global" | "workspace";
+}
+const skillsLoaded = ref(false);
+const skillsCatalogue = ref<SkillSummary[]>([]);
+const mentionQuery = ref<string | null>(null);
+const mentionStart = ref(0);
+const mentionSelectedIdx = ref(0);
+
+const mentionMatches = computed<SkillSummary[]>(() => {
+  if (mentionQuery.value === null) return [];
+  const q = mentionQuery.value.toLowerCase();
+  const all = skillsCatalogue.value;
+  if (!q) return all.slice(0, 8);
+  const prefix = all.filter((s) => s.name.startsWith(q));
+  const sub = all.filter((s) => !s.name.startsWith(q) && s.name.includes(q));
+  return [...prefix, ...sub].slice(0, 8);
+});
+
+async function loadSkillsCatalogue(): Promise<void> {
+  if (skillsLoaded.value) return;
+  try {
+    const qs = ws.activeId ? `?workspace_id=${encodeURIComponent(ws.activeId)}` : "";
+    const r = await apiJson<{ skills: SkillSummary[] }>(`/api/skills${qs}`);
+    skillsCatalogue.value = r.skills || [];
+  } catch (exc) {
+    console.warn("[composer] skills load failed", exc);
+  } finally {
+    skillsLoaded.value = true;
+  }
+}
+
+function detectMention(value: string, caret: number): { start: number; query: string } | null {
+  if (caret <= 0) return null;
+  const minStart = Math.max(0, caret - 64);
+  for (let i = caret - 1; i >= minStart; i -= 1) {
+    const ch = value[i];
+    if (ch === "@") {
+      const prev = i === 0 ? "" : value[i - 1];
+      if (prev !== "" && !/\s/.test(prev)) return null;
+      const query = value.slice(i + 1, caret);
+      if (!/^[a-zA-Z0-9-]*$/.test(query)) return null;
+      return { start: i, query: query.toLowerCase() };
+    }
+    if (/\s/.test(ch)) return null;
+  }
+  return null;
+}
+
+function recomputeMentionState(): void {
+  const ta = composerTextarea.value;
+  if (!ta) return;
+  const caret = ta.selectionStart ?? text.value.length;
+  const m = detectMention(text.value, caret);
+  if (!m) {
+    mentionQuery.value = null;
+    return;
+  }
+  if (!skillsLoaded.value) void loadSkillsCatalogue();
+  mentionStart.value = m.start;
+  mentionQuery.value = m.query;
+  mentionSelectedIdx.value = 0;
+}
+
+function onComposerInput(): void {
+  recomputeMentionState();
+}
+
+function onComposerSelectionChange(): void {
+  recomputeMentionState();
+}
+
+function insertMention(name: string): void {
+  const ta = composerTextarea.value;
+  if (!ta || mentionQuery.value === null) return;
+  const caret = ta.selectionStart ?? text.value.length;
+  const before = text.value.slice(0, mentionStart.value);
+  const after = text.value.slice(caret);
+  const inserted = `@${name} `;
+  text.value = before + inserted + after;
+  mentionQuery.value = null;
+  const newCaret = before.length + inserted.length;
+  void nextTick(() => {
+    const el = composerTextarea.value;
+    if (!el) return;
+    el.focus();
+    el.setSelectionRange(newCaret, newCaret);
+  });
+}
+
+function closeMention(): void {
+  mentionQuery.value = null;
+}
+
+const mentionOpen = computed(
+  () => mentionQuery.value !== null && mentionMatches.value.length > 0,
+);
 
 const totalPendingBytes = computed(() =>
   pendingAttachments.value.reduce((s, a) => s + (a.size || 0), 0),
@@ -175,6 +289,35 @@ function submit(): void {
 }
 
 function onKeydown(e: KeyboardEvent): void {
+  // Skill-mention popup intercepts navigation keys. Branch BEFORE the
+  // submit fallback so Enter inserts the highlighted skill instead of
+  // firing the prompt.
+  if (mentionOpen.value) {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      const n = mentionMatches.value.length;
+      mentionSelectedIdx.value = (mentionSelectedIdx.value + 1) % n;
+      return;
+    }
+    if (e.key === "ArrowUp") {
+      e.preventDefault();
+      const n = mentionMatches.value.length;
+      mentionSelectedIdx.value = (mentionSelectedIdx.value - 1 + n) % n;
+      return;
+    }
+    if (e.key === "Escape") {
+      e.preventDefault();
+      closeMention();
+      return;
+    }
+    if (e.key === "Enter" || e.key === "Tab") {
+      e.preventDefault();
+      const pick = mentionMatches.value[mentionSelectedIdx.value];
+      if (pick) insertMention(pick.name);
+      return;
+    }
+  }
+
   if (e.key !== "Enter") return;
   // Don't intercept Enter while the user is committing an IME
   // composition (CJK, accent menus, autocorrect popups). `isComposing`
@@ -384,18 +527,58 @@ const inputDisabled = computed(() => !!lastErrorCode.value);
 
       <!-- Textarea row. No visible border here — the parent card owns
            the border, the textarea owns the typing surface. -->
-      <textarea
-        ref="composerTextarea"
-        v-model="text"
-        rows="3"
-        :placeholder="placeholder"
-        class="block w-full resize-none border-0 bg-transparent px-4 py-3 text-lead leading-relaxed text-foreground placeholder:text-muted-foreground/80 focus:outline-none font-sans"
-        :disabled="inputDisabled"
-        @keydown="onKeydown"
-        @paste="onPaste"
-        @focus="focused = true"
-        @blur="focused = false"
-      />
+      <div class="relative">
+        <textarea
+          ref="composerTextarea"
+          v-model="text"
+          rows="3"
+          :placeholder="placeholder"
+          class="block w-full resize-none border-0 bg-transparent px-4 py-3 text-lead leading-relaxed text-foreground placeholder:text-muted-foreground/80 focus:outline-none font-sans"
+          :disabled="inputDisabled"
+          @input="onComposerInput"
+          @keydown="onKeydown"
+          @paste="onPaste"
+          @focus="focused = true"
+          @blur="focused = false"
+        />
+
+        <!-- @-mention skill picker. Floats above the textarea so it
+             never gets clipped by the parent card. `mousedown.prevent`
+             keeps the textarea focused while clicking, otherwise the
+             blur fires first and the popup disappears before the
+             click registers. -->
+        <div
+          v-if="mentionOpen"
+          class="absolute bottom-full left-2 right-2 z-20 mb-1 max-h-64 overflow-y-auto rounded-md border border-border bg-popover shadow-lg ring-1 ring-black/10"
+          @mousedown.prevent
+        >
+          <ul class="py-1">
+            <li
+              v-for="(sk, idx) in mentionMatches"
+              :key="sk.name"
+              class="cursor-pointer px-3 py-1.5"
+              :class="
+                idx === mentionSelectedIdx
+                  ? 'bg-primary/10 text-foreground'
+                  : 'text-foreground hover:bg-muted'
+              "
+              @mouseenter="mentionSelectedIdx = idx"
+              @click="insertMention(sk.name)"
+            >
+              <div class="flex items-center gap-2">
+                <code class="text-body font-semibold">@{{ sk.name }}</code>
+                <span
+                  class="rounded bg-muted px-1 text-caption text-muted-foreground"
+                >{{ sk.source }}</span>
+              </div>
+              <p
+                v-if="sk.description"
+                class="mt-0.5 truncate text-caption text-muted-foreground"
+              >{{ sk.description }}</p>
+            </li>
+          </ul>
+        </div>
+      </div>
 
       <!-- Toolbar row. Mode + model + settings on the left, attach +
            send/stop on the right. Same width as the textarea so

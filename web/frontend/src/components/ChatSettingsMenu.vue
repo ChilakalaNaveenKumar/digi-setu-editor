@@ -23,6 +23,7 @@ import { useBillingStore } from "../stores/billing";
 import { useConfigStore } from "../stores/config";
 
 import PermissionModePicker from "./PermissionModePicker.vue";
+import SkillsModal from "./SkillsModal.vue";
 import UpgradeModal from "./UpgradeModal.vue";
 
 const billing = useBillingStore();
@@ -34,6 +35,7 @@ void cfg;
 
 const open = ref(false);
 const showUpgrade = ref(false);
+const showSkills = ref(false);
 const triggerRef = ref<HTMLButtonElement | null>(null);
 const popoverRef = ref<HTMLDivElement | null>(null);
 
@@ -221,6 +223,11 @@ function openUpgrade(): void {
   close();
   showUpgrade.value = true;
 }
+
+function openSkills(): void {
+  close();
+  showSkills.value = true;
+}
 </script>
 
 <template>
@@ -357,6 +364,27 @@ function openUpgrade(): void {
         </div>
       </div>
 
+          <!-- Skills -->
+          <div class="border-b border-border px-3 py-2.5">
+            <div class="mb-1.5 flex items-baseline justify-between">
+              <span class="font-mono text-caption uppercase tracking-wide text-muted-foreground">
+                skills
+              </span>
+            </div>
+            <button
+              type="button"
+              class="flex w-full items-center justify-between rounded border border-border bg-background px-2 py-1 text-body hover:bg-muted"
+              @click="openSkills"
+            >
+              <span>Manage skills</span>
+              <Icon icon="codicon:arrow-right" class="h-3.5 w-3.5 text-muted-foreground" />
+            </button>
+            <p class="mt-1.5 text-caption leading-tight text-muted-foreground">
+              Markdown docs that extend pi. Reference inline with
+              <code class="rounded bg-muted px-1">@name</code>.
+            </p>
+          </div>
+
           <!-- Footer hint -->
           <div class="px-3 py-2 text-caption leading-tight text-muted-foreground">
             Settings live next to the composer so you don't lose visual
@@ -368,5 +396,6 @@ function openUpgrade(): void {
     </Teleport>
   </div>
 
+  <SkillsModal v-if="showSkills" @close="showSkills = false" />
   <UpgradeModal v-if="showUpgrade" :enabled="enabled" @close="showUpgrade = false" />
 </template>
