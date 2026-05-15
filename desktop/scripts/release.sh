@@ -58,6 +58,15 @@
 #   desktop/scripts/release.sh --no-upload    # local artefacts only
 #   desktop/scripts/release.sh --skip-sidecar # reuse existing sidecar dist
 #   desktop/scripts/release.sh --skip-icons   # don't rebuild icons
+#   desktop/scripts/release.sh --skip-notarize # build + sign + DMG only;
+#                                                skip Apple notary +
+#                                                staple. Use this on CI
+#                                                when Apple's notary
+#                                                queue is too slow to
+#                                                fit in a runner timeout
+#                                                — finish notarize/staple
+#                                                later from a laptop via
+#                                                desktop/scripts/notarize-local.sh.
 #   desktop/scripts/release.sh --local-env    # bypass GSM, use local .env
 #   desktop/scripts/release.sh --dmg-only     # rebuild + reupload Mac DMG
 #                                                from existing .app
@@ -104,20 +113,22 @@ LINUX_APPIMG_OUT="/tmp/Digi-Setu-${APP_VERSION}-amd64.AppImage"
 NO_UPLOAD=0
 SKIP_SIDECAR=0
 SKIP_ICONS=0
+SKIP_NOTARIZE=0
 LOCAL_ENV=0
 DMG_ONLY=0
 DO_MAC=0
 DO_LINUX=0
 for arg in "$@"; do
     case "$arg" in
-        --no-upload)    NO_UPLOAD=1 ;;
-        --skip-sidecar) SKIP_SIDECAR=1 ;;
-        --skip-icons)   SKIP_ICONS=1 ;;
-        --local-env)    LOCAL_ENV=1 ;;
-        --dmg-only)     DMG_ONLY=1; DO_MAC=1 ;;
-        --mac)          DO_MAC=1 ;;
-        --linux)        DO_LINUX=1 ;;
-        --all)          DO_MAC=1; DO_LINUX=1 ;;
+        --no-upload)     NO_UPLOAD=1 ;;
+        --skip-sidecar)  SKIP_SIDECAR=1 ;;
+        --skip-icons)    SKIP_ICONS=1 ;;
+        --skip-notarize) SKIP_NOTARIZE=1 ;;
+        --local-env)     LOCAL_ENV=1 ;;
+        --dmg-only)      DMG_ONLY=1; DO_MAC=1 ;;
+        --mac)           DO_MAC=1 ;;
+        --linux)         DO_LINUX=1 ;;
+        --all)           DO_MAC=1; DO_LINUX=1 ;;
         -h|--help)
             sed -n '/^# Usage:/,/^$/p' "$0" | sed 's/^# \?//'
             exit 0
@@ -471,6 +482,19 @@ notarize_dmg_mac() {
        || -z "${APPLE_NOTARY_API_KEY_ID:-}" \
        || -z "${APPLE_NOTARY_API_ISSUER:-}" ]]; then
         log "skipping notarization (APPLE_NOTARY_API_KEY{,_ID} / APPLE_NOTARY_API_ISSUER not all set)"
+        return 0
+    fi
+
+    # `--skip-notarize` flag: bail out before talking to Apple. Used
+    # on CI when Apple's notary queue is too slow to fit in a runner
+    # timeout (a brand-new Developer ID's first ~5 submissions can
+    # take 30 min – several hours each per Apple DTS). The signed
+    # DMG is then notarized + stapled later from a laptop via
+    # desktop/scripts/notarize-local.sh, which has no wall-clock
+    # cap and can run in the background overnight.
+    if [[ ${SKIP_NOTARIZE:-0} -eq 1 ]]; then
+        log "--skip-notarize set; DMG is signed but NOT notarized."
+        log "to finish later: bash desktop/scripts/notarize-local.sh ${DMG_OUT}"
         return 0
     fi
 

@@ -401,7 +401,7 @@ jobs:
           APPLE_NOTARY_API_ISSUER:     ${{ secrets.APPLE_NOTARY_API_ISSUER }}
         run: bash desktop/scripts/ci-setup-apple-signing.sh
 
-      - name: Build mac DMG (release.sh --mac --local-env --no-upload)
+      - name: Build mac DMG (release.sh --mac --local-env --no-upload --skip-notarize)
         env:
           APP_VERSION: ${{ env.APP_VERSION }}
           # APPLE_SIGNING_IDENTITY + APPLE_NOTARY_API_KEY{,_ID,_ISSUER}
@@ -409,31 +409,33 @@ jobs:
           # When unset, release.sh falls back to ad-hoc sign + skip
           # notarize, so PR builds keep producing usable artefacts.
         run: |
-          # --local-env  → release.sh reads desktop/backend/.env (we just staged it)
-          # --no-upload  → CI controls the upload below; release.sh's smoke-test
-          #                 needs gcloud + curl against the eventual public URL,
-          #                 which is brittle to do mid-job.
-          bash desktop/scripts/release.sh --mac --local-env --no-upload
+          # --local-env     → release.sh reads desktop/backend/.env
+          #                    (we just staged it)
+          # --no-upload     → CI uploads via the artefact step below,
+          #                    not via deploy/scripts/upload-installer.sh
+          #                    which is brittle mid-job.
+          # --skip-notarize → CRITICAL: Apple's notary queue can take
+          #                    30 min – 6 h for a brand-new Developer
+          #                    ID's first ~5 submissions, blowing past
+          #                    any reasonable runner timeout. Build +
+          #                    sign here (deterministic ~20 min);
+          #                    notarize + staple happens later from a
+          #                    laptop via desktop/scripts/notarize-
+          #                    local.sh, which has no wall-clock cap.
+          bash desktop/scripts/release.sh --mac --local-env --no-upload --skip-notarize
 
-      - name: Upload .dmg to digi-setu.com (only if SA key provided)
-        if: steps.flags.outputs.has_gcp == 'true'
-        env:
-          GCP_PROJECT: ${{ secrets.GCP_PROJECT || 'digi-setu-dev' }}
-          GCP_VM:      ${{ secrets.GCP_VM      || 'digi-setu-live' }}
-          GCP_ZONE:    ${{ secrets.GCP_ZONE    || 'us-central1-a' }}
-        run: |
-          DMG="/tmp/Digi-Setu-${APP_VERSION}-arm64.dmg"
-          if [[ -f "$DMG" ]]; then
-            bash deploy/scripts/upload-installer.sh "$DMG"
-          else
-            echo "::warning::no arm64 .dmg produced at $DMG"
-            ls -la /tmp/Digi-Setu-* || true
-          fi
+      # NOTE: cloud upload removed — the DMG is signed but NOT
+      # notarized at this point. Uploading an unnotarized DMG to
+      # digi-setu.com would Gatekeeper-reject every download. Run
+      # `bash desktop/scripts/notarize-local.sh --from-gh latest --upload`
+      # from your laptop after this run completes; that script
+      # notarizes, staples, and uploads in one shot.
 
       - uses: actions/upload-artifact@v4
         with:
           name: macos-arm-dmg
           path: /tmp/Digi-Setu-*-arm64.dmg
+          retention-days: 14
 
   # ── macOS x86_64 (Intel) ────────────────────────────────────────────
   # Output: Digi-Setu-<version>-x86_64.dmg
@@ -593,33 +595,23 @@ jobs:
           # Tauri's externalBin config picks up `pi-typst-sidecar-<target-triple>`.
           cp "$DIST/pi-typst-sidecar" "$DIST/pi-typst-sidecar-x86_64-apple-darwin"
 
-      - name: Build x86_64 DMG (release.sh --mac --local-env --no-upload --skip-sidecar)
+      - name: Build x86_64 DMG (release.sh --mac --local-env --no-upload --skip-sidecar --skip-notarize)
         env:
           APP_VERSION: ${{ env.APP_VERSION }}
         run: |
           # Override the host arch detection so release.sh targets x86_64
           # even though we're running on ARM. The sidecar is already built
           # above (x86_64 via Rosetta), so --skip-sidecar avoids rebuilding
-          # it as arm64.
+          # it as arm64. --skip-notarize: see macos-arm comment.
           export TAURI_CLI_TARGET=x86_64-apple-darwin
-          bash desktop/scripts/release.sh --mac --local-env --no-upload --skip-sidecar
+          bash desktop/scripts/release.sh --mac --local-env --no-upload --skip-sidecar --skip-notarize
 
-      - name: Upload .dmg to digi-setu.com (only if SA key provided)
-        if: steps.flags.outputs.has_gcp == 'true'
-        env:
-          GCP_PROJECT: ${{ secrets.GCP_PROJECT || 'digi-setu-dev' }}
-          GCP_VM:      ${{ secrets.GCP_VM      || 'digi-setu-live' }}
-          GCP_ZONE:    ${{ secrets.GCP_ZONE    || 'us-central1-a' }}
-        run: |
-          DMG="/tmp/Digi-Setu-${APP_VERSION}-x86_64.dmg"
-          if [[ -f "$DMG" ]]; then
-            bash deploy/scripts/upload-installer.sh "$DMG"
-          else
-            echo "::warning::no x86_64 .dmg produced at $DMG"
-            ls -la /tmp/Digi-Setu-* || true
-          fi
+      # Cloud upload removed — see macos-arm comment. Use
+      # `bash desktop/scripts/notarize-local.sh --from-gh latest --upload`
+      # from your laptop to finish the release.
 
       - uses: actions/upload-artifact@v4
         with:
           name: macos-intel-dmg
           path: /tmp/Digi-Setu-*-x86_64.dmg
+          retention-days: 14
