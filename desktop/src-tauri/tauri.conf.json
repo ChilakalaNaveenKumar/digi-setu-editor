@@ -91,6 +91,16 @@
       "desktop": {
         "schemes": ["digi-setu"]
       }
+    },
+    "updater": {
+      "active": true,
+      "windows": {
+        "installMode": "passive"
+      },
+      "endpoints": [
+        "https://digi-setu.com/desktop-updates/{{target}}-{{arch}}/{{current_version}}.json"
+      ],
+      "pubkey": "REPLACE_ME_WITH_OUTPUT_OF_TAURI_SIGNER_GENERATE"
     }
   }
 }

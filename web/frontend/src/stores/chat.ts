@@ -93,6 +93,21 @@ export const useChatStore = defineStore("chat", () => {
   const session = ref<SessionInfo | null>(null);
   const connState = ref<ConnState>("idle");
   const isStreaming = ref(false);
+  /**
+   * Distinct from `isStreaming`. While the user has clicked Stop but
+   * the backend hasn't confirmed yet, we sit in `isAborting`. The
+   * composer keeps showing the Stop pill (now labelled "Stopping…")
+   * so the user gets feedback that their click registered AND can
+   * retry if needed — previously we flipped `isStreaming` to false
+   * the instant the click happened, which made the pill vanish and
+   * the user (correctly) concluded "Stop didn't work" when pi was
+   * actually still wedged on a Vertex round-trip. Backend now has a
+   * 4 s grace + force-kill escalation, so this state should resolve
+   * within 4–5 s in the worst case; we add an 8 s frontend hard
+   * fallback below just to make sure the UI never gets permanently
+   * stuck if the abort POST itself fails.
+   */
+  const isAborting = ref(false);
   const lastError = ref<string | null>(null);
   const lastErrorCode = ref<string | null>(null);
 
@@ -252,6 +267,53 @@ export const useChatStore = defineStore("chat", () => {
     });
   }
 
+  // ── file-tree auto-refresh after filesystem-mutating tools ─────────
+  //
+  // Earlier behaviour: when the agent ran `write` / `edit` / `bash`
+  // (any of which can create, delete, or move files) the FileTreePane
+  // stayed stale until the user hit the manual Refresh button or
+  // switched chats. New files appeared in the editor (via
+  // applyLiveWrite) but were invisible in the tree, which made it
+  // look like the AI hadn't actually written the file.
+  //
+  // New behaviour: every time a tool finishes (status flips to
+  // `success` or `error`), if its name is one we know touches the
+  // filesystem, schedule a refresh. We debounce (300 ms) so a turn
+  // that writes 12 files in succession only fires ONE refresh after
+  // the last one settles, not 12 in a row.
+  const _FS_MUTATING_TOOLS = new Set(["write", "edit", "bash", "process"]);
+  let _treeRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  function _maybeRefreshFileTree(): void {
+    const last = router.messages[router.messages.length - 1];
+    if (!last || last.kind !== "assistant") return;
+    // Look at the most recent tool call that JUST finished. We don't
+    // walk the whole list because that'd refire every event of every
+    // tool that ever ran in this turn — pricey on a long thread.
+    let mutated = false;
+    for (let i = last.toolCalls.length - 1; i >= 0; i--) {
+      const tc = last.toolCalls[i];
+      if (tc.status !== "success" && tc.status !== "error") continue;
+      if (_FS_MUTATING_TOOLS.has(tc.name)) {
+        mutated = true;
+      }
+      // Only care about the LAST finished one — earlier finished
+      // calls in the same turn were already handled by an earlier
+      // tick of this function.
+      break;
+    }
+    if (!mutated) return;
+    if (_treeRefreshTimer !== null) clearTimeout(_treeRefreshTimer);
+    _treeRefreshTimer = setTimeout(() => {
+      _treeRefreshTimer = null;
+      // Lazy import dance — the files store needs the active workspace
+      // id which isn't set until `connect()` has fired. If we
+      // grabbed the store at module load we'd capture a stale Pinia
+      // instance after HMR.
+      const files = useFilesStore();
+      void files.refreshTree();
+    }, 300);
+  }
+
   // ── connect / disconnect ────────────────────────────────────────────
   /**
    * Open the SSE stream for `sessionId`. Hydrate persisted history
@@ -375,6 +437,7 @@ export const useChatStore = defineStore("chat", () => {
     messages.value = [];
     router = createRouterState();
     isStreaming.value = false;
+    _clearAbortState();
     _resetDisplayTotals();
     usePermissionsStore().clear();
     pendingAttachments.value = [];
@@ -426,7 +489,10 @@ export const useChatStore = defineStore("chat", () => {
     }
 
     if (evt.type === "agent_start" || evt.type === "turn_start") isStreaming.value = true;
-    else if (evt.type === "agent_end") isStreaming.value = false;
+    else if (evt.type === "agent_end") {
+      isStreaming.value = false;
+      _clearAbortState();
+    }
 
     if (evt.type === "compaction_start") {
       const reason = String((evt as { reason?: string }).reason || "threshold");
@@ -556,6 +622,7 @@ export const useChatStore = defineStore("chat", () => {
     }
 
     _syncEditorFromWriteCall();
+    _maybeRefreshFileTree();
     messages.value = router.messages.slice();
   }
 
@@ -590,14 +657,81 @@ export const useChatStore = defineStore("chat", () => {
     })();
   }
 
+  /**
+   * Two-stage abort:
+   *   1. Flip `isAborting` → composer shows "Stopping…" pill (still
+   *      clickable but disabled), `isStreaming` stays true so the
+   *      pill itself doesn't disappear.
+   *   2. POST /abort, then wait for either:
+   *        a) backend `agent_end` event → flips `isStreaming` false
+   *           via the normal event-router path. This is the path
+   *           BOTH the graceful and the force-kill cases now take —
+   *           on force-kill the backend synthesises `agent_end` (plus
+   *           `tool_execution_end` for every spinning tool card and
+   *           a `message_end` with `stopReason: "aborted"`) so the
+   *           SPA cleans up the same way it would have if pi exited
+   *           normally.
+   *        b) backend POST returns → belt-and-braces, we flip both
+   *           flags ourselves in case the SSE stream is racing.
+   *        c) 25 s elapses with no answer at all → defensive
+   *           fallback, we free the UI anyway so the user can keep
+   *           typing. Should be unreachable in practice — backend's
+   *           worst-case grace is 20 s.
+   */
+  let _abortFallbackTimer: ReturnType<typeof setTimeout> | null = null;
+  function _clearAbortState(): void {
+    if (_abortFallbackTimer !== null) {
+      clearTimeout(_abortFallbackTimer);
+      _abortFallbackTimer = null;
+    }
+    isAborting.value = false;
+  }
   function abort(): void {
-    // Always free the local UI immediately. The backend abort is a
-    // best-effort courtesy on top of that.
-    isStreaming.value = false;
-    if (!stream) return;
-    void stream.abort().catch(() => {
-      // swallow — local UI already reset, nothing else to do
-    });
+    // Idempotent — repeat clicks on the Stopping pill are no-ops.
+    if (isAborting.value) return;
+    if (!isStreaming.value && !stream) return;
+    isAborting.value = true;
+    if (!stream) {
+      isStreaming.value = false;
+      _clearAbortState();
+      return;
+    }
+    void stream
+      .abort()
+      .then(() => {
+        // Backend abort returned. Either it was a clean (graceful)
+        // abort — pi emitted `agent_end`, `isStreaming` already
+        // flipped, harmless — OR it took the slow path (20 s
+        // grace + force-kill). On the slow path we now synthesise
+        // `agent_end` server-side after SIGKILL, so the SSE event
+        // still flips `isStreaming` for us. This block is the
+        // belt-and-braces clear for both paths.
+        isStreaming.value = false;
+        _clearAbortState();
+      })
+      .catch(() => {
+        // Network error on the abort POST itself — free the UI
+        // anyway, the user shouldn't be trapped.
+        isStreaming.value = false;
+        _clearAbortState();
+      });
+
+    // 25 s defensive fallback. Sized to exceed the backend's 20 s
+    // graceful-abort grace by a comfortable margin so we never hide
+    // the "Stopping…" pill before the backend has a chance to
+    // complete the abort cleanly (which can legitimately take 5-15 s
+    // during a parallel `subagent` fan-out + slow Vertex stream).
+    // Previously 8 s — that fired DURING the grace window, kicking
+    // the user back to a typable state while pi was still cleaning
+    // up; the next prompt would race the half-finished turn and
+    // produce the "main agent cut off after refresh" symptom the
+    // user reported on 2026-05-16.
+    _abortFallbackTimer = setTimeout(() => {
+      if (isAborting.value) {
+        isStreaming.value = false;
+        _clearAbortState();
+      }
+    }, 25000);
   }
 
   // ── queue API ────────────────────────────────────────────────────────
@@ -746,6 +880,7 @@ export const useChatStore = defineStore("chat", () => {
     session,
     connState,
     isStreaming,
+    isAborting,
     lastError,
     lastErrorCode,
     clearError,

@@ -491,15 +491,25 @@ async def _call_google_vertex(
         f"/publishers/google/models/{model_id}:generateContent"
     )
 
-    # ── Explicit cache lookup ─────────────────────────────────────
-    # Only attempted when the caller threaded through ``full_corpus``
-    # so the cache layer can lockstep-refresh siblings if needed.
-    cached_resource: str | None = None
-    if full_corpus is not None:
-        try:
-            from services import gemini_cache  # local import to avoid cycle
+    # ── Explicit cache lookup + stale-cache recovery ─────────────
+    # We try the request up to TWICE: first with whatever cache the
+    # registry hands us, and — if Vertex says the cache is invalid /
+    # missing / expired — once more after invalidating + recreating.
+    # Anything beyond that is almost certainly an unrelated upstream
+    # error (auth, quota, region) and looping on it just costs latency.
+    from services import gemini_cache  # local import to avoid cycle
 
-            cached_resource = await gemini_cache.get_or_refresh(
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "x-goog-user-project": project,
+    }
+
+    async def _fetch_cache() -> str | None:
+        if full_corpus is None:
+            return None
+        try:
+            return await gemini_cache.get_or_refresh(
                 package=package,
                 corpus=full_corpus,
                 persona_for=_persona_for,
@@ -510,57 +520,86 @@ async def _call_google_vertex(
                 host=host,
                 token_provider=_adc_token,
             )
-        except Exception as exc:  # noqa: BLE001 - never let a cache bug 502 the route
+        except Exception as exc:  # noqa: BLE001
             print(
                 f"[typst-docs] gemini_cache lookup failed ({exc}); "
                 "falling back to inline-corpus path",
                 file=sys.stderr,
             )
-            cached_resource = None
+            return None
 
-    if cached_resource:
-        # Tiny body: cached prefix already holds persona+rules+corpus.
-        body = {
-            "cachedContent": cached_resource,
-            "contents": [
-                {"role": "user", "parts": [{"text": f"The user's brief:\n{query}"}]},
-            ],
-            "generationConfig": {
-                "temperature": 0.2,
-                "maxOutputTokens": 30000,
-            },
-        }
-    else:
+    def _build_body(cached: str | None) -> dict:
+        if cached:
+            # Tiny body: cached prefix already holds persona+rules+corpus.
+            return {
+                "cachedContent": cached,
+                "contents": [
+                    {"role": "user", "parts": [{"text": f"The user's brief:\n{query}"}]},
+                ],
+                "generationConfig": {
+                    "temperature": 0.2,
+                    "maxOutputTokens": 30000,
+                },
+            }
         prompt = (
             f"{persona}\n\n{_RULES}\n\nThe user's brief:\n{query}\n\n"
             f"The full corpus follows. Read what you need, ignore the rest.\n\n"
             f"{corpus_text}"
         )
-        body = {
+        return {
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {
                 "temperature": 0.2,
                 "maxOutputTokens": 30000,
             },
         }
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "x-goog-user-project": project,
-    }
+
+    cached_resource = await _fetch_cache()
+    body = _build_body(cached_resource)
+
+    resp: httpx.Response | None = None
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
             resp = await client.post(url, content=json.dumps(body), headers=headers)
+
+            # Stale-cache recovery: if Vertex says our cachedContent
+            # is missing / expired / invalid, drop the registry row,
+            # delete the Vertex resource (best-effort), force-create a
+            # new one, and retry exactly once. This is the only retry
+            # path we take — any other 4xx/5xx propagates as a 502.
+            if (
+                cached_resource
+                and resp.status_code != 200
+                and gemini_cache.is_stale_cache_error(
+                    status=resp.status_code, body=resp.text,
+                )
+            ):
+                print(
+                    f"[typst-docs] vertex says cache stale for {package} "
+                    f"(HTTP {resp.status_code}: {resp.text[:200]!r}); "
+                    "invalidating + recreating then retrying once",
+                    file=sys.stderr,
+                )
+                await gemini_cache.invalidate(
+                    package=package,
+                    project=project,
+                    host=host,
+                    token_provider=_adc_token,
+                )
+                cached_resource = await _fetch_cache()
+                body = _build_body(cached_resource)
+                resp = await client.post(url, content=json.dumps(body), headers=headers)
     except httpx.RequestError as exc:
         raise HTTPException(
             status_code=502,
             detail={"code": "upstream_unreachable", "message": str(exc)},
         )
-    if resp.status_code != 200:
+    if resp is None or resp.status_code != 200:
+        status = resp.status_code if resp is not None else 0
+        text = resp.text[:500] if resp is not None else ""
         raise HTTPException(
             status_code=502,
-            detail={"code": "vertex_error", "status": resp.status_code,
-                    "body": resp.text[:500]},
+            detail={"code": "vertex_error", "status": status, "body": text},
         )
     data = resp.json()
     parts = []

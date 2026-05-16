@@ -256,3 +256,69 @@ def get_json(
         # toast rather than dumping the raw exception.
         print(f"[cloud_api] {path} network error: {exc}", file=sys.stderr)
         raise CloudApiError(f"cloud unreachable: {exc}") from exc
+
+
+def post_json(
+    path: str,
+    body: Optional[dict[str, Any]] = None,
+    *,
+    timeout: float = _DEFAULT_TIMEOUT_SECS,
+) -> Any:
+    """POST a JSON body to ``{PI_CLOUD_API_BASE}{path}`` with the
+    cached desktop JWT.
+
+    Mirror of ``get_json`` but for the rare desktop→cloud writes:
+    today only ``/api/desktop/heartbeat`` (the per-install
+    version-checkin), but the same shape supports any future
+    write-side endpoint that the desktop needs to drive without a
+    full browser bounce.
+
+    We deliberately keep the surface tiny — no streaming, no
+    chunked uploads, no retries-with-backoff. The desktop's two
+    write callers (heartbeat, future telemetry) are both
+    "best-effort, fire on boot, swallow failures" and don't
+    benefit from heroic retry logic. A failed call simply means
+    we lose one heartbeat; the next boot reports the same
+    version and the cloud catches up.
+    """
+    bearer = _bearer_token()
+    url = _build_url(path)
+    payload = json.dumps(body or {}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {bearer}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "digi-setu-desktop-sidecar/1.0 (cloud-api)",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+            try:
+                return json.loads(raw) if raw else None
+            except json.JSONDecodeError as exc:
+                raise CloudApiError(
+                    f"cloud returned non-JSON for POST {path}: {exc}",
+                    status=resp.status,
+                ) from exc
+    except urllib.error.HTTPError as exc:
+        body_excerpt = ""
+        try:
+            body_excerpt = exc.read().decode("utf-8", errors="replace")[:200]
+        except Exception:
+            pass
+        print(
+            f"[cloud_api] POST {path} → HTTP {exc.code}: {body_excerpt!r}",
+            file=sys.stderr,
+        )
+        raise CloudApiError(
+            f"cloud returned HTTP {exc.code}",
+            status=exc.code,
+        ) from exc
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        print(f"[cloud_api] POST {path} network error: {exc}", file=sys.stderr)
+        raise CloudApiError(f"cloud unreachable: {exc}") from exc

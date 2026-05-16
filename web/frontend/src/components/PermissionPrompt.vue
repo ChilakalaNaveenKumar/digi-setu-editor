@@ -1,11 +1,32 @@
 <!--
-  PermissionPrompt — inline tool-call approval card.
+  PermissionPrompt — approval banner above the composer.
 
-  Lives at the bottom-right of the chat pane (NOT a screen-blocking
-  modal). Default state shows one line: "Digi Setu wants to …" + 4
-  primary buttons. Click the chevron to expand for intent +
-  command/diff preview. Cursor / Aider / Goose all use this pattern —
-  the dialog never steals the screen.
+  Renders INLINE just above the Composer (between the message list
+  and the input area). NOT a teleported overlay, NOT a modal — a
+  prominent banner the user can't miss. The first iteration was
+  bottom-right fixed; testers consistently failed to notice it on
+  long-running turns. The second iteration parked it at the TOP of
+  the chat column (above MessageList), but that pushed the prompt
+  far from the user's eye path — they were watching the composer
+  for the next thing to type, not the chat header. The current
+  position pairs the prompt with the input region the user is
+  already focused on, so the Allow/Deny decision is one short eye-
+  flick away from the keyboard.
+
+  Visual hierarchy when a permission is pending:
+
+      …(message list above)…
+      ┌───────────────────────────────────────────────────────────┐
+      │ ⚠  Digi Setu wants to run a shell command  · rm -rf foo   │
+      │                                              ⏲30s [^] [⌃] │
+      │ [ Allow ]  [ Always allow ]  [ Always deny ]  [ Deny ]   │
+      └───────────────────────────────────────────────────────────┘
+      ┌──── composer (Add a follow-up…) ─────────────────────────┐
+
+  Mirrors pi-mono-main's TUI flow (extensions/permission-gate.ts
+  uses `ctx.ui.select(…)` which produces the same allow/deny choice
+  semantics — we just render it as a graphical banner instead of a
+  TUI selector).
 
   Decisions go back over the WS via chat.sendPermissionResponse, then
   we dequeue locally so the next pending request takes the slot.
@@ -275,30 +296,28 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <Teleport to="body">
-    <Transition
-      enter-active-class="transition-all duration-150 ease-out"
-      leave-active-class="transition-all duration-100 ease-in"
-      enter-from-class="opacity-0 translate-y-2"
-      leave-to-class="opacity-0 translate-y-2"
+  <Transition
+    enter-active-class="transition-all duration-150 ease-out"
+    leave-active-class="transition-all duration-100 ease-in"
+    enter-from-class="opacity-0 -translate-y-1"
+    leave-to-class="opacity-0 -translate-y-1"
+  >
+    <!--
+      Banner anchors at the TOP of the chat column. Mounted from
+      ChatPane.vue (between header and MessageList) so it pushes the
+      message list down — impossible to miss while a decision is
+      pending. No backdrop / no blur — long-running chat threads
+      remain readable while the user reads the permission detail
+      and decides.
+    -->
+    <div
+      v-if="current"
+      :key="current.id"
+      class="pi-permission-banner border-b border-warning/40 bg-warning/10 text-foreground shadow-[inset_0_-1px_0_rgb(0_0_0/0.05)]"
+      role="alertdialog"
+      aria-modal="false"
+      aria-labelledby="permission-title"
     >
-      <!--
-        Bottom-right anchor on desktop, full-width on small screens. We
-        deliberately don't blur or dim the page — long-running chat
-        threads stay readable while the user decides. Cursor /
-        Continue.dev both behave this way.
-      -->
-      <div
-        v-if="current"
-        class="pointer-events-none fixed inset-x-3 bottom-3 z-40 flex justify-end sm:inset-x-auto sm:right-4 sm:bottom-4"
-        role="dialog"
-        aria-modal="false"
-        aria-labelledby="permission-title"
-      >
-        <div
-          :key="current.id"
-          class="pi-permission-card pointer-events-auto w-full max-w-[440px] overflow-hidden rounded-md border border-border bg-popover text-foreground shadow-lg ring-1 ring-black/5"
-        >
           <!-- Compact header: icon · title · mode chip · queue · expand -->
           <div class="flex items-center gap-2 px-3 py-2">
             <Icon
@@ -505,8 +524,6 @@ onUnmounted(() => {
               {{ $t("permission.prompt.autoAllowHint", { secs: secondsLeft }) }}
             </div>
           </div>
-        </div>
-      </div>
-    </Transition>
-  </Teleport>
+    </div>
+  </Transition>
 </template>

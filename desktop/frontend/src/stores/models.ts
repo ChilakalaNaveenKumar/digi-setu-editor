@@ -26,8 +26,15 @@ export const useModelsStore = defineStore("models", () => {
    * conditionally surface the BYOK/Cloud hint in the picker — when
    * the user has no keys configured every row is cloud and the
    * badge becomes visual noise.
+   *
+   * UI is temporarily pinned to `false` — we're hiding all
+   * "bring your own key" messaging until we're ready to relaunch
+   * that path. The backend value is still read into `_byokModeFromApi`
+   * so when the flag flips back, the only change is replacing the
+   * `false` constant below with `_byokModeFromApi.value`.
    */
-  const byokMode = ref(false);
+  const _byokModeFromApi = ref(false);
+  const byokMode = computed(() => false);
   const loaded = ref(false);
 
   const pinnedModelId = ref<string | null>(null);
@@ -40,7 +47,7 @@ export const useModelsStore = defineStore("models", () => {
       catalogue.value = r.models;
       defaultId.value = r.default;
       planId.value = r.plan;
-      byokMode.value = !!r.byok_mode;
+      _byokModeFromApi.value = !!r.byok_mode;
       loaded.value = true;
     } catch (exc) {
       console.warn("[models] refresh failed", exc);

@@ -9,19 +9,20 @@
   receipts, not aggregated analytics. The credit-remaining banner up
   top is the at-a-glance summary; the table is the audit trail.
 
-  ─── Data fetching strategy (rewritten 2026-05-09) ──────────────────
-  Original behaviour pulled the entire 500-event ring buffer on every
-  visit AND on every 30s auto-refresh. For a heavy user that's a 100s-
-  of-KB JSON payload landing on the wire every half minute even when
-  nothing changed.
+  ─── Data fetching strategy (no polling, rewritten 2026-05-16) ─────
+  The page never schedules a timer. The user gets:
 
-  New behaviour:
     1. Initial load    → GET /api/usage/events?limit=100   (last 100)
-    2. Auto-refresh    → GET …?since=<newest_ts>&limit=100 (PREPEND)
-                         only ships new rows since the last fetch.
+    2. Manual refresh  → GET …?limit=100, "Refresh" button.
     3. "Load older"    → GET …?before=<oldest_ts>&limit=100 (APPEND)
                          cursor-based pagination; hides itself when
                          the server says no more pages.
+
+  Earlier builds also ran a 30 s `pollNew` interval that pulled
+  `?since=<newest>` increments. Removed — the table is an audit
+  log, not a live feed, and the polling created a steady stream of
+  background traffic for a number nothing was watching most of the
+  time.
 
   Same shape mirrored on the BYOK table.
 
@@ -66,6 +67,12 @@ const loadingCloud = ref(false);
 const loadingMoreCloud = ref(false);
 
 // ── BYOK (local key) events ────────────────────────────────────────
+// The BYOK section is hidden in the UI for now — see Activity.vue
+// template (`v-if="byokActive"` gates). Keep the refs / loaders in
+// place so the page wiring stays intact for when we re-enable the
+// path; `byokActive` is permanently `false` for now so the section
+// never renders. Flip the assignment in `loadAll` back to
+// `byok.byok_active` to bring it back.
 const byokActive = ref(false);
 const byokEvents = ref<ByokEvent[]>([]);
 const byokSummary = ref<ByokSummary>({ total: {}, per_model: [] });
@@ -77,7 +84,6 @@ const loadingMoreByok = ref(false);
 const errMsg = ref("");
 const credit = ref<CreditSnapshot | null>(null);
 const lastFetchedAt = ref<string | null>(null);
-let refreshTimer: ReturnType<typeof setInterval> | null = null;
 
 const loading = computed(() => loadingCloud.value || loadingByok.value);
 
@@ -99,7 +105,9 @@ async function refresh(): Promise<void> {
     credit.value = usage.credit;
     events.value = evts.events;
     cloudHasMore.value = evts.has_more;
-    byokActive.value = byok.byok_active;
+    // Force-hidden — see ref declaration above. When re-enabling the
+    // BYOK UI, restore: `byokActive.value = byok.byok_active`.
+    byokActive.value = false;
     byokEvents.value = byok.events;
     byokSummary.value = byok.summary;
     byokHasMore.value = byok.has_more;
@@ -110,45 +118,6 @@ async function refresh(): Promise<void> {
     loadingCloud.value = false;
     loadingByok.value = false;
   }
-}
-
-/**
- * Polling tick — pull only the rows newer than the newest currently-
- * shown row and PREPEND them. Skips entirely when there are no rows
- * yet (the next visible refresh handles that). We bound the poll
- * payload at PAGE_SIZE — a user actively running 100+ chats inside
- * 30s is implausible, but if it ever happens they'll see "Refresh"
- * repopulate properly on the next tick.
- */
-async function pollNew(): Promise<void> {
-  if (loadingCloud.value || loadingByok.value) return;
-  // Cloud
-  try {
-    const newestCloud = events.value[0]?.ts;
-    if (newestCloud) {
-      const r = await getUsageEvents({ limit: PAGE_SIZE, since: newestCloud });
-      if (r.events.length > 0) events.value = [...r.events, ...events.value];
-    }
-  } catch {
-    /* polling failures are silent — the next manual refresh will surface them */
-  }
-  // BYOK
-  try {
-    if (byokActive.value) {
-      const newestByok = byokEvents.value[0]?.ts;
-      if (newestByok) {
-        const r = await getByokUsage({ limit: PAGE_SIZE, since: newestByok });
-        if (r.events.length > 0) {
-          byokEvents.value = [...r.events, ...byokEvents.value];
-        }
-        // Re-pull the rollup so per-model totals stay accurate.
-        byokSummary.value = r.summary;
-      }
-    }
-  } catch {
-    /* see above */
-  }
-  lastFetchedAt.value = new Date().toISOString();
 }
 
 /**
@@ -187,19 +156,16 @@ async function loadOlderByok(): Promise<void> {
 
 onMounted(() => {
   void refresh();
-  // Light auto-refresh while the tab is open so a chat happening in
-  // a different tab shows up here without a manual reload. 30 s is
-  // a reasonable middle ground — frequent enough to feel live, rare
-  // enough that it doesn't show up in the network panel. We poll
-  // INCREMENTALLY (only new rows since the newest visible) instead
-  // of refetching the whole window.
-  refreshTimer = setInterval(() => {
-    if (document.visibilityState === "visible") void pollNew();
-  }, 30_000);
+  // No setInterval polling. The page has a visible Refresh button
+  // (header, hit "Refresh now") and a one-shot refresh on mount;
+  // anything else would mean firing /api/usage at a number nobody
+  // is necessarily watching. Users who want live numbers can click;
+  // users who don't pay no cost.
 });
 
 onBeforeUnmount(() => {
-  if (refreshTimer) clearInterval(refreshTimer);
+  // Nothing to clean up — no interval was started. Hook kept so
+  // future side-effect registration has the symmetric pair.
 });
 
 // ── derived ────────────────────────────────────────────────────────
@@ -724,7 +690,7 @@ const byokTotalTokens = computed(() => {
         v-if="lastFetchedAt"
         class="mt-3 font-mono text-caption text-muted-foreground"
       >
-        Last refreshed {{ fmtTime(lastFetchedAt) }} · auto-refreshes every 30s (new rows only)
+        Last refreshed {{ fmtTime(lastFetchedAt) }} · click Refresh for the latest numbers
       </p>
     </main>
   </div>

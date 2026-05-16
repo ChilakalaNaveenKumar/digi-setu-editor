@@ -40,6 +40,14 @@ pub mod ids {
     pub const FOCUS_CHAT: &str = "focus_chat";
     pub const NEW_CHAT: &str = "new_chat";
     pub const FIND_IN_CHAT: &str = "find_in_chat";
+    /// View ▸ "Restart & Clean Backend". Wired in lib.rs to a frontend
+    /// event the SPA picks up; the SPA invokes the ``restart_and_clean``
+    /// IPC and shows a transient toast while the watchdog respawns.
+    pub const RESTART_AND_CLEAN: &str = "restart_and_clean";
+    /// Help ▸ "Check for Updates…". Same pattern — emits a frontend
+    /// event so the SPA's Maintenance modal opens and drives the
+    /// download / install flow with progress feedback.
+    pub const CHECK_FOR_UPDATES: &str = "check_for_updates";
     pub const HELP_DOCS: &str = "help_docs";
     pub const HELP_REPORT: &str = "help_report";
     pub const HELP_HOMEPAGE: &str = "help_homepage";
@@ -141,6 +149,15 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         .accelerator("CmdOrCtrl+L")
         .build(app)?;
 
+    // Big-red-button maintenance affordance. Lives in View (rather
+    // than a fresh "Tools" submenu) because that's where users
+    // already reach for "Reload Window" / "Toggle Fullscreen" — same
+    // class of "fix the rendering / fix the backend" actions.
+    let restart_clean_item =
+        MenuItemBuilder::with_id(ids::RESTART_AND_CLEAN, "Restart & Clean Backend")
+            .accelerator("CmdOrCtrl+Shift+K")
+            .build(app)?;
+
     let view_submenu = SubmenuBuilder::new(app, "View")
         .item(&reload_item)
         // DevTools accessor only compiled into debug builds; in release
@@ -154,6 +171,8 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         .item(&zoom_reset_item)
         .separator()
         .item(&fullscreen_item)
+        .separator()
+        .item(&restart_clean_item)
         .build()?;
 
     // ── Window submenu ───────────────────────────────────────────────
@@ -168,6 +187,8 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         .build()?;
 
     // ── Help submenu ─────────────────────────────────────────────────
+    let updates_item =
+        MenuItemBuilder::with_id(ids::CHECK_FOR_UPDATES, "Check for Updates…").build(app)?;
     let docs_item =
         MenuItemBuilder::with_id(ids::HELP_DOCS, "Documentation").build(app)?;
     let report_item = MenuItemBuilder::with_id(ids::HELP_REPORT, "Report Issue").build(app)?;
@@ -181,6 +202,8 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         MenuItemBuilder::with_id(ids::HELP_LICENSES, "Open Source Licenses").build(app)?;
 
     let help_submenu = SubmenuBuilder::new(app, "Help")
+        .item(&updates_item)
+        .separator()
         .item(&docs_item)
         .item(&report_item)
         .separator()

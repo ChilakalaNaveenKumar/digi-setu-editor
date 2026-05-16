@@ -68,7 +68,7 @@ const cfg = useConfigStore();
 const ws = useWorkspaceStore();
 const files = useFilesStore();
 const ui = useUiStore();
-const { pendingAttachments, queuedMessages, connState, isStreaming, lastErrorCode } = storeToRefs(chat);
+const { pendingAttachments, queuedMessages, connState, isStreaming, isAborting, lastErrorCode } = storeToRefs(chat);
 
 const text = ref("");
 
@@ -608,23 +608,35 @@ const inputDisabled = computed(() => !!lastErrorCode.value);
         <!-- Model -->
         <ModelPicker />
 
-        <!-- Stop pill. The whole pill is the abort button — one tap
-             kills the in-flight pi turn. We deliberately drop the
-             "streaming…" label users complained about; the spinner-
-             dot + "Stop" + stop-icon already convey "something is
-             happening, click to cancel" without the redundant text.
-             Replaces a previously buried 28×28 icon button that users
-             routinely missed. -->
+        <!-- Stop pill. Stays visible while `isAborting` so the user
+             gets clear feedback that their click registered. Backend
+             abort has a 4 s grace + force-kill escalation; the
+             worst-case pill state is "Stopping…" for ~5 s. See
+             stores/chat.ts for the full two-stage abort rationale. -->
         <button
-          v-if="isStreaming"
+          v-if="isStreaming || isAborting"
           type="button"
-          class="ml-1 inline-flex items-center gap-1.5 rounded-full border border-destructive/40 bg-destructive/10 px-2.5 py-1 text-caption text-destructive transition-colors hover:border-destructive hover:bg-destructive hover:text-destructive-foreground"
-          title="Stop the current response"
+          :disabled="isAborting"
+          :class="[
+            'ml-1 inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-caption transition-colors',
+            isAborting
+              ? 'cursor-wait border-destructive/30 bg-destructive/5 text-destructive/80'
+              : 'border-destructive/40 bg-destructive/10 text-destructive hover:border-destructive hover:bg-destructive hover:text-destructive-foreground',
+          ]"
+          :title="isAborting ? 'Stopping the in-flight response…' : 'Stop the current response'"
           @click="chat.abort"
         >
-          <span class="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-destructive" />
-          <span>Stop</span>
-          <Icon icon="codicon:debug-stop" class="h-3 w-3" />
+          <span
+            :class="[
+              'inline-block h-1.5 w-1.5 animate-pulse rounded-full',
+              isAborting ? 'bg-destructive/60' : 'bg-destructive',
+            ]"
+          />
+          <span>{{ isAborting ? "Stopping…" : "Stop" }}</span>
+          <Icon
+            :icon="isAborting ? 'codicon:loading' : 'codicon:debug-stop'"
+            :class="['h-3 w-3', isAborting && 'animate-spin']"
+          />
         </button>
 
         <span class="ml-auto" />

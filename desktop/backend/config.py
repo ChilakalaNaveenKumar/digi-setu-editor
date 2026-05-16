@@ -185,6 +185,37 @@ if DEPLOY_MODE == "desktop" and _DESKTOP_HOME is not None:
         except OSError:
             pass
 
+    # ── Tighten file mode to 0600 ───────────────────────────────────
+    # This file can hold BYOK API keys (sk-ant-…, AIza…, sk-proj-…).
+    # With the default umask, the seeded file (and any file the user
+    # creates by hand in TextEdit/vim) ends up mode 0644 — readable
+    # by every process running as the user, every other local
+    # account, every backup tool that crawls $HOME, etc. Lock it down
+    # to owner-only on every boot so the desktop binary self-heals
+    # the perms whether the file was seeded by us, migrated from
+    # legacy `~/.digi-setu/`, or pasted in by the user. Best-effort:
+    # if chmod fails (read-only mount, weird FS) we still load the
+    # values but log a warning so the user knows.
+    try:
+        if _USER_ENV.exists() and os.name == "posix":
+            import stat as _stat
+            current_mode = _USER_ENV.stat().st_mode & 0o777
+            if current_mode != 0o600:
+                os.chmod(_USER_ENV, 0o600)
+                if current_mode & (_stat.S_IRGRP | _stat.S_IROTH):
+                    print(
+                        f"[config] tightened {_USER_ENV} perms "
+                        f"from {oct(current_mode)} → 0o600 "
+                        f"(was world/group-readable; BYOK keys are safer now)",
+                        file=__import__("sys").stderr,
+                    )
+    except OSError as exc:
+        print(
+            f"[config] WARN: could not chmod {_USER_ENV} to 0o600 ({exc}); "
+            f"BYOK keys may be readable by other processes on this machine",
+            file=__import__("sys").stderr,
+        )
+
     _load_dotenv_into_environ(_USER_ENV)
 
     # ── Vertex auto-config (operator only) ─────────────────────────

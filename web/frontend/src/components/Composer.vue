@@ -59,14 +59,13 @@ import { apiJson } from "../api/client";
 import { uploadAttachments } from "../api/attachments";
 import QueueStrip from "./QueueStrip.vue";
 import ModelPicker from "./ModelPicker.vue";
-import PermissionModePicker from "./PermissionModePicker.vue";
 import ChatSettingsMenu from "./ChatSettingsMenu.vue";
 
 const chat = useChatStore();
 const ws = useWorkspaceStore();
 const files = useFilesStore();
 const ui = useUiStore();
-const { pendingAttachments, queuedMessages, connState, isStreaming, lastErrorCode } = storeToRefs(chat);
+const { pendingAttachments, queuedMessages, connState, isStreaming, isAborting, lastErrorCode } = storeToRefs(chat);
 
 const text = ref("");
 const textareaRef = ref<HTMLTextAreaElement | null>(null);
@@ -623,29 +622,53 @@ const inputDisabled = computed(() => !!lastErrorCode.value);
           />
         </span>
 
-        <!-- Mode (Auto / Ask / Cautious) -->
-        <PermissionModePicker />
+        <!--
+          Permission mode chip removed on web — backend locks the
+          mode to `approve_all` (see
+          web/backend/services/user_prefs.py). Web's pi runs in our
+          sandbox container, so there's nothing for a "Cautious" /
+          "Ask" mode to gate against. Desktop's Composer still shows
+          its picker because tool calls run on the user's laptop.
+        -->
 
         <!-- Model -->
         <ModelPicker />
 
         <!-- Stop pill. The whole pill is the abort button — one tap
-             kills the in-flight pi turn. We deliberately drop the
-             "streaming…" label users complained about; the spinner-
-             dot + "Stop" + stop-icon already convey "something is
-             happening, click to cancel" without the redundant text.
-             Replaces a previously buried 28×28 icon button that users
-             routinely missed. -->
+             kills the in-flight pi turn. Stays visible while
+             `isAborting` so the user gets clear feedback that their
+             click registered (and is wired to retry safely if they
+             smash it again — abort() is now idempotent in chat.ts).
+             We previously flipped `isStreaming` to false the instant
+             the user clicked, which made the pill vanish and read as
+             "Stop didn't do anything" when pi was actually wedged on
+             a Vertex HTTP call that ignores AbortSignal. Backend now
+             has a 4 s grace + force-kill escalation, so the worst
+             case here is the pill showing "Stopping…" for ~5 s. -->
         <button
-          v-if="isStreaming"
+          v-if="isStreaming || isAborting"
           type="button"
-          class="ml-1 inline-flex items-center gap-1.5 rounded-full border border-destructive/40 bg-destructive/10 px-2.5 py-1 text-caption text-destructive transition-colors hover:border-destructive hover:bg-destructive hover:text-destructive-foreground"
-          title="Stop the current response"
+          :disabled="isAborting"
+          :class="[
+            'ml-1 inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-caption transition-colors',
+            isAborting
+              ? 'cursor-wait border-destructive/30 bg-destructive/5 text-destructive/80'
+              : 'border-destructive/40 bg-destructive/10 text-destructive hover:border-destructive hover:bg-destructive hover:text-destructive-foreground',
+          ]"
+          :title="isAborting ? 'Stopping the in-flight response…' : 'Stop the current response'"
           @click="chat.abort"
         >
-          <span class="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-destructive" />
-          <span>Stop</span>
-          <Icon icon="codicon:debug-stop" class="h-3 w-3" />
+          <span
+            :class="[
+              'inline-block h-1.5 w-1.5 animate-pulse rounded-full',
+              isAborting ? 'bg-destructive/60' : 'bg-destructive',
+            ]"
+          />
+          <span>{{ isAborting ? "Stopping…" : "Stop" }}</span>
+          <Icon
+            :icon="isAborting ? 'codicon:loading' : 'codicon:debug-stop'"
+            :class="['h-3 w-3', isAborting && 'animate-spin']"
+          />
         </button>
 
         <span class="ml-auto" />

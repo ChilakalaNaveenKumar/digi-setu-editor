@@ -321,7 +321,12 @@ fn home_dir() -> Option<PathBuf> {
 /// SIGKILL them. Cheap, idempotent, and matches what every other
 /// "single-process" desktop app does (Slack, Discord, VS Code all
 /// do this on boot).
-fn kill_orphan_sidecars() {
+///
+/// `pub(crate)` so the IPC `restart_and_clean` command in `commands.rs`
+/// can call the same sweep when the user clicks the "Restart & Clean
+/// Backend" affordance. Centralising the kill-list in one function
+/// keeps the boot-time and on-demand paths from drifting.
+pub(crate) fn kill_orphan_sidecars() {
     #[cfg(unix)]
     {
         // We previously used `pkill -9 -f pi-typst-sidecar`, but `-f`
@@ -357,10 +362,151 @@ fn kill_orphan_sidecars() {
     }
 }
 
+/// On-disk marker we drop after a successful "version migration" sweep
+/// in `<data_root>/.cleanup-version`. Read on every cold start; if its
+/// contents differ from the running app's `CARGO_PKG_VERSION` (or the
+/// file is missing entirely — first launch on a fresh install) we run
+/// the deep-purge path below before the sidecar comes up. After the
+/// sweep we write the current version back so the next boot is fast.
+const CLEANUP_VERSION_MARKER: &str = ".cleanup-version";
+
+/// Deep state-purge that runs once per app version on cold start.
+///
+/// `kill_orphan_sidecars()` covers the "previous boot left a sidecar
+/// running" case, but it does NOT cover state that survives in the
+/// user's data dir between boots and gets stale across upgrades:
+///
+///   * `<data_root>/tmp/` — short-lived working files the sidecar
+///     leaves behind on crash (`.tmp` files, half-written upload
+///     chunks). Harmless but gradually eat disk on long-running
+///     installs.
+///   * `<data_root>/pi-runtime/.lock`-style lock files left behind by
+///     a sidecar that died mid-self-heal (see services.pi_integrity).
+///     Without removing them the new sidecar sees "another process is
+///     still installing pi" and refuses to boot until they age out.
+///   * `<data_root>/.session.lock` style transient locks from the
+///     previous version's session manager.
+///
+/// Why version-gated rather than every boot: the deep sweep does
+/// filesystem walks (cheap, but non-zero), and a user who relaunches
+/// 50 times a day shouldn't pay the cost. A new install or in-place
+/// upgrade is the right trigger because:
+///   * The Tauri shell binary changed, so any IPC contract drift
+///     between versions is most dangerous right here.
+///   * Sidecar PyInstaller binary changed, so the in-flight
+///     `pi-runtime/` self-heal markers from the OLD sidecar are
+///     no-longer-valid signals for the NEW sidecar.
+///
+/// Idempotent: removing files that don't exist is a no-op. Errors are
+/// logged but never panic — the user must always be able to launch
+/// the app, even if the data root is read-only or partially corrupt.
+fn purge_legacy_state(data_root: &Path) {
+    if let Err(err) = std::fs::create_dir_all(data_root) {
+        log::warn!(
+            "purge_legacy_state: cannot ensure data root {}: {err}",
+            data_root.display()
+        );
+        return;
+    }
+
+    let marker_path = data_root.join(CLEANUP_VERSION_MARKER);
+    let current_version = env!("CARGO_PKG_VERSION");
+    let last_version = std::fs::read_to_string(&marker_path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+
+    if last_version == current_version {
+        log::debug!(
+            "purge_legacy_state: already cleaned for {current_version}; skipping deep sweep"
+        );
+        return;
+    }
+
+    log::info!(
+        "purge_legacy_state: version transition '{}' -> '{}', running deep cleanup",
+        if last_version.is_empty() { "<fresh install>" } else { &last_version },
+        current_version,
+    );
+
+    // 1. Always sweep orphan sidecars, even if a previous deep-purge
+    //    on this version succeeded. (We're here because the version
+    //    bumped, which means the sidecar binary on disk just got
+    //    replaced by the new bundle — kill anything still running
+    //    out of the OLD path before we spawn the new one.)
+    kill_orphan_sidecars();
+
+    // 2. tmp/ — best-effort recursive remove. We only nuke our own
+    //    `tmp` subdir, never the user's wider data root. Anything
+    //    truly important (chats, snapshots, registry) lives outside
+    //    `tmp/` by convention.
+    let tmp_dir = data_root.join("tmp");
+    if tmp_dir.exists() {
+        match std::fs::remove_dir_all(&tmp_dir) {
+            Ok(_) => log::info!(
+                "purge_legacy_state: removed {} (was carrying stale work)",
+                tmp_dir.display()
+            ),
+            Err(err) => log::warn!(
+                "purge_legacy_state: could not remove {}: {err}",
+                tmp_dir.display()
+            ),
+        }
+    }
+
+    // 3. Stale lock / pid files at well-known paths. The list is
+    //    deliberately exhaustive — we'd rather over-clean than leave
+    //    a stale lock that bricks the next sidecar boot.
+    let stale_files = [
+        data_root.join("pi-runtime").join(".heal.lock"),
+        data_root.join("pi-runtime").join(".install.lock"),
+        data_root.join(".session.lock"),
+        data_root.join(".registry.lock"),
+        data_root.join("tmp.flag"),
+    ];
+    for path in &stale_files {
+        if path.exists() {
+            if let Err(err) = std::fs::remove_file(path) {
+                log::warn!(
+                    "purge_legacy_state: could not remove stale {}: {err}",
+                    path.display()
+                );
+            } else {
+                log::info!("purge_legacy_state: removed stale {}", path.display());
+            }
+        }
+    }
+
+    // 4. Drop the new marker so the next boot is fast. We write the
+    //    file even if some of the cleanups above failed — the sweep
+    //    is best-effort and we don't want a single permission error
+    //    to lock us into the slow path forever.
+    if let Err(err) = std::fs::write(&marker_path, current_version) {
+        log::warn!(
+            "purge_legacy_state: could not write marker {}: {err} \
+             (next launch will redo the sweep)",
+            marker_path.display()
+        );
+    }
+}
+
 pub async fn spawn_sidecar(
     app: &AppHandle,
 ) -> Result<(SidecarHandle, u16), SidecarError> {
     let paths = resolve_paths(app)?;
+
+    // Versioned deep-purge. Runs the heavy sweep ONLY on the first
+    // launch after a fresh install or in-place upgrade; same-version
+    // relaunches read the marker file and short-circuit, so this
+    // costs ~1ms on the hot path.
+    //
+    // The deep-purge already kills orphan sidecars internally on the
+    // version-mismatch path. We still call ``kill_orphan_sidecars``
+    // again below for the SAME-version case (e.g. user force-quit
+    // and immediately relaunched) so the boot ALWAYS starts from a
+    // clean process table — the user should never have to chase
+    // ghost sidecars in Activity Monitor.
+    purge_legacy_state(&paths.data_root);
 
     // Sweep zombie sidecars from prior crashed / force-quit launches
     // BEFORE we pick a port — otherwise a stale sidecar could already
@@ -427,6 +573,13 @@ pub async fn spawn_sidecar(
         .env("PI_DESKTOP_NODE_BIN", &paths.node_bin)
         .env("PI_DESKTOP_PI_DIR", &paths.pi_dir)
         .env("PI_DESKTOP_BUNDLE_VENDOR_DIR", &paths.pi_runtime_root)
+        // Tells the sidecar's heartbeat module which app version it
+        // belongs to. We use the Tauri crate's CARGO_PKG_VERSION
+        // (the same value that gates ``purge_legacy_state`` above)
+        // so the cloud sees the bundle version, not the Python
+        // sidecar's internal __version__ — they're built together
+        // but only the bundle version is what users have installed.
+        .env("PI_DESKTOP_APP_VERSION", env!("CARGO_PKG_VERSION"))
         // Default the AI's permission posture to the Cursor-style
         // approve-risky mode. The user can toggle it from the UI;
         // this is just the first-launch default.

@@ -109,7 +109,7 @@
   --secondary-foreground: oklch(0.95 0.005 240);
 
   --muted:             oklch(0.26 0.005 240);
-  --muted-foreground:  oklch(0.68 0.01 240);   /* secondary text */
+  --muted-foreground:  oklch(0.78 0.01 240);   /* secondary text — bumped from 0.68→0.78 in 2026-05-16 for readability over the dark popover (`--popover: 0.24`); 0.68 was getting lost in body copy / hint text. */
 
   --border:            oklch(0.30 0.005 240);  /* dividers */
   --input:             oklch(0.30 0.005 240);  /* input borders */

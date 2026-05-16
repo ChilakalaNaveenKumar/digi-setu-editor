@@ -120,6 +120,23 @@ async def _lifespan(app: FastAPI):
     # the user to restart the app every time they drop a key.
     if DEPLOY_MODE == "desktop":
         dotenv_watcher.start()
+        # Cloud telemetry: tell digi-setu.com which version this
+        # install is running, so the cloud can light up "update
+        # available" badges in the web account UI and we can answer
+        # "how many users are on the latest build?" without scraping
+        # logs. Fires once per boot, in the background, after a
+        # short delay so the JWT cache has time to populate. Failure
+        # is silent — a missed heartbeat means we lose one data
+        # point, never a user-visible regression.
+        try:
+            from services import desktop_heartbeat
+            desktop_heartbeat.start()
+        except Exception as exc:  # noqa: BLE001
+            import sys as _sys
+            print(
+                f"[lifespan] desktop_heartbeat scheduling failed: {exc}",
+                file=_sys.stderr,
+            )
     if DEPLOY_MODE != "desktop":
         try:
             await container_pool.cleanup_orphaned_containers()

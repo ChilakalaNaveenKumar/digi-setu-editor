@@ -26,14 +26,16 @@ import { useBillingStore } from "../stores/billing";
 import { useChatStore } from "../stores/chat";
 import { useChatSessionStore } from "../stores/chat-session";
 import { useConfigStore } from "../stores/config";
+import { useSubagentPanelStore } from "../stores/subagent-panel";
 import { useUiStore } from "../stores/ui";
 import { useWorkspaceStore } from "../stores/workspace";
 import type { SessionRecord } from "../api/types";
 import CompactionPill from "./CompactionPill.vue";
 import Composer from "./Composer.vue";
-import CreditChip from "./CreditChip.vue";
 import MessageList from "./MessageList.vue";
+import PermissionPrompt from "./PermissionPrompt.vue";
 import SessionDisconnectedCard from "./SessionDisconnectedCard.vue";
+import SubagentLivePanel from "./SubagentLivePanel.vue";
 import UpgradeModal from "./UpgradeModal.vue";
 
 const chat = useChatStore();
@@ -43,6 +45,8 @@ const cfg = useConfigStore();
 const ws = useWorkspaceStore();
 const ui = useUiStore();
 const router = useRouter();
+const subagentPanel = useSubagentPanelStore();
+const { openCallId: subagentOpenCallId } = storeToRefs(subagentPanel);
 
 const {
   messages,
@@ -400,15 +404,14 @@ function pickFromHistory(s: SessionRecord): void {
         </div>
       </header>
 
-      <!-- Credit chip strip. Connection dot, model picker and settings
-           gear moved INTO the Composer card — see Composer.vue. We
-           keep credit visible up here so plan + usage reads at a glance
-           from the top of the pane without opening the gear menu. -->
-      <div
-        class="flex items-center justify-end gap-2 border-b border-sidebar-border px-3 py-1.5"
-      >
-        <CreditChip />
-      </div>
+      <!--
+        Credit chip removed from the IDE header. Previously two
+        CreditChip instances rendered here AND in the web header
+        below; both ran an onMounted /api/usage fetch + the gear
+        polled every 30 s. The credit gauge now lives ONLY inside
+        ChatSettingsMenu, fetched on click. See
+        ChatSettingsMenu.vue:`watch(open, …)`. Zero polling.
+      -->
     </template>
 
     <!-- ── WEB HEADER ─────────────────────────────────────────────── -->
@@ -417,7 +420,6 @@ function pickFromHistory(s: SessionRecord): void {
         class="flex items-center justify-between gap-2 border-b border-sidebar-border px-3 py-2"
       >
         <span class="text-caption uppercase tracking-wide text-muted-foreground">chat</span>
-        <CreditChip />
       </header>
     </template>
 
@@ -438,7 +440,21 @@ function pickFromHistory(s: SessionRecord): void {
       />
       <span>Connecting…</span>
     </div>
-    <MessageList v-else :messages="messages" />
+    <!--
+      MessageList vs SubagentLivePanel are mutually exclusive in this
+      flex slot. When the user clicks a SubagentToolCard the panel
+      store flips `openCallId`, we hide MessageList, and SubagentLivePanel
+      renders the live transcript using the SAME width/height the chat
+      uses (instead of the previous 560 px right-side drawer that
+      truncated wider tool cards on big screens). PermissionPrompt /
+      CompactionPill / Composer keep working below because they're
+      sibling flex children, not covered by an overlay anymore.
+    -->
+    <MessageList
+      v-if="!isInitialConnecting && !subagentOpenCallId"
+      :messages="messages"
+    />
+    <SubagentLivePanel v-else-if="!isInitialConnecting && subagentOpenCallId" />
 
     <!--
       Reconnecting pill — slim, non-modal indicator that the bridge
@@ -492,14 +508,22 @@ function pickFromHistory(s: SessionRecord): void {
           to="/login"
           class="inline-flex items-center rounded-md bg-primary px-3 py-1.5 text-body font-semibold text-primary-foreground shadow-sm transition-opacity hover:opacity-90"
         >{{ $t("nav.signIn") }}</RouterLink>
-        <RouterLink
-          to="/login"
-          class="text-body text-muted-foreground hover:text-foreground hover:underline"
-        >{{ $t("login.byok.title") }}</RouterLink>
+        <!-- BYOK CTA intentionally hidden — re-enable once we're ready
+             to surface the "use your own key" path again. The plumbing
+             (~/.digi-setu/.env, login.byok.* locales) still exists. -->
       </div>
     </div>
 
     <CompactionPill />
+
+    <!-- Pending-permission banner. Renders nothing when the queue is
+         empty. Anchored just above the Composer because that's where
+         the user's eye lives while a turn is in flight (watching for
+         the next thing to type / for the agent to finish). Earlier
+         iterations parked this at the top of the chat column; users
+         routinely missed the prompt because their gaze had already
+         moved to the composer. See PermissionPrompt.vue header comment. -->
+    <PermissionPrompt />
 
     <Composer />
 
@@ -523,5 +547,14 @@ function pickFromHistory(s: SessionRecord): void {
       :enabled="billingEnabled"
       @close="billing.dismissAutoUpgrade()"
     />
+
+    <!--
+      SubagentLivePanel was previously rendered here as an absolutely-
+      positioned right-side drawer. It now slots into the MessageList
+      position above (mutually exclusive with MessageList), so the
+      transcript inherits the chat column's responsive width instead of
+      being clamped to 560 px. See the v-if/v-else-if pair near
+      PermissionPrompt above and the comment block in SubagentLivePanel.vue.
+    -->
   </aside>
 </template>

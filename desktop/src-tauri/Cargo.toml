@@ -30,6 +30,22 @@ tauri-plugin-opener = "2"
 # already-running process so we can focus the existing window instead
 # of spawning a second sidecar that fights for the same registry file.
 tauri-plugin-single-instance = "2"
+# Auto-updater. The user clicks "Check for Updates…" (or it kicks off
+# silently on a 24 h timer); the plugin GETs a JSON manifest from
+# `tauri.conf.json#plugins.updater.endpoints`, compares semver to
+# CARGO_PKG_VERSION, downloads the bundle if newer, verifies the
+# minisign signature against the embedded public key, installs in
+# place, then restarts. We expose two IPCs (commands::check_for_update
+# / commands::apply_update_and_restart) so the SPA can drive the flow
+# itself rather than the plugin opening a native dialog the user can't
+# style. See ``UPDATER_SETUP.md`` for the signing-key + manifest-host
+# bootstrap a fresh dev/CI environment needs.
+tauri-plugin-updater = "2"
+# `process` so we can call ``app.restart()`` after the updater swaps
+# the bundle. The bundled `tauri::Manager::restart()` only exists on
+# 2.0+; we keep the plugin import in case we move to multi-window
+# coordinated restart later.
+tauri-plugin-process = "2"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

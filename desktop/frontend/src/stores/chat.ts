@@ -93,6 +93,20 @@ export const useChatStore = defineStore("chat", () => {
   const session = ref<SessionInfo | null>(null);
   const connState = ref<ConnState>("idle");
   const isStreaming = ref(false);
+  /**
+   * Distinct from `isStreaming`. While the user has clicked Stop but
+   * the backend hasn't confirmed yet, we sit in `isAborting`. The
+   * composer keeps showing the Stop pill (now labelled "Stopping…")
+   * so the user gets feedback that their click registered AND can
+   * retry if needed — previously we flipped `isStreaming` to false
+   * the instant the click happened, which made the pill vanish and
+   * the user (correctly) concluded "Stop didn't work" when pi was
+   * actually still wedged on a Vertex round-trip. Backend now has a
+   * 4 s grace + force-kill escalation, so this state should resolve
+   * within 4–5 s in the worst case; an 8 s frontend hard fallback
+   * frees the UI defensively if the abort POST itself fails.
+   */
+  const isAborting = ref(false);
   const lastError = ref<string | null>(null);
   const lastErrorCode = ref<string | null>(null);
 
@@ -252,6 +266,35 @@ export const useChatStore = defineStore("chat", () => {
     });
   }
 
+  // ── file-tree auto-refresh after filesystem-mutating tools ─────────
+  //
+  // Same hook as web/frontend — see chat.ts there for the full
+  // rationale. On desktop the impact is bigger because the agent
+  // writes to the USER'S real filesystem (not a sandbox container),
+  // so a stale tree shows the user "my AI didn't write the file" when
+  // it actually did. Debounced so a turn that writes 12 files only
+  // fires ONE refresh after the last write settles.
+  const _FS_MUTATING_TOOLS = new Set(["write", "edit", "bash", "process"]);
+  let _treeRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  function _maybeRefreshFileTree(): void {
+    const last = router.messages[router.messages.length - 1];
+    if (!last || last.kind !== "assistant") return;
+    let mutated = false;
+    for (let i = last.toolCalls.length - 1; i >= 0; i--) {
+      const tc = last.toolCalls[i];
+      if (tc.status !== "success" && tc.status !== "error") continue;
+      if (_FS_MUTATING_TOOLS.has(tc.name)) mutated = true;
+      break;
+    }
+    if (!mutated) return;
+    if (_treeRefreshTimer !== null) clearTimeout(_treeRefreshTimer);
+    _treeRefreshTimer = setTimeout(() => {
+      _treeRefreshTimer = null;
+      const files = useFilesStore();
+      void files.refreshTree();
+    }, 300);
+  }
+
   // ── connect / disconnect ────────────────────────────────────────────
   /**
    * Open the SSE stream for `sessionId`. Hydrate persisted history
@@ -375,6 +418,7 @@ export const useChatStore = defineStore("chat", () => {
     messages.value = [];
     router = createRouterState();
     isStreaming.value = false;
+    _clearAbortState();
     _resetDisplayTotals();
     usePermissionsStore().clear();
     pendingAttachments.value = [];
@@ -426,7 +470,10 @@ export const useChatStore = defineStore("chat", () => {
     }
 
     if (evt.type === "agent_start" || evt.type === "turn_start") isStreaming.value = true;
-    else if (evt.type === "agent_end") isStreaming.value = false;
+    else if (evt.type === "agent_end") {
+      isStreaming.value = false;
+      _clearAbortState();
+    }
 
     if (evt.type === "compaction_start") {
       const reason = String((evt as { reason?: string }).reason || "threshold");
@@ -556,6 +603,7 @@ export const useChatStore = defineStore("chat", () => {
     }
 
     _syncEditorFromWriteCall();
+    _maybeRefreshFileTree();
     messages.value = router.messages.slice();
   }
 
@@ -590,14 +638,48 @@ export const useChatStore = defineStore("chat", () => {
     })();
   }
 
+  /**
+   * Two-stage abort. See web/stores/chat.ts for the full rationale —
+   * mirrored here verbatim so desktop and web behave identically.
+   */
+  let _abortFallbackTimer: ReturnType<typeof setTimeout> | null = null;
+  function _clearAbortState(): void {
+    if (_abortFallbackTimer !== null) {
+      clearTimeout(_abortFallbackTimer);
+      _abortFallbackTimer = null;
+    }
+    isAborting.value = false;
+  }
   function abort(): void {
-    // Always free the local UI immediately. The backend abort is a
-    // best-effort courtesy on top of that.
-    isStreaming.value = false;
-    if (!stream) return;
-    void stream.abort().catch(() => {
-      // swallow — local UI already reset, nothing else to do
-    });
+    if (isAborting.value) return;
+    if (!isStreaming.value && !stream) return;
+    isAborting.value = true;
+    if (!stream) {
+      isStreaming.value = false;
+      _clearAbortState();
+      return;
+    }
+    void stream
+      .abort()
+      .then(() => {
+        isStreaming.value = false;
+        _clearAbortState();
+      })
+      .catch(() => {
+        isStreaming.value = false;
+        _clearAbortState();
+      });
+    // 25 s defensive fallback — must exceed the backend abort grace
+    // (20 s) so we never hide the "Stopping…" pill before pi has a
+    // chance to clean up gracefully (parallel subagent fan-out +
+    // slow Vertex stream can legitimately take 5-15 s). See the web
+    // copy of this file for the full rationale.
+    _abortFallbackTimer = setTimeout(() => {
+      if (isAborting.value) {
+        isStreaming.value = false;
+        _clearAbortState();
+      }
+    }, 25000);
   }
 
   // ── queue API ────────────────────────────────────────────────────────
@@ -755,6 +837,7 @@ export const useChatStore = defineStore("chat", () => {
     messages,
     session,
     connState,
+    isAborting,
     isStreaming,
     lastError,
     lastErrorCode,

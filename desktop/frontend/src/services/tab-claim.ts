@@ -2,7 +2,7 @@
  * tab-claim.ts — single-tab guard for chat sessions.
  *
  * Replaces the WebSocket-layer "kick the older tab" behaviour from
- * services/session_locks.py + chat-bridge.ts. Lives entirely in the
+ * services/session_locks.py + the old ChatBridge. Lives entirely in the
  * browser using BroadcastChannel — the backend doesn't need to
  * know how many tabs the user has open.
  *

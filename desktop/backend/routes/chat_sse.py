@@ -576,20 +576,36 @@ async def _sse_body(
     stream_iter = rt.stream(since=since).__aiter__()
     next_keepalive = asyncio.get_event_loop().time() + _KEEPALIVE_INTERVAL_SECONDS
 
+    # ── DO NOT inline `await asyncio.wait_for(stream_iter.__anext__(),
+    # timeout=…)` here. `wait_for` cancels the inner coroutine on
+    # timeout, which propagates a CancelledError *into* the underlying
+    # async generator (`rt.stream`) and finalises it — so the next
+    # `__anext__()` call raises StopAsyncIteration even though the
+    # runtime is perfectly healthy. The user sees a `_runtime_ended`
+    # event ~20s after every reconnect and the SPA reopens the stream
+    # in a hot loop (mirror of the web-backend fix on 2026-05-16).
+    #
+    # Fix: hold the pending `__anext__()` as a long-lived task and
+    # *shield* it from `wait_for`'s cancellation.
+    pending: Optional[asyncio.Task[tuple[int, dict[str, Any]]]] = None
     try:
         while True:
             if await request.is_disconnected():
                 break
+
+            if pending is None:
+                pending = asyncio.ensure_future(stream_iter.__anext__())
 
             now = asyncio.get_event_loop().time()
             timeout = max(0.5, next_keepalive - now)
 
             try:
                 ev_id, evt = await asyncio.wait_for(
-                    stream_iter.__anext__(), timeout=timeout
+                    asyncio.shield(pending), timeout=timeout
                 )
             except asyncio.TimeoutError:
-                # No event in the keepalive window — emit a comment.
+                # No event in the keepalive window — emit a comment;
+                # `pending` keeps running for the next iteration.
                 yield _KEEPALIVE
                 next_keepalive = asyncio.get_event_loop().time() + _KEEPALIVE_INTERVAL_SECONDS
                 continue
@@ -598,9 +614,12 @@ async def _sse_body(
                 # Same SSE-format rule as _format_sse: NO `event:`
                 # field, the marker rides on the JSON `type` so it
                 # lands on `onmessage` and the chat.ts dispatcher.
+                pending = None
                 yield b'data: {"type":"_runtime_ended"}\n\n'
                 break
 
+            # Successful event — re-arm pending for the next read.
+            pending = None
             yield _format_sse(ev_id, evt)
             next_keepalive = asyncio.get_event_loop().time() + _KEEPALIVE_INTERVAL_SECONDS
     except asyncio.CancelledError:
@@ -618,6 +637,19 @@ async def _sse_body(
             yield _format_sse(0, bridge_error("internal"))
         except Exception:  # noqa: BLE001
             pass
+    finally:
+        # Cancel & drain the pending __anext__() task on any exit
+        # path so we don't leak a dangling task on the event loop.
+        if pending is not None and not pending.done():
+            pending.cancel()
+            try:
+                await pending
+            except (
+                asyncio.CancelledError,
+                StopAsyncIteration,
+                Exception,  # noqa: BLE001
+            ):
+                pass
 
 
 @router.get("/api/sessions/{sid}/stream")

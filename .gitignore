@@ -6,6 +6,11 @@ data/
 runs/
 logs/
 
+# Cursor "Export chat" markdown dumps — these end up at the repo root
+# every time we run a postmortem or share a transcript, and they're
+# always many MB of one-off context that has no business in source.
+cursor_*.md
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Secrets / local config
 # ─────────────────────────────────────────────────────────────────────────────

@@ -6,9 +6,17 @@
   on narrow widths.
 
   What lives here:
-    - Permission mode picker (approve_all / auto / manual)
     - Plan + credit usage with progress bar + Upgrade button
+    - Routing default (BYOK vs cloud), only when byok keys exist
     - Quick links to /pricing and "Open billing portal"
+    - Manage skills modal trigger
+
+  What used to live here but doesn't anymore:
+    - Permission mode picker. Web runs pi inside our sandbox
+      container, so tool calls are safe by construction and the
+      modal-prompt UX has zero upside — it can only stall the chat
+      behind a hidden prompt. Locked to `approve_all` server-side
+      (see web/backend/services/user_prefs.py).
 
   What does NOT live here: the model picker. Model is changed often
   (per prompt) so it stays as a first-class control next to the gear.
@@ -22,7 +30,6 @@ import { apiJson, apiPatch } from "../api/client";
 import { useBillingStore } from "../stores/billing";
 import { useConfigStore } from "../stores/config";
 
-import PermissionModePicker from "./PermissionModePicker.vue";
 import SkillsModal from "./SkillsModal.vue";
 import UpgradeModal from "./UpgradeModal.vue";
 
@@ -39,8 +46,8 @@ const showSkills = ref(false);
 const triggerRef = ref<HTMLButtonElement | null>(null);
 const popoverRef = ref<HTMLDivElement | null>(null);
 
-// Same fixed-position-via-Teleport trick PermissionModePicker /
-// ModelPicker use, for the same two reasons:
+// Same fixed-position-via-Teleport trick ModelPicker uses, for the
+// same two reasons:
 //   1. The composer toolbar where this gear lives is at the BOTTOM of
 //      the chat pane. Opening downward (the previous absolute top-full
 //      behaviour) pushed the popover off-screen and the user couldn't
@@ -106,8 +113,6 @@ const routingDefault = ref<RoutingDefault | null>(null);
 const byokModeAvailable = ref(false);
 const routingUpdating = ref(false);
 
-let pollHandle: number | null = null;
-
 async function loadPrefs(): Promise<void> {
   try {
     const r = await apiJson<PrefsResponse>("/api/me/prefs");
@@ -149,12 +154,7 @@ async function setRoutingDefault(value: RoutingDefault): Promise<void> {
 const showRoutingToggle = computed(() => false);
 
 onMounted(() => {
-  void billing.refreshStatus();
-  void billing.refreshUsage();
   void loadPrefs();
-  // 30 s is enough — usage rarely changes outside an active turn,
-  // and message_end already nudges the ledger live.
-  pollHandle = window.setInterval(() => void billing.refreshUsage(), 30_000);
   document.addEventListener("click", onDocClick);
   // Same capture-phase listeners the other pickers use so we
   // re-anchor when ANY ancestor scrolls (chat pane scroll, page
@@ -164,14 +164,28 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
-  if (pollHandle !== null) window.clearInterval(pollHandle);
   document.removeEventListener("click", onDocClick);
   window.removeEventListener("resize", reposition);
   window.removeEventListener("scroll", reposition, true);
 });
 
+// We deliberately do NOT keep a setInterval polling /api/usage.
+// Earlier builds fired refreshUsage every 30 seconds while the
+// chat was visible; for a power user with 8 tabs open that meant
+// ~14k unnecessary cloud round-trips a day, all to refresh a
+// number that nothing reads until the user clicks the gear.
+// Instead: fetch on click. The popover opens, we hit /api/usage
+// + /api/billing/status once, and the numbers are correct for
+// the entire time the popover is visible. Closing it cancels any
+// in-flight refresh next time round.
 watch(open, async (v) => {
   if (!v) return;
+  // Fire-and-forget — `refreshStatus` reads the plan catalogue
+  // (cached server-side, ~1 ms) and `refreshUsage` reads the
+  // credit gauge. Both writes go through the shared billing
+  // store, so any other surface watching them updates too.
+  void billing.refreshStatus();
+  void billing.refreshUsage();
   await nextTick();
   reposition();
 });
@@ -257,19 +271,13 @@ function openSkills(): void {
         class="z-[60] flex flex-col overflow-hidden rounded-md border border-border bg-popover shadow-xl ring-1 ring-black/10"
       >
         <div class="flex-1 overflow-y-auto">
-      <!-- Permission mode -->
-      <div class="border-b border-border px-3 py-2.5">
-        <div class="mb-1.5 flex items-baseline justify-between">
-          <span class="font-mono text-caption uppercase tracking-wide text-muted-foreground">
-            permissions
-          </span>
-        </div>
-        <PermissionModePicker />
-        <p class="mt-1.5 text-caption leading-tight text-muted-foreground">
-          Controls when pi asks before running tools. Audit trail is
-          always recorded.
-        </p>
-      </div>
+      <!--
+        Permission mode picker removed on web in 2026-05-16. Backend
+        locks the mode to `approve_all` for every user — pi runs in
+        our sandbox container so there's no host-side surface to
+        prompt about. See web/backend/services/user_prefs.py
+        (`DEFAULT_PERMISSION_MODE` doc comment).
+      -->
 
       <!-- Routing default (BYOK vs Cloud). Only surfaces when the
            desktop sidecar booted with at least one BYOK key in

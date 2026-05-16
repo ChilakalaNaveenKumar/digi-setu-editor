@@ -66,6 +66,7 @@ from routes import (
     chat_sse,
     chat_ws,
     config as config_route,
+    desktop as desktop_routes,
     desktop_handoff,
     desktop_relay,
     feedback,
@@ -141,17 +142,73 @@ async def _lifespan(app: FastAPI):
     from services.file_watcher import WatcherRegistry as _WR
     await _WR.instance().start_reaper()
 
-    # ── Pre-warm the Gemini explicit context cache for search_docs ──
-    # Per-package caches expire on a 24 h TTL; doing this in the
-    # background here means the FIRST real user request finds them
-    # already warm. Failures are logged inside the helper and never
-    # propagate — startup must not block on a Vertex hiccup.
-    import asyncio as _asyncio
-    _asyncio.create_task(_prewarm_typst_cache())
+    # ── Gemini explicit context cache: DB + sweeper ────────────────
+    # The pre-2026-05 design eagerly created all 7 caches at boot,
+    # tracked them in a per-process dict, and leaked the previous
+    # boot's resources on every redeploy (~$1k/day in storage at
+    # steady state — see services/gemini_cache.py for the postmortem).
+    # The current design:
+    #
+    #   * `gemini_cache.get_or_refresh` creates caches LAZILY on the
+    #     first search_docs call per package. The cross-process
+    #     registry lives in services/gemini_cache_db.py (SQLite).
+    #   * A background SWEEPER scans the registry every 10 min and
+    #     evicts any cache that hasn't been touched for 1 h, plus any
+    #     Vertex-side cache matching our displayName pattern that
+    #     isn't tracked in the DB (orphan reconcile).
+    #
+    # The sweeper needs Vertex credentials; we configure it here with
+    # the same project/location/host/token plumbing the request hot
+    # path uses. Failure to wire the sweeper is non-fatal — the route
+    # still works, we just don't auto-evict idle caches in this
+    # process. Other workers / a redeploy will pick up the slack.
+    try:
+        from services import gemini_cache as _gem_cache
+        from routes.llm_relay import (  # type: ignore
+            _adc_token,
+            _gcp_project,
+            _resolve_google_location,
+            _vertex_host,
+        )
+        _proj = _gcp_project()
+        if _proj:
+            # The sweeper's reconcile pass talks to a single region.
+            # We pin it to whatever the default flash routing chose,
+            # since that's where 99 % of cachedContents resources live.
+            from services.models_registry import DEFAULT_MODEL_ID as _DEFAULT
+            _loc = _resolve_google_location(_DEFAULT)
+            _gem_cache.configure_sweeper(
+                project=_proj,
+                location=_loc,
+                host=_vertex_host(_loc),
+                token_provider=_adc_token,
+            )
+            _gem_cache.start_sweeper()
+        else:
+            import sys as _sys
+            print(
+                "[lifespan] gemini cache sweeper not started: no GCP "
+                "project resolved (running BYOK-only?)",
+                file=_sys.stderr,
+            )
+    except Exception as exc:  # noqa: BLE001
+        import sys as _sys
+        print(
+            f"[lifespan] gemini cache sweeper boot FAILED: {exc} — "
+            "caches will still work but idle eviction won't run from "
+            "this process; another worker / redeploy will compensate",
+            file=_sys.stderr,
+        )
 
     try:
         yield
     finally:
+        try:
+            from services import gemini_cache as _gem_cache_shutdown
+            await _gem_cache_shutdown.stop_sweeper()
+        except Exception as exc:  # noqa: BLE001
+            import sys as _sys
+            print(f"[lifespan] gemini cache sweeper stop failed: {exc}", file=_sys.stderr)
         egress_proxy.stop_egress_proxy()
         # Cancel the reaper. Active runtimes are NOT torn down on
         # backend shutdown (mirroring the existing WS path) — the
@@ -296,6 +353,11 @@ def create_app() -> FastAPI:
     # signed-in user.
     app.include_router(auth_webhook.router)
     app.include_router(desktop_handoff.router)
+    # Desktop install + heartbeat tracking. Sits next to
+    # desktop_handoff because they're both "things the desktop
+    # talks to the cloud about over plain HTTPS, with the user's
+    # JWT". See routes/desktop.py for the four endpoints.
+    app.include_router(desktop_routes.router)
 
     app.include_router(feedback.router)
     app.include_router(usage.router)

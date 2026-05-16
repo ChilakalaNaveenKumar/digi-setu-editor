@@ -30,6 +30,7 @@ mod deeplink;
 mod menu;
 mod secure_storage;
 mod sidecar;
+mod updater;
 
 use std::sync::Mutex;
 use tauri::{Emitter, Manager};
@@ -76,6 +77,14 @@ pub fn run() {
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_deep_link::init())
+        // Updater + process plugins. ``tauri_plugin_updater`` reads its
+        // endpoints + pubkey from ``tauri.conf.json#plugins.updater``
+        // and exposes a Rust API the IPC commands in ``updater.rs``
+        // wrap into a SPA-friendly surface. ``tauri_plugin_process``
+        // gives us ``app.restart()`` (used by ``apply_update_and_restart``)
+        // and is required by the updater plugin in Tauri 2.x.
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppState {
             backend_port: Mutex::new(None),
             sidecar: Mutex::new(None),
@@ -146,6 +155,9 @@ pub fn run() {
             commands::is_desktop,
             commands::open_new_window,
             commands::restart_sidecar,
+            commands::restart_and_clean,
+            updater::check_for_update,
+            updater::apply_update_and_restart,
             secure_storage::secure_store_session,
             secure_storage::secure_load_session,
             secure_storage::secure_delete_session,
@@ -224,6 +236,13 @@ fn handle_menu_event(app: &tauri::AppHandle, id: &str) {
         ids::NEW_CHAT => emit_to_active("menu:new_chat"),
         ids::FIND_IN_CHAT => emit_to_active("menu:find_in_chat"),
         ids::FOCUS_CHAT => emit_to_active("menu:focus_chat"),
+        // The SPA listens for these on every window and mounts the
+        // matching modal / triggers the IPC. Doing the IPC directly
+        // here would skip the SPA's progress UI (download bar for
+        // updates, "respawning…" banner for restart-clean) which is
+        // the whole point of having a UI in the first place.
+        ids::RESTART_AND_CLEAN => emit_to_active("menu:restart_and_clean"),
+        ids::CHECK_FOR_UPDATES => emit_to_active("menu:check_for_updates"),
         ids::RELOAD => {
             // Cmd+Shift+R bypasses the Cmd+R suppressor we set up in
             // main.ts (which exists to stop accidental reloads from

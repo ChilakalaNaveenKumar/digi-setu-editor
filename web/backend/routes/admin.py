@@ -135,6 +135,88 @@ async def _active_session_count() -> int:
         return 0
 
 
+@router.get("/gemini-caches")
+async def admin_gemini_caches_list(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Snapshot the Gemini cache registry + recent eviction audit log.
+
+    Powers operator dashboards / postmortem queries: "what's actively
+    burning Vertex storage right now?", "did the sweeper run today?",
+    "did invalidation kick in for any package this week?". The DB is
+    the single source of truth, so this endpoint reads what every
+    worker reads — no per-process drift.
+
+    Same admin-bearer auth as ``/api/admin/load`` (off-VM operators
+    can hit it without a Clerk session).
+    """
+    _require_admin_bearer(authorization)
+    from services import gemini_cache_db
+    from services import gemini_cache
+
+    last_sweep = gemini_cache_db.last_sweep_at()
+    return {
+        "ok": True,
+        "disabled": gemini_cache.is_disabled(),
+        "ttl_seconds": gemini_cache._ttl_seconds(),
+        "idle_ttl_seconds": gemini_cache_db._idle_ttl_s(),
+        "sweeper_interval_seconds": gemini_cache_db._sweeper_interval_s(),
+        "sweeper_running": gemini_cache_db.is_sweeper_running(),
+        "last_sweep_epoch": last_sweep,
+        "caches": gemini_cache_db.list_all(),
+        "recent_evictions": gemini_cache_db.list_evictions(limit=50),
+    }
+
+
+@router.post("/gemini-caches/sweep")
+async def admin_gemini_caches_sweep(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Force one sweeper cycle right now.
+
+    Bypasses the lease check (an operator hitting this knowingly is
+    asking for an immediate pass — they don't want "another worker
+    swept 4 minutes ago, try later"). Returns the counters from the
+    cycle so the response shows what was killed.
+    """
+    _require_admin_bearer(authorization)
+    from services import gemini_cache
+
+    counters = await gemini_cache.run_sweep_now()
+    return {"ok": True, "counters": counters}
+
+
+@router.post("/gemini-caches/{package}/invalidate")
+async def admin_gemini_caches_invalidate(
+    package: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Drop one specific package from the registry + delete its
+    Vertex resource. Operator escape hatch when a single cache is
+    misbehaving (corpus drift, manual fix-up after a botched deploy).
+
+    The next ``search_docs`` call for ``package`` will create a
+    fresh cache on the spot — no service interruption.
+    """
+    _require_admin_bearer(authorization)
+    from routes.llm_relay import _adc_token, _gcp_project, _resolve_google_location, _vertex_host
+    from services import gemini_cache
+    from services.models_registry import DEFAULT_MODEL_ID
+
+    project = _gcp_project()
+    if not project:
+        raise HTTPException(
+            status_code=503,
+            detail="no GCP project resolved (BYOK-only mode?)",
+        )
+    location = _resolve_google_location(DEFAULT_MODEL_ID)
+    host = _vertex_host(location)
+    await gemini_cache.invalidate(
+        package=package, project=project, host=host, token_provider=_adc_token,
+    )
+    return {"ok": True, "package": package}
+
+
 @router.get("/load")
 async def admin_load(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     """Snapshot of the signals the autoscaler needs.

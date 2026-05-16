@@ -1,14 +1,52 @@
 <!--
-  PermissionPrompt — inline tool-call approval card.
+  PermissionPrompt — approval banner above the composer.
 
-  Lives at the bottom-right of the chat pane (NOT a screen-blocking
-  modal). Default state shows one line: "Digi Setu wants to …" + 4
-  primary buttons. Click the chevron to expand for intent +
-  command/diff preview. Cursor / Aider / Goose all use this pattern —
-  the dialog never steals the screen.
+  Renders INLINE just above the Composer (between the message list
+  and the input area). NOT a teleported overlay, NOT a modal — a
+  prominent banner the user can't miss. The first iteration was
+  bottom-right fixed; testers consistently failed to notice it on
+  long-running turns. The second iteration parked it at the TOP of
+  the chat column (above MessageList), but that pushed the prompt
+  far from the user's eye path — they were watching the composer
+  for the next thing to type, not the chat header. The current
+  position pairs the prompt with the input region the user is
+  already focused on, so the Allow/Deny decision is one short eye-
+  flick away from the keyboard.
+
+  Visual hierarchy when a permission is pending:
+
+      …(message list above)…
+      ┌───────────────────────────────────────────────────────────┐
+      │ ⚠  Digi Setu wants to run a shell command  · rm -rf foo   │
+      │                                              ⏲30s [^] [⌃] │
+      │ [ Allow ]  [ Always allow ]  [ Always deny ]  [ Deny ]   │
+      └───────────────────────────────────────────────────────────┘
+      ┌──── composer (Add a follow-up…) ─────────────────────────┐
+
+  Mirrors pi-mono-main's TUI flow (extensions/permission-gate.ts
+  uses `ctx.ui.select(…)` which produces the same allow/deny choice
+  semantics — we just render it as a graphical banner instead of a
+  TUI selector).
 
   Decisions go back over the WS via chat.sendPermissionResponse, then
   we dequeue locally so the next pending request takes the slot.
+
+  Auto-allow countdown:
+    The prompt arrives with a 30-second countdown ring on the Allow
+    button. If the user takes no action before it hits zero, we fire
+    `allow_once` for them. Two reasons:
+      1. The old fail-closed default (back-end "deny on timeout") had
+         a horrible failure mode — a single dropped SSE frame would
+         silently nuke every tool call in the chat and the user just
+         saw "the agent is broken". Fail-open on the visible countdown
+         removes that mode for AFK / first-time / network-flake users.
+      2. The visible countdown gives the user a clear "something is
+         about to happen" signal so the auto-allow is not surprising.
+    The countdown PAUSES while the prompt is expanded — opening the
+    detail view is a strong signal the user is actively reading and
+    not AFK. It also PAUSES when the tab loses focus (visibilitychange)
+    so a user who alt-tabs to look something up doesn't return to a
+    silently auto-allowed batch of commands.
 
   Keyboard (only when no editable element is focused):
     Esc          → deny_once       (safe default if user dismisses)
@@ -44,15 +82,97 @@ const current = computed(() => permissions.current);
 
 const expanded = ref(false);
 
-// Reset expansion state whenever a new request takes the slot — no
-// reason a previously-expanded prompt should leak its state into the
-// next decision the user has to make.
+// ─── Auto-allow countdown ────────────────────────────────────────
+//
+// Keep this in sync with TIMEOUT_MS in extensions/permission.ts —
+// the frontend fires its allow_once a hair BEFORE the backend
+// safety-net would so the visible countdown matches the action.
+// Currently both sides are 15s (the spec users locked in 2026-05).
+// Update both if either changes.
+//
+// The countdown is SKIPPED entirely when the active request's mode
+// is `manual` ("Ask each time") — that mode's whole point is to
+// wait forever for an explicit click, so the modal stays open with
+// no ticker and no auto-allow.
+const AUTO_ALLOW_SECONDS = 15;
+
+// Seconds remaining for the current prompt. -1 sentinel = no active
+// countdown (no current prompt / paused / fired). 0 = about to fire.
+const secondsLeft = ref<number>(-1);
+
+// Interval handle so we can clear/restart between prompts.
+let tickHandle: number | null = null;
+
+function stopTimer(): void {
+  if (tickHandle !== null) {
+    window.clearInterval(tickHandle);
+    tickHandle = null;
+  }
+}
+
+function startTimer(): void {
+  stopTimer();
+  // `manual` ("Ask each time") deliberately has no timeout — the
+  // agent waits for an explicit click no matter how long it takes.
+  // We park `secondsLeft` at the -1 sentinel so the countdown chip
+  // stays hidden and no auto-allow fires.
+  const mode = current.value?.mode;
+  if (mode === "manual") {
+    secondsLeft.value = -1;
+    return;
+  }
+  secondsLeft.value = AUTO_ALLOW_SECONDS;
+  tickHandle = window.setInterval(() => {
+    // Pause while expanded or while the tab is hidden — both are
+    // strong signals the user is engaged rather than AFK. The user
+    // can still click Allow / Deny manually in either state.
+    if (expanded.value || document.hidden) {
+      return;
+    }
+    secondsLeft.value = Math.max(0, secondsLeft.value - 1);
+    if (secondsLeft.value <= 0) {
+      stopTimer();
+      // Fire the auto-allow on the current prompt. respond() reads
+      // current.value, dequeues, and the next prompt (if any) will
+      // trigger this same watcher and start its own countdown.
+      respond("allow_once");
+    }
+  }, 1000);
+}
+
+// Reset expansion state and start a fresh countdown whenever a new
+// request takes the slot. The expand reset matches the prior behavior
+// (no leaking of details-open across decisions); the countdown reset
+// is new and is the core of the auto-allow safety net.
 watch(
   () => current.value?.id,
-  () => {
+  (id) => {
     expanded.value = false;
+    if (id) {
+      startTimer();
+    } else {
+      stopTimer();
+      secondsLeft.value = -1;
+    }
   },
+  { immediate: true },
 );
+
+// SVG ring geometry — circumference C = 2πr. We use r=8 → C ≈ 50.27.
+// The dash-offset is C × (1 − fraction-remaining), so the ring DRAINS
+// as time passes (a full circle at 30s, empty circle at 0s).
+const RING_RADIUS = 8;
+const RING_CIRC = 2 * Math.PI * RING_RADIUS;
+const ringOffset = computed(() => {
+  if (secondsLeft.value < 0) return RING_CIRC;
+  const fraction = Math.max(0, Math.min(1, secondsLeft.value / AUTO_ALLOW_SECONDS));
+  return RING_CIRC * (1 - fraction);
+});
+
+// Whether the countdown chip should be visible. Hide it when the
+// prompt is expanded (the user is reading; the chip would be noisy)
+// or when the timer is finished.
+const showCountdown = computed(() => !!current.value && secondsLeft.value > 0 && !expanded.value);
 
 // Icons stay as a JS map (no translation needed for icon names).
 const TOOL_ICONS: Record<string, string> = {
@@ -133,6 +253,12 @@ function fileTarget(input: Record<string, unknown> | undefined): string {
 function respond(decision: PermissionDecision): void {
   const c = current.value;
   if (!c) return;
+  // Stop the countdown before dequeue: dequeue updates current.value
+  // reactively, the watcher then restarts the timer for the next
+  // prompt (or stops it if the queue is empty). Calling stopTimer
+  // here avoids a tick from a previous interval firing into the next
+  // prompt's countdown.
+  stopTimer();
   chat.sendPermissionResponse(c.id, decision);
   permissions.dequeue(c.id);
 }
@@ -163,34 +289,35 @@ function onKey(e: KeyboardEvent): void {
 }
 
 onMounted(() => document.addEventListener("keydown", onKey));
-onUnmounted(() => document.removeEventListener("keydown", onKey));
+onUnmounted(() => {
+  document.removeEventListener("keydown", onKey);
+  stopTimer();
+});
 </script>
 
 <template>
-  <Teleport to="body">
-    <Transition
-      enter-active-class="transition-all duration-150 ease-out"
-      leave-active-class="transition-all duration-100 ease-in"
-      enter-from-class="opacity-0 translate-y-2"
-      leave-to-class="opacity-0 translate-y-2"
+  <Transition
+    enter-active-class="transition-all duration-150 ease-out"
+    leave-active-class="transition-all duration-100 ease-in"
+    enter-from-class="opacity-0 -translate-y-1"
+    leave-to-class="opacity-0 -translate-y-1"
+  >
+    <!--
+      Banner anchors at the TOP of the chat column. Mounted from
+      ChatPane.vue (between header and MessageList) so it pushes the
+      message list down — impossible to miss while a decision is
+      pending. No backdrop / no blur — long-running chat threads
+      remain readable while the user reads the permission detail
+      and decides.
+    -->
+    <div
+      v-if="current"
+      :key="current.id"
+      class="pi-permission-banner border-b border-warning/40 bg-warning/10 text-foreground shadow-[inset_0_-1px_0_rgb(0_0_0/0.05)]"
+      role="alertdialog"
+      aria-modal="false"
+      aria-labelledby="permission-title"
     >
-      <!--
-        Bottom-right anchor on desktop, full-width on small screens. We
-        deliberately don't blur or dim the page — long-running chat
-        threads stay readable while the user decides. Cursor /
-        Continue.dev both behave this way.
-      -->
-      <div
-        v-if="current"
-        class="pointer-events-none fixed inset-x-3 bottom-3 z-40 flex justify-end sm:inset-x-auto sm:right-4 sm:bottom-4"
-        role="dialog"
-        aria-modal="false"
-        aria-labelledby="permission-title"
-      >
-        <div
-          :key="current.id"
-          class="pi-permission-card pointer-events-auto w-full max-w-[440px] overflow-hidden rounded-md border border-border bg-popover text-foreground shadow-lg ring-1 ring-black/5"
-        >
           <!-- Compact header: icon · title · mode chip · queue · expand -->
           <div class="flex items-center gap-2 px-3 py-2">
             <Icon
@@ -212,6 +339,50 @@ onUnmounted(() => document.removeEventListener("keydown", onKey));
                   :title="snippet()"
                 >{{ snippet() }}</span>
               </div>
+            </div>
+            <!-- Auto-allow countdown.
+                 The ring drains over the 30 seconds; the centred
+                 numeral shows whole seconds remaining. Both update
+                 in real time. We hide the chip while the prompt is
+                 expanded (the user is reading; pausing is implied by
+                 the timer staying still — see the watcher).
+                 Implementation: two concentric <circle>s — a dim
+                 background ring and an amber progress ring whose
+                 stroke-dashoffset is bound to the time remaining.
+                 r=8 → C=2π·8 ≈ 50.27; offset goes from 0 → 50.27 as
+                 seconds drop from 30 → 0, so the visible arc shrinks. -->
+            <div
+              v-if="showCountdown"
+              class="relative shrink-0"
+              :title="$t('permission.prompt.autoAllowIn', { secs: secondsLeft })"
+              aria-live="polite"
+            >
+              <svg width="20" height="20" viewBox="0 0 20 20" class="-rotate-90">
+                <circle
+                  cx="10"
+                  cy="10"
+                  r="8"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.5"
+                  class="text-muted/40"
+                />
+                <circle
+                  cx="10"
+                  cy="10"
+                  r="8"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.5"
+                  stroke-linecap="round"
+                  class="text-warning transition-[stroke-dashoffset] duration-1000 ease-linear"
+                  :stroke-dasharray="RING_CIRC"
+                  :stroke-dashoffset="ringOffset"
+                />
+              </svg>
+              <span
+                class="pointer-events-none absolute inset-0 flex items-center justify-center font-mono text-[10px] font-semibold leading-none text-warning"
+              >{{ secondsLeft }}</span>
             </div>
             <!-- Mode chip lives in the header so the action row stays a
                  clean 4-button strip. Title-cased label so it reads as
@@ -341,9 +512,18 @@ onUnmounted(() => document.removeEventListener("keydown", onKey));
               <span class="flex-1 text-center">&nbsp;</span>
               <span class="flex-1 text-center">esc</span>
             </div>
+            <!-- Auto-allow disclosure. Only shown while the countdown
+                 is actively ticking down — once the user expands the
+                 prompt (which pauses the timer) the line disappears
+                 to keep the detail view uncluttered. -->
+            <div
+              v-if="showCountdown"
+              class="mt-1 text-center text-caption text-muted-foreground/80"
+              aria-live="polite"
+            >
+              {{ $t("permission.prompt.autoAllowHint", { secs: secondsLeft }) }}
+            </div>
           </div>
-        </div>
-      </div>
-    </Transition>
-  </Teleport>
+    </div>
+  </Transition>
 </template>

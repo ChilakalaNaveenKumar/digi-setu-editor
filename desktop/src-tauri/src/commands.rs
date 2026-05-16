@@ -99,6 +99,55 @@ pub fn open_new_window(app: AppHandle) -> Result<(), String> {
     crate::menu::open_new_window(&app).map_err(|err| err.to_string())
 }
 
+/// "Big-red-button" recovery: nuke every `pi-typst-sidecar` on the
+/// system (ours and any orphans), then trigger the watchdog respawn.
+///
+/// This is the SPA-facing equivalent of the user-facing
+/// "Restart & Clean Backend" button surfaced in the chat-settings
+/// popover and View ▸ menu. Compared to plain ``restart_sidecar``
+/// it ALSO runs the same orphan-sweep boot path uses, so it cleans
+/// up:
+///
+///   * any sidecar from a previous crashed launch that's still
+///     bound to a loopback port;
+///   * dev-mode `cargo tauri dev` sidecars left over after a hot
+///     reload (the dev IDE doesn't always SIGTERM cleanly);
+///   * a sidecar from an OLD app bundle path the user just upgraded
+///     over (in-place install reuses the same comm-name, so pkill
+///     -x catches it regardless of which on-disk binary spawned it).
+///
+/// Returns Ok(()) immediately — the watchdog handles the actual
+/// respawn asynchronously and emits ``backend-restarted`` when the
+/// new sidecar is up. The SPA listens for that event the same way
+/// it does for plain ``restart_sidecar``.
+///
+/// We deliberately do NOT touch the user's data root here. The
+/// "deep cleanup" of stale tmp files and locks runs only on cold
+/// boot of a new app version (see ``sidecar::purge_legacy_state``);
+/// from inside a running app it would race with active sessions.
+#[tauri::command]
+pub fn restart_and_clean(state: State<'_, AppState>) -> Result<(), String> {
+    let handle = (*state.sidecar.lock().unwrap()).clone();
+
+    // 1. Kill every sidecar on the system (ours + any orphan). This
+    //    is the same sweep boot does, deduplicated.
+    crate::sidecar::kill_orphan_sidecars();
+
+    // 2. If our managed handle still points at a (now-dead) child,
+    //    drain it from the slot so the watchdog notices the exit
+    //    and respawns. We use ``kill_child_for_restart`` instead of
+    //    ``terminate`` so the shutdown flag stays unset and the
+    //    watchdog doesn't bail out.
+    if let Some(handle) = handle {
+        if let Some(mut child) = handle.kill_child_for_restart() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+    log::info!("restart_and_clean: orphan sweep complete; watchdog will respawn sidecar");
+    Ok(())
+}
+
 /// Force-restart the FastAPI sidecar.
 ///
 /// Called from the SPA's frontend-side health watchdog when the

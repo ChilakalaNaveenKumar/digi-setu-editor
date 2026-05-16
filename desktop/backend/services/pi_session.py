@@ -854,19 +854,59 @@ class PiSession:
             # pi extensions (see below); we no longer ship a custom
             # permission interceptor.
             _ext_typst = _vendor_root / "extensions" / "typst-tools.ts"
-            # Upstream pi safety extensions (shipped under
-            # examples/extensions/ inside pi-coding-agent itself).
-            #   protected-paths.ts → blocks write/edit to .env / .git/ /
-            #     node_modules/ — keeps the model from corrupting repos
-            #     and overwriting secrets.
+            # Our hardened replacement for pi's stock protected-paths.
+            # See extensions/desktop-protected-paths.ts for the full
+            # block list — covers ~/.ssh, ~/.aws, ~/.gnupg, browser
+            # cookies, keychain, sudoers, private keys by extension, etc.
+            # We load this INSTEAD OF pi's example protected-paths.ts on
+            # desktop because the example's `.env / .git / node_modules`
+            # list is far too narrow for "the user's real laptop".
+            _ext_desktop_protected = _vendor_root / "extensions" / "desktop-protected-paths.ts"
+            # Pi's bundled `examples/extensions/` directory contains a
+            # library of first-party extensions. We load the ones that
+            # are pure quality-of-life wins for our use case — none of
+            # them require the SPA to learn new event shapes; they
+            # surface either as additional tool calls (which our
+            # generic tool-card already renders) or as session events
+            # we already handle.
+            _examples = _pi_pkg / "examples" / "extensions"
+            #   (protected-paths.ts is replaced by our hardened
+            #     desktop-protected-paths.ts above.)
             #   permission-gate.ts → prompts the user before running
             #     `rm -rf`, `sudo`, `chmod/chown 777`. Pi's RPC UI shim
-            #     surfaces the prompt to the SPA.
+            #     surfaces the prompt to the SPA via `extension_ui_request`.
+            #   trigger-compact.ts → watches token usage and auto-compacts
+            #     old turns when context > 100k tokens. Without this,
+            #     long chats hit the model's context limit and break
+            #     with a hard error.
+            #   git-checkpoint.ts → `git stash create` before every
+            #     turn so /fork can rewind to that point. Harmless
+            #     no-op if the workspace isn't a git repo.
+            #   todo.ts → registers a native `todo` tool the AI uses
+            #     to plan multi-step tasks. State persists per-session
+            #     so it survives branch/fork/resume.
+            #   subagent/index.ts → adds `subagent(spawn|list|kill)`
+            #     tools so the AI can fan work out into isolated
+            #     pi processes with their own context windows.
+            #     Critical for "scan this large codebase" tasks —
+            #     without it, the scan trashes the main context.
+            #   structured-output.ts → adds a `structured_output` tool
+            #     with `terminate: true` so the AI can end a turn
+            #     with a JSON answer instead of paying for one more
+            #     LLM round-trip.
+            #   handoff.ts → registers the `/handoff <goal>` slash
+            #     command for clean context transfer to a fresh
+            #     chat (better than lossy compaction).
             # The Python-side host policy (services/policy.py) still
             # blocks genuinely-malicious bash patterns (cloud metadata
             # IPs, miners, …) before they reach pi at all.
-            _ext_protected = _pi_pkg / "examples" / "extensions" / "protected-paths.ts"
-            _ext_perm_gate = _pi_pkg / "examples" / "extensions" / "permission-gate.ts"
+            _ext_perm_gate = _examples / "permission-gate.ts"
+            _ext_trigger_compact = _examples / "trigger-compact.ts"
+            _ext_git_checkpoint = _examples / "git-checkpoint.ts"
+            _ext_todo = _examples / "todo.ts"
+            _ext_subagent = _examples / "subagent" / "index.ts"
+            _ext_structured = _examples / "structured-output.ts"
+            _ext_handoff = _examples / "handoff.ts"
             cmd = [
                 desktop_node,
                 str(_pi_shim),
@@ -880,13 +920,52 @@ class PiSession:
                 # (where we kill pi). See the docker-mode block
                 # above for the full rationale.
                 "--continue",
+                # Enable pi's NATIVE grep/find/ls tools alongside the
+                # default read/bash/edit/write set. The defaults only
+                # ── NOTE: do NOT pass `--tools <allowlist>` here ─────
+                # We previously passed
+                #   --tools read,bash,edit,write,grep,find,ls
+                # to enable pi's native grep/find/ls alongside the
+                # defaults. Discovered on 2026-05-16: `--tools` is a
+                # HARD allowlist that filters BOTH built-in and
+                # extension tools (pi-coding-agent
+                # dist/core/agent-session.js, `_refreshToolRegistry`:
+                # the `if (allowedToolNames) {…}` branch shadows the
+                # `else if (includeAllExtensionTools)` branch). The
+                # 7-name allowlist was silently filtering out every
+                # extension tool we register below (todo, subagent,
+                # search_docs, web_search, read_doc, …); the model
+                # then truthfully reported "no todo / no subagent"
+                # even though the extensions loaded. By omitting
+                # `--tools` we keep the default 4 built-ins PLUS all
+                # extension tools active. The cost is that
+                # grep/find/ls are no longer active by default; the
+                # model falls back to `bash grep` / `bash find`,
+                # which is slower but functional.
             ]
             if _ext_typst.exists():
                 cmd += ["--extension", str(_ext_typst)]
-            if _ext_protected.exists():
-                cmd += ["--extension", str(_ext_protected)]
+            if _ext_desktop_protected.exists():
+                cmd += ["--extension", str(_ext_desktop_protected)]
             if _ext_perm_gate.exists():
                 cmd += ["--extension", str(_ext_perm_gate)]
+            # Quality-of-life extensions from pi's bundled library.
+            # Loading order matches our priority for the
+            # `extension_ui_request` interceptor (first-registered
+            # wins for matching prefixes), so safety extensions
+            # (above) come before agent-feature extensions (below).
+            if _ext_trigger_compact.exists():
+                cmd += ["--extension", str(_ext_trigger_compact)]
+            if _ext_git_checkpoint.exists():
+                cmd += ["--extension", str(_ext_git_checkpoint)]
+            if _ext_todo.exists():
+                cmd += ["--extension", str(_ext_todo)]
+            if _ext_subagent.exists():
+                cmd += ["--extension", str(_ext_subagent)]
+            if _ext_structured.exists():
+                cmd += ["--extension", str(_ext_structured)]
+            if _ext_handoff.exists():
+                cmd += ["--extension", str(_ext_handoff)]
             # Append the desktop-mode system prompt so the model knows
             # it's on the user's actual machine (no container, no
             # allow-list) and which paths to leave alone by default.
@@ -923,6 +1002,22 @@ class PiSession:
         _repo_root = _Path(__file__).resolve().parent.parent.parent.parent
         _dev_ext_typst = _repo_root / "extensions" / "typst-tools.ts"
         _dev_ext_perm = _repo_root / "extensions" / "permission.ts"
+        _dev_ext_desktop_protected = _repo_root / "extensions" / "desktop-protected-paths.ts"
+        # Locate the pi-coding-agent package on disk so we can load
+        # its bundled QoL extensions in dev too. Look first in the
+        # in-tree vendor copy (desktop/pi-runtime/vendor/pi), then
+        # fall back to whatever `pi` is on PATH. Best-effort — if
+        # neither path exists the dev session still runs, just
+        # without subagent/todo/trigger-compact/etc.
+        _dev_pi_pkg_candidates = [
+            _repo_root / "desktop" / "pi-runtime" / "vendor" / "pi" / "node_modules"
+            / "@mariozechner" / "pi-coding-agent",
+        ]
+        _dev_examples: Optional[Path] = None
+        for _cand in _dev_pi_pkg_candidates:
+            if (_cand / "examples" / "extensions" / "todo.ts").is_file():
+                _dev_examples = _cand / "examples" / "extensions"
+                break
         # Also locate the dev APPEND_SYSTEM.md (the slim base prompt) so
         # the prompt is loaded in dev exactly like the bundled binary
         # would inject it. Without this dev-loop runs with whatever
@@ -937,11 +1032,33 @@ class PiSession:
             "--model", self._model,
             "--session-dir", str(self.session_dir),
             "--continue",
+            # See the "NOTE: do NOT pass `--tools <allowlist>`" comment
+            # in the bundled-binary branch above for the rationale.
         ]
         if _dev_ext_typst.exists():
             cmd += ["--extension", str(_dev_ext_typst)]
         if _dev_ext_perm.exists():
             cmd += ["--extension", str(_dev_ext_perm)]
+        # Our hardened path guard — replaces pi's stock protected-paths.ts.
+        # See the bundled-binary branch above for rationale.
+        if _dev_ext_desktop_protected.exists():
+            cmd += ["--extension", str(_dev_ext_desktop_protected)]
+        # Quality-of-life extensions from pi's bundled library (dev mode).
+        # protected-paths.ts is intentionally OMITTED here — our hardened
+        # desktop-protected-paths.ts above supersedes it.
+        if _dev_examples is not None:
+            for _name in (
+                "permission-gate.ts",
+                "trigger-compact.ts",
+                "git-checkpoint.ts",
+                "todo.ts",
+                "subagent/index.ts",
+                "structured-output.ts",
+                "handoff.ts",
+            ):
+                _p = _dev_examples / _name
+                if _p.is_file():
+                    cmd += ["--extension", str(_p)]
         if _dev_append_md.exists():
             try:
                 _txt = _dev_append_md.read_text(encoding="utf-8")

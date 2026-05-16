@@ -1,7 +1,7 @@
 /**
  * chat-stream.ts — thin SSE client for the chat protocol.
  *
- * Replaces ws/chat-bridge.ts. We deliberately keep this file small:
+ * Replaces the old WebSocket transport. We deliberately keep this file small:
  *
  *   - No reconnect state machine: EventSource auto-reconnects on
  *     transport errors and sends `Last-Event-ID` automatically.

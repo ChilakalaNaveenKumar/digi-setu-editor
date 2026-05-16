@@ -15,7 +15,6 @@ import { Icon } from "@iconify/vue";
 
 import AppShell from "../components/AppShell.vue";
 import BrandHeader from "../components/BrandHeader.vue";
-import PermissionPrompt from "../components/PermissionPrompt.vue";
 import { useChatStore } from "../stores/chat";
 import { useChatSessionStore } from "../stores/chat-session";
 import { useWorkspaceStore } from "../stores/workspace";
@@ -101,7 +100,7 @@ onBeforeUnmount(() => {
              on the parent flex layout, collapse to less than full
              height — which is exactly what produced the giant black
              void below the chat panes the user reported.
-    Conn banner / PermissionPrompt: intrinsic height after the panes.
+    Conn banner: intrinsic height after the panes.
   -->
   <div class="flex h-full w-full flex-col bg-background text-foreground">
     <!-- Compact brand header for the IDE shell. Same global BrandHeader
@@ -135,9 +134,15 @@ onBeforeUnmount(() => {
       {{ connState === "closed" ? $t("workspace.connectionClosed") : $t("workspace.connectionError") }}
     </div>
 
-    <!-- Per-tool-call approval gate. Renders nothing when there are no
-         pending requests; <Teleport> moves the overlay to <body> so it
-         escapes any z-index traps inside AppShell. -->
-    <PermissionPrompt />
+    <!--
+      Per-tool-call approval gate removed on web. Backend locks the
+      permission mode to `approve_all` (see
+      web/backend/services/user_prefs.py) so no `permission_request`
+      events are ever emitted — there's nothing for the prompt to
+      render. Keeping the import wired here would mean a mounted
+      component just listening to a queue that can't fill, which is
+      dead weight. Desktop still mounts PermissionPrompt because its
+      picker is live.
+    -->
   </div>
 </template>

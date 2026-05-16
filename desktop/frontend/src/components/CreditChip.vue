@@ -17,7 +17,7 @@ import { computed, onMounted, ref } from "vue";
 import { useBillingStore } from "../stores/billing";
 
 const billing = useBillingStore();
-const { credit, remainingPct, lowCredit, enabled, exhausted, isAuthoritative, isByok } =
+const { credit, remainingPct, lowCredit, enabled, exhausted, isAuthoritative } =
   storeToRefs(billing);
 
 const showUpgrade = ref(false);
@@ -37,7 +37,9 @@ onMounted(() => {
 const labelLeft = computed(() => {
   const c = credit.value;
   if (!c) return "…";
-  if (isByok.value) return "Your key";
+  // BYOK-specific copy is intentionally suppressed for now — we'll
+  // resurface "Your key" once the bring-your-own-key path is back.
+  // (Falls through to the regular plan-label rendering.)
   // Don't render the noisy "$0.00 / $0" pair when the cloud reading
   // hasn't arrived yet (offline / signed-out). Show the plan label
   // alone — calmer and accurate.
@@ -64,7 +66,7 @@ const stateClass = computed(() => {
 const tooltip = computed(() => {
   const c = credit.value;
   if (!c) return "Usage";
-  if (isByok.value) return "Bring-your-own-key — billed by your AI provider";
+  // BYOK tooltip suppressed for now — see labelLeft comment above.
   if (!isAuthoritative.value) {
     return `${c.plan.label} plan · live usage shown once you sign in`;
   }

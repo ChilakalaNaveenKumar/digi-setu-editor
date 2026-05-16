@@ -24,6 +24,167 @@ import signal
 import sys
 
 
+def _ensure_ssl_certs() -> None:
+    """Point Python's stdlib `ssl` at certifi's CA bundle.
+
+    When PyInstaller freezes the interpreter on macOS / Windows the
+    resulting binary doesn't ship the system Python's `Install
+    Certificates.command` hook, and doesn't fall back to the OS
+    keychain either. Symptom in the field: every `urllib.request.urlopen`
+    against digi-setu.com (cloud-relay LLM proxy, /api/usage,
+    /api/auth/whoami, plan_cache refresh, billing webhook fetch …)
+    raises `CERTIFICATE_VERIFY_FAILED`, the cloud-relay handshake
+    fails, pi exits immediately, and the chat shows "Something
+    went wrong / internal" with no useful log line.
+
+    `certifi` IS bundled (see `desktop/sidecar/pyinstaller.spec`'s
+    `collect_data_files("certifi")`), but nothing wires the stdlib
+    `ssl` default context to it. Setting `SSL_CERT_FILE` /
+    `REQUESTS_CA_BUNDLE` BEFORE any module imports `ssl` makes the
+    default context pick up certifi's bundle when it's first asked
+    for a certificate. (Modules that have already cached an SSL
+    context — e.g. via `urllib3.PoolManager()` at import time — will
+    still need a process restart, which is why this runs as the
+    first thing in `main()`.)
+
+    On Linux we used to skip silently (distro OpenSSL has the system
+    CA store wired up), but the `.deb` we ship via Bitbucket
+    Pipelines runs the SAME PyInstaller-frozen Python, which doesn't
+    inherit the system Python's `Install Certificates` hook. So we
+    apply the same wiring on Linux. The `setdefault` below means any
+    user/IT-set `SSL_CERT_FILE` still wins, which preserves corporate
+    MITM CA chains where they exist.
+    """
+    try:
+        import certifi  # noqa: PLC0415
+    except Exception as exc:  # noqa: BLE001
+        # Direct stderr write because the root logger isn't configured
+        # yet at this point in the boot sequence — `logging.warning`
+        # silently goes nowhere until uvicorn installs handlers.
+        print(f"[sidecar] WARN: certifi not importable: {exc}", file=sys.stderr, flush=True)
+        return
+    ca_path = certifi.where()
+    if not os.path.isfile(ca_path):
+        print(
+            f"[sidecar] WARN: certifi reports {ca_path} but file is missing",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+    # `setdefault` so an explicit env override (e.g. corporate MITM
+    # CA chain installed by IT) still wins.
+    os.environ.setdefault("SSL_CERT_FILE", ca_path)
+    os.environ.setdefault("REQUESTS_CA_BUNDLE", ca_path)
+    # Direct stderr write — see note above on logger not being ready.
+    # This line is the smoking-gun proof in field logs that the SSL
+    # fix shipped and ran. Don't lower this to a debug level.
+    print(
+        f"[sidecar] SSL bundle wired to certifi: {ca_path}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _ensure_user_tool_paths() -> None:
+    """Augment `PATH` so subprocesses can find user-installed tools.
+
+    Problem: when the user launches Digi Setu from the Dock /
+    Applications / Start menu, the GUI shell on macOS, Windows and
+    most Linux DEs gives the spawned process a **minimal** `PATH`
+    (`/usr/bin:/bin:/usr/sbin:/sbin` on macOS, `C:\\Windows\\…` on
+    Windows). This does NOT include Homebrew (`/opt/homebrew/bin`,
+    `/usr/local/bin`), TeX Live (`/Library/TeX/texbin`), Quarto's
+    user install dir, or anywhere `~/.cargo/bin` lives. The user's
+    `.zshrc` / `.bash_profile` is never sourced.
+
+    Symptom in the field: pi's `bash` tool runs `quarto render foo.qmd`
+    or `pdflatex foo.tex`, the subprocess gets a `command not found`,
+    pi reports "I don't have quarto installed", user says "what do
+    you mean, I literally just used it in Terminal".
+
+    Fix: at sidecar startup, prepend every standard user-tool path
+    that EXISTS on this machine to `PATH`. Existence check means we
+    don't add bogus entries to `PATH` (which can slow tool lookup
+    and confuse pi's "which tools do I have" probe).
+
+    We prepend (not append) because if the user has BOTH a Homebrew
+    Python and a system Python and pi shells out `python`, they
+    almost certainly mean the Homebrew one (which their own scripts
+    use). Same logic for `node`, `quarto`, every other tool with a
+    "system fallback" version.
+
+    Idempotent: re-calling never duplicates entries.
+    """
+    candidates: list[str] = []
+    home = os.path.expanduser("~")
+
+    if sys.platform == "darwin":
+        candidates += [
+            "/opt/homebrew/bin",                # Apple Silicon Homebrew
+            "/opt/homebrew/sbin",
+            "/usr/local/bin",                   # Intel Homebrew + manual installs
+            "/usr/local/sbin",
+            "/Library/TeX/texbin",              # MacTeX / BasicTeX (pdflatex, xelatex)
+            f"{home}/.cargo/bin",               # rustup / cargo-install (typst, ripgrep)
+            f"{home}/.local/bin",               # pipx, pip --user
+            f"{home}/Library/Application Support/Quarto/bin",  # Quarto user install
+            f"{home}/.npm-global/bin",          # npm prefix=~/.npm-global
+            "/opt/local/bin",                   # MacPorts
+            "/opt/local/sbin",
+        ]
+    elif sys.platform == "win32":
+        # Windows installers usually update the system PATH, BUT the
+        # Tauri-spawned process gets a snapshot of PATH from before
+        # the user's last install. We add the standard scoop/cargo/
+        # python-user-install locations as a safety net.
+        program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+        local_app_data = os.environ.get("LOCALAPPDATA", os.path.join(home, "AppData", "Local"))
+        candidates += [
+            os.path.join(home, "scoop", "shims"),                # Scoop
+            os.path.join(home, ".cargo", "bin"),                 # cargo-install
+            os.path.join(local_app_data, "Programs", "Quarto", "bin"),
+            os.path.join(program_files, "Quarto", "bin"),
+            os.path.join(program_files, "R", "R-4.4.0", "bin"),  # best-effort; users often have multiple R versions
+            os.path.join(local_app_data, "Programs", "Python", "Python311", "Scripts"),
+        ]
+    else:
+        # Linux .deb: GUI launchers don't source .bashrc, so the
+        # spawned process gets only the Wayland/Xorg-set PATH which
+        # is usually missing `~/.local/bin` and `~/.cargo/bin`.
+        candidates += [
+            f"{home}/.cargo/bin",
+            f"{home}/.local/bin",
+            "/snap/bin",
+            "/usr/local/bin",
+        ]
+
+    existing = os.environ.get("PATH", "")
+    existing_parts = existing.split(os.pathsep) if existing else []
+    existing_set = {p for p in existing_parts if p}
+
+    # Prepend in declared order, skipping non-existent dirs and dirs
+    # already present (preserves any explicit user/IT-set ordering).
+    to_prepend: list[str] = []
+    for p in candidates:
+        if not p or p in existing_set:
+            continue
+        if not os.path.isdir(p):
+            continue
+        to_prepend.append(p)
+        existing_set.add(p)
+
+    if to_prepend:
+        new_path = os.pathsep.join(to_prepend + existing_parts)
+        os.environ["PATH"] = new_path
+        # Direct stderr write so this shows up in field logs without
+        # depending on the not-yet-configured root logger.
+        print(
+            f"[sidecar] PATH augmented with: {os.pathsep.join(to_prepend)}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 def _ensure_backend_on_path() -> None:
     """
     PyInstaller's `pathex` in the spec already adds the desktop
@@ -98,6 +259,17 @@ def _run_pi_integrity() -> None:
 
 
 def main() -> int:
+    # SSL certs MUST be wired before anything imports `ssl` for real
+    # (urllib, requests, httpx, asyncio.ssl). Has to happen before
+    # `_ensure_backend_on_path` because importing `app` later pulls in
+    # routes that may construct an SSL context at module load time.
+    _ensure_ssl_certs()
+    # PATH augmentation MUST happen before pi sessions are spawned so
+    # the inherited env passed to the pi child includes Homebrew /
+    # Quarto / TeX dirs. Earlier this ran post-import which meant the
+    # first `pi.spawn` of a fresh session saw the minimal GUI PATH
+    # and reported "quarto not found" until the sidecar was restarted.
+    _ensure_user_tool_paths()
     _ensure_backend_on_path()
 
     parser = argparse.ArgumentParser(

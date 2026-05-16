@@ -14,6 +14,8 @@ import GrepToolCard from "./GrepToolCard.vue";
 import LsToolCard from "./LsToolCard.vue";
 import ProcessToolCard from "./ProcessToolCard.vue";
 import ReadToolCard from "./ReadToolCard.vue";
+import SubagentToolCard from "./SubagentToolCard.vue";
+import TodoToolCard from "./TodoToolCard.vue";
 import WriteToolCard from "./WriteToolCard.vue";
 
 defineProps<{ call: ToolCall }>();
@@ -28,5 +30,7 @@ defineProps<{ call: ToolCall }>();
   <GrepToolCard v-else-if="call.name === 'grep'" :call="call" />
   <LsToolCard v-else-if="call.name === 'ls'" :call="call" />
   <FindToolCard v-else-if="call.name === 'find'" :call="call" />
+  <TodoToolCard v-else-if="call.name === 'todo'" :call="call" />
+  <SubagentToolCard v-else-if="call.name === 'subagent'" :call="call" />
   <ToolCallCard v-else :call="call" />
 </template>

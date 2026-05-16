@@ -61,6 +61,7 @@ banner — same affordance you get when a chat reconnect lags too far).
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import time
 from collections import deque
@@ -111,6 +112,42 @@ REAPER_TICK_SECONDS = 30.0
 # `since=0` means "from the very beginning of this runtime's life" —
 # any event id is > 0 so the first yield is guaranteed.
 SENTINEL_SINCE = 0
+
+
+# Magic prefix our custom permission.ts (extensions/permission.ts) puts
+# on the `extension_ui_request` title. When we see it we synthesise a
+# `permission_request` event the SPA's PermissionPrompt understands
+# instead of leaking the raw RPC envelope. Mirror of routes/chat_ws.py
+# `_PERMISSION_PREFIX` — both transports MUST use the same value or
+# permission prompts disappear when one path is taken.
+_PERMISSION_PREFIX = "[pi-permission]"
+
+
+# pi-mono's stock subagent extension fires
+# `ctx.ui.confirm("Run project-local agents?", …)` (see
+# pi-mono-main/packages/coding-agent/examples/extensions/subagent/index.ts:489)
+# whenever the model passes `agentScope: "project"|"both"` and at least
+# one requested agent lives under `<workspace>/.pi/agents/`. The TUI
+# safeguard exists for users running pi inside a freshly-cloned
+# untrusted repo. In digi-setu the workspace is the user's OWN dir and
+# the agents in `.pi/agents/` were authored by them — auto-confirming
+# is the right default. The cancel branch (replying `{cancelled: true}`)
+# would surface "Canceled: project-local agents not approved." and
+# scout/planner/etc. would never run, which is exactly the symptom the
+# user hit on 2026-05-16. Title comparison is exact: we don't substring-
+# match because pi reuses `confirm` for other extensions and we don't
+# want to silently auto-yes those.
+_PROJECT_AGENT_CONFIRM_TITLE = "Run project-local agents?"
+
+
+# Methods that BLOCK pi's tool execution waiting for a response (per
+# the RPC spec at pi-mono-main/packages/coding-agent/src/modes/rpc/
+# rpc-types.ts). If we don't reply, pi hangs forever — we saw exactly
+# that for the subagent flow before this interceptor existed (smoke
+# test in /tmp/smoke-subagent.py reproduces the deadlock). Non-blocking
+# methods (notify/setStatus/setWidget/setTitle/set_editor_text) are
+# fire-and-forget; pi keeps going whether we ack or not.
+_BLOCKING_UI_METHODS = frozenset({"select", "confirm", "input", "editor"})
 
 
 class SessionRuntime:
@@ -205,6 +242,21 @@ class SessionRuntime:
         # hasn't answered yet. Stored so a reconnecting client can
         # re-render any modal without waiting for pi to repeat itself.
         self._pending_permissions: dict[str, dict[str, Any]] = {}
+
+        # Outstanding tool executions (started but not yet ended) keyed
+        # by `toolCallId`. We use this when a force-kill cuts pi off
+        # before `tool_execution_end` arrives — without it the SPA's
+        # tool cards (especially the long-running `subagent` spinner)
+        # would spin forever after Stop. See `abort()`.
+        self._pending_tool_calls: dict[str, dict[str, Any]] = {}
+
+        # The most recent assistant `message_start` we've seen but not
+        # yet a matching `message_end`. Same purpose as
+        # `_pending_tool_calls` — lets `abort()` synthesise a final
+        # `message_end` with `stopReason: "aborted"` so the SPA's
+        # `isStreaming` flips off and the message gets the "aborted"
+        # treatment (cf. pi-mono web-ui's Messages.ts:126).
+        self._in_flight_assistant_message: Optional[dict[str, Any]] = None
 
         # Seed `_session_info` into the ring at construction time so the
         # very first SSE subscriber gets the model + permission_mode
@@ -486,13 +538,54 @@ class SessionRuntime:
     async def abort(self) -> None:
         """Tell pi to abandon the current turn.
 
-        We don't kill pi — abort is in-protocol; pi receives the
-        signal, drops the in-flight tool execution, and emits its
-        own `agent_end`. The runtime stays alive for the next prompt.
+        Two-phase, so a wedged pi can still be unstuck:
+
+          1. **Polite** — send `{"type":"abort"}` over pi's stdin.
+             Pi-rpc's handler calls `session.abort()` which fires
+             the run's AbortController and `await`s
+             `agent.waitForIdle()`. That signal cascades to:
+               * the in-flight LLM stream (`AbortSignal` → undici
+                 closes the HTTPS socket cleanly)
+               * every active extension tool; the `subagent`
+                 extension specifically does `SIGTERM` → 5 s grace
+                 → `SIGKILL` on each child pi process (see pi-mono
+                 coding-agent subagent/index.ts ~L370)
+             Then pi writes the final assistant message with
+             `stopReason: "aborted"`, emits `tool_execution_end` for
+             every aborted tool, plus `message_end` + `turn_end` +
+             `agent_end`, and the runtime stays alive for the next
+             prompt. Most clean aborts complete in 1–5 s; a parallel
+             subagent fan-out + slow Vertex response can legitimately
+             take up to ~15 s.
+
+          2. **Force-kill** — if pi doesn't flip `_in_flight` to
+             False within `grace_s` (20 s), escalate to SIGKILL via
+             `pi_session.terminate()`. We've seen pi wedge when its
+             HTTPS client (undici → libuv → kevent) is stuck on a
+             stalled Vertex response that refuses to honour
+             AbortSignal. The polite stdin abort is queued but pi's
+             event loop is blocked on the socket, so it never
+             processes the message. After SIGKILL we synthesise the
+             cleanup events pi would have emitted (see body) so the
+             SPA's spinning tool cards resolve and the in-flight
+             assistant message gets the "aborted" treatment.
+
+          After force-kill we drop our handle to pi; the very next
+          `send_prompt` re-spawns it via `_ensure_pi()`.
+
+        Caller (`/api/sessions/{sid}/abort`) awaits this method, so
+        the POST can block for up to `grace_s` (20 s) on the
+        worst-case path. The frontend shows a "Stopping…" affordance
+        until the response lands (see chat.ts `isAborting` + the
+        8 s defensive fallback timer — bumped up to >grace_s so it
+        never fires before the backend gets a chance to finish).
         """
         if self._pi is None:
             return
         self._touch()
+
+        # Phase 1 — polite. We tolerate `send` itself failing (broken
+        # pipe means pi already exited; that's fine, we're done).
         try:
             await self._pi.send({"type": "abort"})
         except Exception as exc:  # noqa: BLE001
@@ -501,8 +594,111 @@ class SessionRuntime:
                 session_id=self.session_id,
                 user_id=self.user_id,
                 exc=exc,
-                where="session_runtime.abort",
+                where="session_runtime.abort.send",
             )
+            # send died — pi is almost certainly dead too. Clear state.
+            self._in_flight = False
+            self._notify.set()
+            return
+
+        # Phase 2 — wait for pi to acknowledge by flipping `_in_flight`
+        # to False (driven by the `agent_end` event handler upstream).
+        #
+        # `grace_s` budget rationale:
+        #   * pi-rpc's abort handler runs `session.abort()` which calls
+        #     `agent.abort()` and then `await agent.waitForIdle()`.
+        #   * `waitForIdle` blocks until ALL in-flight work unwinds:
+        #     - the current LLM streaming chunk drains (~1-2 s for
+        #       Anthropic; up to ~10 s if a Vertex Gemini response is
+        #       mid-flight)
+        #     - every active extension tool finishes cleanup; the
+        #       `subagent` extension specifically does `SIGTERM` → 5 s
+        #       grace → `SIGKILL` on each child pi process (see
+        #       pi-mono coding-agent subagent/index.ts ~L370). With 2
+        #       children running in parallel that's a 5 s lower bound.
+        #     - the run executor writes the final assistant message
+        #       with `stopReason: "aborted"` and emits `agent_end`.
+        #   So a healthy graceful abort during a parallel subagent
+        #   fan-out can legitimately take 6-15 s. Anything past 20 s
+        #   means pi's event loop is wedged (typically on undici's
+        #   socket waiting for a hung Vertex response that refuses
+        #   to honour AbortSignal) and only SIGKILL gets us out.
+        grace_s = 20.0
+        deadline = asyncio.get_event_loop().time() + grace_s
+        while self._in_flight and asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(0.1)
+
+        if not self._in_flight:
+            return  # clean abort — happy path
+
+        # Phase 3 — wedged. Force-kill pi, synthesise the cleanup
+        # events pi normally would have emitted, then drop our handle
+        # so the next `send_prompt` re-spawns. We DO NOT call
+        # `self.close()` here because that also tears down bg
+        # subscribers + emits a final `runtime_closed` marker — the
+        # user might just want to send another prompt, in which case
+        # we want `_ensure_pi()` to re-spawn cleanly.
+        log_info(
+            "abort_escalated_to_kill",
+            session_id=self.session_id,
+            user_id=self.user_id,
+            where="session_runtime.abort.escalate",
+        )
+        try:
+            await self._pi.terminate()
+        except Exception as exc:  # noqa: BLE001
+            log_error(
+                "internal",
+                session_id=self.session_id,
+                user_id=self.user_id,
+                exc=exc,
+                where="session_runtime.abort.terminate",
+            )
+
+        # ── Synthesise cleanup events (the "missing" pi output) ──
+        # When pi exits cleanly the SPA relies on these to:
+        #   * flip every spinning tool card to error (esp. subagent
+        #     fan-outs, which can sit in "spawning child agent…" for
+        #     ages waiting on Vertex)
+        #   * stamp the in-flight assistant message with
+        #     `stopReason: "aborted"` so Messages.vue renders the
+        #     italic "Request aborted" badge (mirrors pi-mono web-ui
+        #     Messages.ts:126)
+        #   * fire `agent_end` so chat.ts can flip `isStreaming` off
+        #     and clear `isAborting` without waiting for the 8 s
+        #     defensive fallback timer.
+        # Without this synthesis the SPA looks frozen even though pi
+        # is dead — exactly the "subagent card spins forever after I
+        # press Stop" bug the user just hit on 2026-05-16.
+        for tcid, info in list(self._pending_tool_calls.items()):
+            self._enqueue({
+                "type": "tool_execution_end",
+                "toolCallId": tcid,
+                "toolName": info.get("toolName") or "unknown",
+                "isError": True,
+                "result": {
+                    "content": [{"type": "text", "text": "Aborted by user."}],
+                },
+            })
+        self._pending_tool_calls.clear()
+
+        if self._in_flight_assistant_message is not None:
+            aborted_msg = dict(self._in_flight_assistant_message)
+            aborted_msg["stopReason"] = "aborted"
+            aborted_msg["errorMessage"] = "Request was aborted."
+            self._enqueue({"type": "message_end", "message": aborted_msg})
+            self._enqueue({"type": "turn_end", "message": aborted_msg, "toolResults": []})
+            self._in_flight_assistant_message = None
+
+        # Always emit `agent_end` so the SPA's `isStreaming` flips off
+        # immediately. Pi-mono's payload includes `messages` (the
+        # whole run so far); we don't have that locally so we send an
+        # empty list — the SPA only reads the event type.
+        self._enqueue({"type": "agent_end", "messages": []})
+
+        self._pi = None
+        self._in_flight = False
+        self._notify.set()
 
     async def answer_permission(self, prompt_id: str, granted: bool) -> bool:
         """Forward the user's allow/deny click for a tool call.
@@ -730,6 +926,132 @@ class SessionRuntime:
             },
         )
 
+    # ── internal: extension_ui_request bridge ───────────────────────
+    def _intercept_extension_ui_request(
+        self,
+        evt: dict[str, Any],
+    ) -> Optional[dict[str, Any]]:
+        """Map pi's raw `extension_ui_request` into something the SPA
+        can render — or auto-respond when no SPA wiring exists.
+
+        The WS path (routes/chat_ws.py:_intercept_permission_request)
+        had this logic since 2026-04. The SSE path was added later and
+        forgot to mirror it, which caused two regressions:
+
+          * Permission prompts on SSE leaked the raw RPC envelope and
+            the SPA ignored it (the modal never appeared). Fixed by
+            converting `[pi-permission]`-prefixed titles to a
+            `permission_request` event the existing PermissionPrompt
+            component already handles.
+
+          * Any non-permission BLOCKING extension UI (e.g. the
+            subagent extension's "Run project-local agents?" confirm)
+            had nobody to answer it, so pi hung indefinitely waiting
+            for `extension_ui_response`. The user's 2026-05-16 report
+            ("subagent panel stuck on 'spawning child agent — first
+            turn lands in a moment…'") was exactly this — no children
+            spawned, no `tool_execution_update` fired, no
+            `tool_execution_end` ever arrived.
+
+        Returns:
+          * a *replacement* event (currently only `permission_request`)
+            to enqueue in the ring instead of the raw envelope, OR
+          * None to drop the event (after firing any required RPC
+            response back to pi). Caller MUST treat None as
+            "swallow, don't enqueue".
+
+        We never return the original event unchanged — raw
+        `extension_ui_request` envelopes are an internal RPC concern
+        and exposing them would just confuse the event-router on the
+        SPA.
+        """
+        if evt.get("type") != "extension_ui_request":
+            return evt  # not for us — pass through
+
+        method = evt.get("method")
+        title = evt.get("title")
+        req_id = evt.get("id")
+
+        # Path 1: our custom permission extension. Convert to the
+        # `permission_request` shape PermissionPrompt.vue expects.
+        if isinstance(title, str) and title.startswith(_PERMISSION_PREFIX):
+            try:
+                payload = json.loads(title[len(_PERMISSION_PREFIX):])
+            except Exception as exc:  # noqa: BLE001
+                # Malformed payload should never happen in practice
+                # (extensions/permission.ts builds the JSON itself),
+                # but if it does we auto-allow once to avoid deadlock
+                # and log loudly so the operator notices.
+                print(
+                    f"[runtime {self.session_id}] malformed permission "
+                    f"payload: {exc!r}; auto-allowing once",
+                    file=sys.stderr,
+                )
+                if isinstance(req_id, str) and self._pi is not None:
+                    asyncio.create_task(
+                        self._pi.send({
+                            "type": "extension_ui_response",
+                            "id": req_id,
+                            "value": "allow_once",
+                        })
+                    )
+                return None
+            if not isinstance(req_id, str):
+                return None
+            return {
+                "type": "permission_request",
+                "id": req_id,
+                "tool": payload.get("tool"),
+                "tool_call_id": payload.get("tool_call_id"),
+                "input": payload.get("input"),
+                "intent": payload.get("intent"),
+                "preview": payload.get("preview"),
+                "mode": payload.get("mode"),
+            }
+
+        # Path 2: subagent extension's project-agents safeguard. The
+        # workspace is the user's own dir; auto-confirm so scout /
+        # planner / worker / reviewer actually run instead of hanging.
+        if (
+            method == "confirm"
+            and isinstance(title, str)
+            and title == _PROJECT_AGENT_CONFIRM_TITLE
+        ):
+            if isinstance(req_id, str) and self._pi is not None:
+                asyncio.create_task(
+                    self._pi.send({
+                        "type": "extension_ui_response",
+                        "id": req_id,
+                        "confirmed": True,
+                    })
+                )
+            return None
+
+        # Path 3: any other BLOCKING dialog — auto-cancel so pi doesn't
+        # hang. Same policy as the WS path. If a future extension
+        # needs a real modal, add a Path 4 above this one to handle it.
+        if method in _BLOCKING_UI_METHODS:
+            if isinstance(req_id, str) and self._pi is not None:
+                asyncio.create_task(
+                    self._pi.send({
+                        "type": "extension_ui_response",
+                        "id": req_id,
+                        "cancelled": True,
+                    })
+                )
+                print(
+                    f"[runtime {self.session_id}] auto-cancelling unknown "
+                    f"extension_ui_request id={req_id!r} method={method!r} "
+                    f"title={title!r}",
+                    file=sys.stderr,
+                )
+            return None
+
+        # Path 4: non-blocking (notify/setStatus/setWidget/…). Fire-
+        # and-forget on pi's side; we just drop them so they don't
+        # clutter the SPA event stream.
+        return None
+
     # ── internal: pi → ring pump ────────────────────────────────────
     async def _pump_pi_events(self) -> None:
         """Drain pi.events() into the ring buffer. Runs as a background task."""
@@ -737,6 +1059,18 @@ class SessionRuntime:
         try:
             async for evt in self._pi.events():
                 self._touch()
+
+                # Bridge / drop extension_ui_request envelopes BEFORE
+                # any other handling so the ring buffer never carries
+                # raw RPC dialog requests (the SPA has no handler for
+                # them) and pi gets its required RPC response in time
+                # to keep its tool execution unblocked. See
+                # `_intercept_extension_ui_request` for the policy.
+                bridged = self._intercept_extension_ui_request(evt)
+                if bridged is None:
+                    continue
+                evt = bridged
+
                 # Track in-flight turn boundaries so the reaper
                 # doesn't kill pi mid-stream.
                 t = evt.get("type")
@@ -752,10 +1086,36 @@ class SessionRuntime:
                         self._turn_started_at = asyncio.get_event_loop().time()
                 elif t in ("agent_end", "turn_end"):
                     self._in_flight = False
+                    # Pi emits these whenever a turn / agent finishes
+                    # cleanly (including its own graceful abort path),
+                    # so any leftover trackers are stale — clear them
+                    # so the next force-kill doesn't synthesise events
+                    # for tool calls that pi already finalised.
+                    self._pending_tool_calls.clear()
+                    self._in_flight_assistant_message = None
                 elif t == "permission_request":
                     pid = str(evt.get("id") or "")
                     if pid:
                         self._pending_permissions[pid] = dict(evt)
+                elif t == "tool_execution_start":
+                    tcid = str(evt.get("toolCallId") or "")
+                    if tcid:
+                        self._pending_tool_calls[tcid] = {
+                            "toolName": evt.get("toolName"),
+                            "args": evt.get("args"),
+                        }
+                elif t == "tool_execution_end":
+                    tcid = str(evt.get("toolCallId") or "")
+                    if tcid:
+                        self._pending_tool_calls.pop(tcid, None)
+                elif t == "message_start":
+                    msg = evt.get("message") or {}
+                    if isinstance(msg, dict) and msg.get("role") == "assistant":
+                        self._in_flight_assistant_message = msg
+                elif t == "message_end":
+                    msg = evt.get("message") or {}
+                    if isinstance(msg, dict) and msg.get("role") == "assistant":
+                        self._in_flight_assistant_message = None
 
                 # Billing side-effects. Run BEFORE _enqueue so a
                 # billing crash never leaks unbilled events into the

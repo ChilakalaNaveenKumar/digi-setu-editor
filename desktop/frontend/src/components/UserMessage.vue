@@ -132,12 +132,15 @@ async function revertTurn(): Promise<void> {
       </button>
     </div>
 
-    <!-- Bubble surface. Soft muted fill + 1 px border + rounded corners
-         is the ChatGPT / Claude convention — clearly anchors "this was
-         the user's message" without competing with the assistant reply
-         (which renders as plain prose on the page background). -->
+    <!-- Bubble surface. Solid `bg-muted` fill, NO border. Earlier
+         pass used `border-border/70 bg-muted/40` which on a dark
+         theme rendered as a thin near-white outline over a barely-
+         tinted fill — the user's prompt looked like an empty contour
+         box. The tinted fill alone anchors "this is the user's turn"
+         and matches the visual style of system / summary bubbles
+         elsewhere in the chat. -->
     <div
-      class="relative rounded-xl border border-border/70 bg-muted/40 px-4 py-3 transition-colors"
+      class="relative rounded-xl bg-muted px-4 py-3 transition-colors"
     >
       <div class="pi-markdown leading-relaxed text-foreground" v-html="html" />
       <!-- Soft fade at the bottom of the preview gives a visual cue
@@ -145,7 +148,7 @@ async function revertTurn(): Promise<void> {
            own bg colour (muted) so it doesn't look like a stripe. -->
       <div
         v-if="isLong && !expanded"
-        class="pointer-events-none absolute inset-x-0 bottom-0 h-10 rounded-b-xl bg-gradient-to-t from-muted/60 to-transparent"
+        class="pointer-events-none absolute inset-x-0 bottom-0 h-10 rounded-b-xl bg-gradient-to-t from-muted to-transparent"
         aria-hidden="true"
       />
     </div>

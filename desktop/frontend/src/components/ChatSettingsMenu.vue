@@ -23,10 +23,12 @@ import { useBillingStore } from "../stores/billing";
 import { useConfigStore } from "../stores/config";
 import { useWorkspaceStore } from "../stores/workspace";
 
+import DesktopMaintenanceSection from "./DesktopMaintenanceSection.vue";
 import PermissionModePicker from "./PermissionModePicker.vue";
 import SkillsModal from "./SkillsModal.vue";
 import StorageCleanupSection from "./StorageCleanupSection.vue";
 import UpgradeModal from "./UpgradeModal.vue";
+import { isDesktop, onMenuMaintenance } from "../lib/native-bridge";
 
 const billing = useBillingStore();
 const cfg = useConfigStore();
@@ -40,7 +42,14 @@ const {
   isAuthoritative,
   isByok,
 } = storeToRefs(billing);
-const { mode: deployMode } = storeToRefs(cfg);
+// `cfg.mode` (a.k.a. deployMode) was previously destructured here so
+// the BYOK routing toggle could decide whether to render itself. The
+// toggle is currently disabled (see `showRoutingToggle` below); when
+// re-enabling it, restore:
+//   const { mode: deployMode } = storeToRefs(cfg);
+// and switch the computed to the desktop+byok gate documented there.
+// Removed for now to keep `noUnusedLocals` happy.
+void cfg;
 
 const open = ref(false);
 const showUpgrade = ref(false);
@@ -116,7 +125,6 @@ const routingDefault = ref<RoutingDefault | null>(null);
 const byokModeAvailable = ref(false);
 const routingUpdating = ref(false);
 
-let pollHandle: number | null = null;
 
 async function loadPrefs(): Promise<void> {
   try {
@@ -152,34 +160,74 @@ async function setRoutingDefault(value: RoutingDefault): Promise<void> {
   }
 }
 
-const showRoutingToggle = computed(
-  () => deployMode.value === "desktop" && byokModeAvailable.value,
-);
+// BYOK routing toggle is intentionally hidden in the UI for now —
+// the underlying plumbing (services/byok.py, /api/me/prefs.byok_mode,
+// model `route: "byok"` rows) is still in place so we can re-enable
+// without a backend change. Flip this back to
+//   deployMode.value === "desktop" && byokModeAvailable.value
+// once we're ready to surface the "use your own key" path again.
+const showRoutingToggle = computed(() => false);
+
+// Ref handle so the menu-bar shortcut (View ▸ Restart & Clean Backend,
+// Help ▸ Check for Updates…) can fire the same actions as the in-popover
+// buttons. The maintenance section exposes them via defineExpose, but
+// we ALSO need to nudge the popover open so the user sees the progress
+// UI rather than the action firing silently from a closed gear.
+const maintenanceRef =
+  ref<InstanceType<typeof DesktopMaintenanceSection> | null>(null);
+let unsubscribeMenu: (() => void) | null = null;
 
 onMounted(() => {
-  void billing.refreshStatus();
-  void billing.refreshUsage();
   void loadPrefs();
-  // 30 s is enough — usage rarely changes outside an active turn,
-  // and message_end already nudges the ledger live.
-  pollHandle = window.setInterval(() => void billing.refreshUsage(), 30_000);
   document.addEventListener("click", onDocClick);
   // Same capture-phase listeners the other pickers use so we
   // re-anchor when ANY ancestor scrolls (chat pane scroll, page
   // scroll on smaller viewports), not just the document.
   window.addEventListener("resize", reposition);
   window.addEventListener("scroll", reposition, true);
+
+  // Native menu hook-up. We listen at the chat-settings level rather
+  // than App.vue because the maintenance UI lives here — opening the
+  // popover from a click on a menu item makes the action visible
+  // (toast / progress bar / version readout) instead of "did it
+  // even fire?". Web mode short-circuits to a no-op listener.
+  if (isDesktop()) {
+    void onMenuMaintenance({
+      onRestartAndClean: () => {
+        open.value = true;
+        void nextTick().then(() => {
+          maintenanceRef.value?.triggerRestartAndClean();
+        });
+      },
+      onCheckForUpdates: () => {
+        open.value = true;
+        void nextTick().then(() => {
+          maintenanceRef.value?.triggerCheckForUpdate();
+        });
+      },
+    }).then((off) => {
+      unsubscribeMenu = off;
+    });
+  }
 });
 
 onUnmounted(() => {
-  if (pollHandle !== null) window.clearInterval(pollHandle);
   document.removeEventListener("click", onDocClick);
   window.removeEventListener("resize", reposition);
   window.removeEventListener("scroll", reposition, true);
+  unsubscribeMenu?.();
 });
 
+// We deliberately do NOT keep a setInterval polling /api/usage.
+// On desktop the call also goes out to digi-setu.com's cloud usage
+// endpoint (the SDK forwards through services/cloud_api.py), which
+// over a 30 s tick on a long-lived window adds up to thousands of
+// useless round-trips for a number nothing reads until the user
+// clicks the gear. Fetch on click instead.
 watch(open, async (v) => {
   if (!v) return;
+  void billing.refreshStatus();
+  void billing.refreshUsage();
   await nextTick();
   reposition();
 });
@@ -421,6 +469,11 @@ function openSkills(): void {
             v-if="workspace.activeId"
             :wsid="workspace.activeId"
           />
+
+          <!-- Desktop-only: restart-clean + auto-update controls. The
+               component itself short-circuits to v-if="false" in web
+               mode, so this slot is harmless in the shared SPA. -->
+          <DesktopMaintenanceSection ref="maintenanceRef" />
 
           <!-- Footer hint -->
           <div class="px-3 py-2 text-caption leading-tight text-muted-foreground">

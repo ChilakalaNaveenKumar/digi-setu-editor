@@ -15,7 +15,6 @@ import { Icon } from "@iconify/vue";
 
 import AppShell from "../components/AppShell.vue";
 import BrandHeader from "../components/BrandHeader.vue";
-import PermissionPrompt from "../components/PermissionPrompt.vue";
 import { listSessions } from "../api/sessions";
 import { useChatStore } from "../stores/chat";
 import { useChatSessionStore } from "../stores/chat-session";
@@ -154,9 +153,9 @@ onBeforeUnmount(() => {
       </button>
     </div>
 
-    <!-- Per-tool-call approval gate. Renders nothing when there are no
-         pending requests; <Teleport> moves the overlay to <body> so it
-         escapes any z-index traps inside AppShell. -->
-    <PermissionPrompt />
+    <!-- Per-tool-call approval banner is now mounted INSIDE ChatPane
+         (between header and message list) so it anchors visually at
+         the top of the chat column where the user's eye actually is.
+         The old bottom-right overlay went unnoticed on long turns. -->
   </div>
 </template>

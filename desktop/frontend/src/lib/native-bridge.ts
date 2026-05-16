@@ -255,3 +255,138 @@ export async function restartSidecar(): Promise<number | null> {
     return null;
   }
 }
+
+/**
+ * "Big-red-button" restart that ALSO sweeps every orphan
+ * `pi-typst-sidecar` on the system before respawning. Use this
+ * (instead of plain `restartSidecar`) for the user-facing
+ * "Restart & Clean Backend" affordance — the orphan sweep covers
+ * the cases plain restart can't:
+ *
+ *   * a sidecar from a previous crashed launch that's still
+ *     bound to a loopback port and intercepting traffic;
+ *   * a leftover dev-mode sidecar from `tauri dev`;
+ *   * a sidecar from an old app bundle the user just upgraded
+ *     over (in-place install reuses the comm-name).
+ *
+ * After this returns, the SPA should listen for `backend-restarted`
+ * the same way it does for plain `restartSidecar` — the watchdog
+ * handles the actual respawn asynchronously.
+ *
+ * In web mode this is a no-op (no sidecar to restart).
+ */
+export async function restartAndCleanSidecar(): Promise<boolean> {
+  if (!isDesktop()) return false;
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("restart_and_clean");
+    return true;
+  } catch (err) {
+    console.error("restartAndCleanSidecar failed:", err);
+    return false;
+  }
+}
+
+/** Shape of the auto-update probe response. `null` means "up to date". */
+export type UpdateInfo = {
+  version: string;
+  body: string | null;
+  date: string | null;
+};
+
+/**
+ * Probe the configured updater endpoint(s) for a newer release.
+ * Returns:
+ *   - `null` when we're already on the latest version;
+ *   - the new release info when an upgrade is available;
+ *   - throws on network / config / signature problems (the caller
+ *     should surface these to the user as a banner, not silently
+ *     swallow — we want loud failures here so signing problems get
+ *     noticed before they brick a release).
+ *
+ * In web mode this returns `null` (nothing to update — the SPA's
+ * served by Caddy and reloaded on every visit).
+ */
+export async function checkForUpdate(): Promise<UpdateInfo | null> {
+  if (!isDesktop()) return null;
+  const { invoke } = await import("@tauri-apps/api/core");
+  return await invoke<UpdateInfo | null>("check_for_update");
+}
+
+/** Streaming progress event during `applyUpdateAndRestart`. */
+export type UpdateProgress = { chunkBytes: number; totalBytes: number | null };
+
+/**
+ * Download + verify + install the latest release, then restart the
+ * app. Subscribes to the `updater://download-progress` event so the
+ * caller can show a progress bar.
+ *
+ * On success this never resolves — the app process is gone before
+ * the awaited Promise has a chance to settle. The Promise rejects
+ * on download / signature / install errors.
+ *
+ * `onProgress` is called from the renderer's main thread; the
+ * default frequency is "every chunk" which is reasonable for a
+ * progress bar (~hundreds of events for a 50 MB bundle).
+ */
+export async function applyUpdateAndRestart(
+  onProgress?: (p: UpdateProgress) => void,
+): Promise<void> {
+  if (!isDesktop()) {
+    throw new Error("auto-update is desktop-only");
+  }
+  let unlisten: (() => void) | undefined;
+  if (onProgress) {
+    const { listen } = await import("@tauri-apps/api/event");
+    unlisten = await listen<UpdateProgress>(
+      "updater://download-progress",
+      (event) => onProgress(event.payload),
+    );
+  }
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("apply_update_and_restart");
+  } finally {
+    unlisten?.();
+  }
+}
+
+/**
+ * Subscribe to the native menu's "Restart & Clean Backend" + "Check
+ * for Updates…" item clicks. The Rust side (`lib.rs`) emits these as
+ * frontend events rather than calling the IPCs directly so the SPA
+ * can show its own progress UI (toast, modal, progress bar) instead
+ * of the menu firing a silent IPC the user can't observe.
+ */
+export type MenuMaintenanceHandlers = {
+  onRestartAndClean?: () => void;
+  onCheckForUpdates?: () => void;
+};
+
+export async function onMenuMaintenance(
+  handlers: MenuMaintenanceHandlers,
+): Promise<() => void> {
+  if (!isDesktop()) return () => {};
+  try {
+    const { listen } = await import("@tauri-apps/api/event");
+    const offs: Array<() => void> = [];
+    if (handlers.onRestartAndClean) {
+      offs.push(
+        await listen("menu:restart_and_clean", () => {
+          handlers.onRestartAndClean?.();
+        }),
+      );
+    }
+    if (handlers.onCheckForUpdates) {
+      offs.push(
+        await listen("menu:check_for_updates", () => {
+          handlers.onCheckForUpdates?.();
+        }),
+      );
+    }
+    return () => offs.forEach((o) => o());
+  } catch (err) {
+    console.error("onMenuMaintenance subscribe failed:", err);
+    return () => {};
+  }
+}

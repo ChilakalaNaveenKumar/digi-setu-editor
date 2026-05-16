@@ -73,8 +73,8 @@ const PILLARS: Array<{ icon: string; title: string; body: string }> = [
   },
   {
     icon: "codicon:shield",
-    title: "Bring your own keys",
-    body: "Drop an Anthropic, OpenAI or Google key into your account and the app routes straight to your provider — billed by them, not us.",
+    title: "Sandboxed by default",
+    body: "Every chat runs in its own container with a curated network allow-list, snapshot history, and one-click revert. Nothing leaks across sessions.",
   },
 ];
 </script>
@@ -105,7 +105,7 @@ const PILLARS: Array<{ icon: string; title: string; body: string }> = [
             Digi Setu turns plain English into polished Typst documents,
             slides and PDFs — inside a sandboxed workspace with a real
             editor, terminal, and live preview. Pay once a month for the
-            actual model + infra cost, or bring your own AI keys.
+            actual model + infra cost — no per-token surprises.
           </p>
           <div class="mt-8 flex flex-wrap items-center justify-center gap-3">
             <!-- Auth-off: single CTA goes straight to the picker. -->

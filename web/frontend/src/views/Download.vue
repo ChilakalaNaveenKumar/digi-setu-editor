@@ -32,18 +32,83 @@
       Debian-family distros because dpkg sets the bit for us.
 -->
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, onMounted, ref } from "vue";
 import { Icon } from "@iconify/vue";
+import { useRouter } from "vue-router";
 
+import { apiPost } from "../api/client";
+import { useConfigStore } from "../stores/config";
 
-const APP_VERSION = "0.1.0";
+const router = useRouter();
+const cfg = useConfigStore();
 
-const MACOS_ARM_DMG = `Digi-Setu-${APP_VERSION}-arm64.dmg`;
-const MACOS_INTEL_DMG = `Digi-Setu-${APP_VERSION}-x86_64.dmg`;
-const LINUX_DEB = `Digi-Setu-${APP_VERSION}-amd64.deb`;
-const LINUX_APPIMAGE = `Digi-Setu-${APP_VERSION}-amd64.AppImage`;
-const WINDOWS_EXE = `Digi-Setu-${APP_VERSION}-x64-setup.exe`;
-const WINDOWS_MSI = `Digi-Setu-${APP_VERSION}-x64.msi`;
+// Hard-coded fallback used by the SPA when the cloud's
+// /api/desktop/latest-version probe fails (offline preview, dev
+// without the cloud reachable, or the page rendering before the
+// fetch resolves). The cloud-pinned value below shadows this on
+// every successful fetch, so a published release bump is live the
+// moment the operator runs `set_release_channel(...)` — no SPA
+// redeploy required to update the badge / filenames.
+const FALLBACK_APP_VERSION = "0.1.0";
+const APP_VERSION = ref<string>(FALLBACK_APP_VERSION);
+
+// Auth state. We render the page for everyone (so the URL stays
+// shareable in marketing copy and we don't trash SEO), but flip
+// the primary CTA to "Sign in to download" when no Clerk session
+// exists. This matches the Pricing.vue convention.
+const signedIn = ref<boolean | null>(null);
+const tracking = ref(false);
+
+onMounted(async () => {
+  // 1) Resolve "are we signed in". Same import-pattern as Pricing.vue
+  //    so the dev build (cfg.authRequired === false) treats every
+  //    visitor as authed.
+  if (cfg.authRequired) {
+    try {
+      const { getToken } = await import("@clerk/vue");
+      const t = await getToken();
+      signedIn.value = !!t;
+    } catch {
+      signedIn.value = false;
+    }
+  } else {
+    signedIn.value = true;
+  }
+
+  // 2) Pull the canonical latest version. Public endpoint — no auth
+  //    needed. Failure leaves the hard-coded fallback in place.
+  try {
+    const r = await apiPost<{ version: string }>(
+      "/api/desktop/latest-version",
+      undefined,
+    ).catch(async () => {
+      // /api/desktop/latest-version is a GET — apiPost will reject
+      // with method-not-allowed. Fall back to a plain fetch so the
+      // page still resolves a server-side version when present.
+      const resp = await fetch("/api/desktop/latest-version", {
+        headers: { Accept: "application/json" },
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      return await resp.json();
+    });
+    if (r && typeof r.version === "string" && r.version) {
+      APP_VERSION.value = r.version;
+    }
+  } catch {
+    // Network blip or the route hasn't shipped yet — silent fallback.
+  }
+});
+
+// Filenames are computeds rather than const strings because
+// APP_VERSION is now a ref that resolves from the cloud after
+// mount. A const interpolation would freeze "Digi-Setu-0.1.0-…"
+// at module load and never reflect the live release pointer.
+const MACOS_ARM_DMG = computed(() => `Digi-Setu-${APP_VERSION.value}-arm64.dmg`);
+const MACOS_INTEL_DMG = computed(() => `Digi-Setu-${APP_VERSION.value}-x86_64.dmg`);
+const LINUX_DEB = computed(() => `Digi-Setu-${APP_VERSION.value}-amd64.deb`);
+const LINUX_APPIMAGE = computed(() => `Digi-Setu-${APP_VERSION.value}-amd64.AppImage`);
+const WINDOWS_EXE = computed(() => `Digi-Setu-${APP_VERSION.value}-x64-setup.exe`);
+const WINDOWS_MSI = computed(() => `Digi-Setu-${APP_VERSION.value}-x64.msi`);
 
 type Platform =
   | "mac-arm"
@@ -85,25 +150,43 @@ const platform = computed<Platform>(() => {
   return "other";
 });
 
+// Platform key sent to the cloud's track-download endpoint. Stays
+// in sync with the `Platform` type above; the helper exists so
+// the click handler doesn't have to duplicate the switch.
+const trackingPlatform = computed<string>(() => {
+  if (platform.value === "mac-intel" && !macIntelAvailable) {
+    // The user is on an Intel Mac but we hand them the arm64 DMG
+    // under Rosetta. Telemetry should reflect what they actually
+    // clicked, not what we'd ideally hand them.
+    return "mac-arm";
+  }
+  return platform.value;
+});
+
 const primaryHref = computed(() => {
   switch (platform.value) {
-    case "mac-arm": return `/downloads/${MACOS_ARM_DMG}`;
+    case "mac-arm": return `/downloads/${MACOS_ARM_DMG.value}`;
     // No native Intel DMG yet (see `macIntelAvailable` above) — fall
     // back to the arm64 DMG which runs fine under Rosetta 2 on Intel
     // Macs. macOS prompts to install Rosetta on first launch (one-time
     // ~30 sec) and from then on it's transparent.
     case "mac-intel":
       return macIntelAvailable
-        ? `/downloads/${MACOS_INTEL_DMG}`
-        : `/downloads/${MACOS_ARM_DMG}`;
-    case "linux-deb": return `/downloads/${LINUX_DEB}`;
-    case "linux-appimage": return `/downloads/${LINUX_APPIMAGE}`;
-    case "windows": return `/downloads/${WINDOWS_EXE}`;
-    default: return `/downloads/${MACOS_ARM_DMG}`;
+        ? `/downloads/${MACOS_INTEL_DMG.value}`
+        : `/downloads/${MACOS_ARM_DMG.value}`;
+    case "linux-deb": return `/downloads/${LINUX_DEB.value}`;
+    case "linux-appimage": return `/downloads/${LINUX_APPIMAGE.value}`;
+    case "windows": return `/downloads/${WINDOWS_EXE.value}`;
+    default: return `/downloads/${MACOS_ARM_DMG.value}`;
   }
 });
 
 const primaryLabel = computed(() => {
+  // Shadow the platform-specific labels with the auth gate when
+  // signed out — the user has to sign in before the bytes fly,
+  // and saying so up-front matches Pricing.vue's "Sign in to
+  // upgrade" UX.
+  if (signedIn.value === false) return "Sign in to download";
   switch (platform.value) {
     case "mac-arm": return "Download for macOS (Apple Silicon)";
     // When we hand an Intel Mac user the arm64 DMG, be explicit about
@@ -119,6 +202,114 @@ const primaryLabel = computed(() => {
     default: return "Download for macOS";
   }
 });
+
+/**
+ * Auth-gated download click handler.
+ *
+ * Behaviour:
+ *   - Signed out → redirect to /login with `next=/download`. After
+ *     sign-in the user lands back here and clicks again. We don't
+ *     auto-trigger the download post-sign-in because Safari + Chrome
+ *     suppress programmatic anchor clicks not initiated by a real
+ *     user gesture, so a "click happened on a previous page" path
+ *     fails silently with no UI feedback.
+ *   - Signed in → POST /api/desktop/track-download (records the
+ *     event server-side), then synthesise an `<a download>` click
+ *     to start the actual download via Caddy's static handler.
+ *
+ * The synthetic anchor pattern (rather than `window.location.href`)
+ * lets the page stay put — important because the download instructions
+ * + first-launch warnings are right below the button. Setting
+ * window.location would navigate away mid-download.
+ */
+async function onPrimaryDownload(): Promise<void> {
+  if (signedIn.value === false) {
+    router.push({ name: "login", query: { next: "/download" } });
+    return;
+  }
+  if (signedIn.value === null || tracking.value) return;
+  tracking.value = true;
+  try {
+    const resp = await apiPost<{
+      ok: boolean;
+      download_id: number;
+      download_url: string;
+    }>("/api/desktop/track-download", {
+      platform: trackingPlatform.value,
+      version: APP_VERSION.value,
+    });
+    triggerDownload(resp.download_url, primaryHref.value);
+  } catch (exc) {
+    // If tracking fails (cloud blip, transient 500) we still want
+    // the user to be able to install the app — degraded telemetry
+    // is preferable to a broken download button. Log + fall through
+    // to the static URL so the user gets the bytes either way.
+    console.warn("[download] track-download failed; serving anyway", exc);
+    triggerDownload(primaryHref.value);
+  } finally {
+    tracking.value = false;
+  }
+}
+
+function triggerDownload(url: string, fallback?: string): void {
+  const a = document.createElement("a");
+  a.href = url || fallback || "";
+  // The download attribute hints to the browser "treat as download,
+  // not navigation". Caddy also sends Content-Disposition: attachment
+  // so this is belt-and-suspenders, but it makes the intent crystal
+  // clear inline.
+  a.setAttribute("download", "");
+  a.rel = "noopener";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+}
+
+/**
+ * Same auth-gated path as ``onPrimaryDownload``, but for the per-OS
+ * rows in the "All downloads" grid below the hero. The grid lets a
+ * Linux user on a Mac (or vice versa) override our UA-based platform
+ * guess; we want the same auth + tracking story for every code path
+ * that hands the user installer bytes.
+ */
+async function onGridDownload(p: Platform | "windows-msi"): Promise<void> {
+  if (signedIn.value === false) {
+    router.push({ name: "login", query: { next: "/download" } });
+    return;
+  }
+  if (signedIn.value === null || tracking.value) return;
+  const fname = filenameFor(p);
+  const fallback = `/downloads/${fname}`;
+  tracking.value = true;
+  try {
+    const resp = await apiPost<{
+      ok: boolean;
+      download_id: number;
+      download_url: string;
+    }>("/api/desktop/track-download", {
+      platform: p,
+      version: APP_VERSION.value,
+    });
+    triggerDownload(resp.download_url, fallback);
+  } catch (exc) {
+    console.warn("[download] track-download failed; serving anyway", exc);
+    triggerDownload(fallback);
+  } finally {
+    tracking.value = false;
+  }
+}
+
+function filenameFor(p: Platform | "windows-msi"): string {
+  switch (p) {
+    case "mac-arm": return MACOS_ARM_DMG.value;
+    case "mac-intel": return MACOS_INTEL_DMG.value;
+    case "linux-deb": return LINUX_DEB.value;
+    case "linux-appimage": return LINUX_APPIMAGE.value;
+    case "windows": return WINDOWS_EXE.value;
+    case "windows-msi": return WINDOWS_MSI.value;
+    default: return MACOS_ARM_DMG.value;
+  }
+}
 
 const primaryIcon = computed(() => {
   switch (platform.value) {
@@ -162,7 +353,11 @@ const macIntelAvailable = true;
 // we land a hosted Linux runner with FUSE.
 const linuxDebAvailable = true;
 const linuxAppImageAvailable = false;
-const linuxAvailable = linuxDebAvailable || linuxAppImageAvailable;
+// Was previously used to render an "any-flavour Linux" row in the
+// All-downloads grid. The grid now branches per-flavour so each row
+// reflects its own availability flag, and this aggregate is unused.
+// Kept the declaration removed rather than commented to satisfy
+// `noUnusedLocals` — the per-flavour flags above carry the truth.
 // Windows: produced by GHA's `windows` job (.github/workflows/release.yml).
 // Both the .exe (NSIS, end-user-friendly) and the .msi (IT/MDM
 // deployment via Group Policy / Intune) come from the same job — flip
@@ -191,14 +386,41 @@ const windowsAvailable = true;
       </p>
 
       <div class="mt-10 flex flex-col items-center gap-3">
-        <a
-          :href="primaryHref"
-          class="inline-flex items-center gap-2 rounded-md bg-primary px-5 py-3 text-base font-semibold text-primary-foreground shadow-sm transition-opacity hover:opacity-90"
+        <!--
+          Click rather than direct anchor: signed-out users get
+          bounced to /login (and back) before any bytes start;
+          signed-in users hit /api/desktop/track-download first
+          so the cloud knows who clicked which artefact. The
+          static /downloads/* URL is still served by Caddy — we
+          only gate the *intent*, not the bytes.
+        -->
+        <button
+          type="button"
+          class="inline-flex items-center gap-2 rounded-md bg-primary px-5 py-3 text-base font-semibold text-primary-foreground shadow-sm transition-opacity hover:opacity-90 disabled:opacity-60"
+          :disabled="tracking || signedIn === null"
+          @click="onPrimaryDownload"
         >
-          <Icon :icon="primaryIcon" class="h-5 w-5" />
+          <Icon
+            v-if="tracking"
+            icon="codicon:sync"
+            class="h-5 w-5 animate-spin"
+          />
+          <Icon
+            v-else-if="signedIn === false"
+            icon="mdi:lock-outline"
+            class="h-5 w-5"
+          />
+          <Icon v-else :icon="primaryIcon" class="h-5 w-5" />
           {{ primaryLabel }}
-        </a>
-        <p class="text-caption text-muted-foreground">
+        </button>
+        <p
+          v-if="signedIn === false"
+          class="text-caption text-muted-foreground"
+        >
+          We track downloads against your account so we can tell you
+          when an update is ready.
+        </p>
+        <p v-else class="text-caption text-muted-foreground">
           Free plan included — $10 of cloud credit every month, no card required.
         </p>
         <button
@@ -348,120 +570,236 @@ const windowsAvailable = true;
       <h2 class="mb-4 text-caption font-mono uppercase tracking-wide text-muted-foreground">
         All downloads
       </h2>
+      <p
+        v-if="signedIn === false"
+        class="mb-3 text-caption text-muted-foreground"
+      >
+        <Icon icon="mdi:lock-outline" class="-mt-0.5 inline h-3.5 w-3.5" />
+        Sign in to download — we keep a list of which build you have so
+        we can tell you when an update is ready.
+      </p>
       <div class="overflow-hidden rounded-lg border border-border">
         <!-- macOS Apple Silicon -->
-        <component
-          :is="macArmAvailable ? 'a' : 'div'"
-          :href="macArmAvailable ? `/downloads/${MACOS_ARM_DMG}` : undefined"
-          class="flex items-center justify-between gap-4 border-b border-border bg-muted/20 px-4 py-3 last:border-b-0"
-          :class="macArmAvailable ? 'hover:bg-muted/40' : 'text-muted-foreground'"
+        <button
+          v-if="macArmAvailable"
+          type="button"
+          class="flex w-full items-center justify-between gap-4 border-b border-border bg-muted/20 px-4 py-3 text-left last:border-b-0 hover:bg-muted/40 disabled:opacity-60"
+          :disabled="tracking || signedIn === null"
+          @click="onGridDownload('mac-arm')"
         >
           <div class="flex items-center gap-3">
             <Icon icon="mdi:apple" class="h-5 w-5 text-foreground" />
             <div>
               <div class="font-semibold">macOS · Apple Silicon</div>
               <div class="font-mono text-caption text-muted-foreground">
-                {{ macArmAvailable ? MACOS_ARM_DMG : "Coming soon" }}
+                {{ MACOS_ARM_DMG }}
               </div>
             </div>
           </div>
-          <Icon :icon="macArmAvailable ? 'mdi:download' : 'mdi:clock-outline'" class="h-5 w-5 text-muted-foreground" />
-        </component>
+          <Icon
+            :icon="signedIn === false ? 'mdi:lock-outline' : 'mdi:download'"
+            class="h-5 w-5 text-muted-foreground"
+          />
+        </button>
+        <div
+          v-else
+          class="flex items-center justify-between gap-4 border-b border-border bg-muted/20 px-4 py-3 text-muted-foreground last:border-b-0"
+        >
+          <div class="flex items-center gap-3">
+            <Icon icon="mdi:apple" class="h-5 w-5 text-foreground" />
+            <div>
+              <div class="font-semibold">macOS · Apple Silicon</div>
+              <div class="font-mono text-caption">Coming soon</div>
+            </div>
+          </div>
+          <Icon icon="mdi:clock-outline" class="h-5 w-5" />
+        </div>
 
         <!-- macOS Intel -->
-        <component
-          :is="macIntelAvailable ? 'a' : 'div'"
-          :href="macIntelAvailable ? `/downloads/${MACOS_INTEL_DMG}` : undefined"
-          class="flex items-center justify-between gap-4 border-b border-border bg-muted/20 px-4 py-3 last:border-b-0"
-          :class="macIntelAvailable ? 'hover:bg-muted/40' : 'text-muted-foreground'"
+        <button
+          v-if="macIntelAvailable"
+          type="button"
+          class="flex w-full items-center justify-between gap-4 border-b border-border bg-muted/20 px-4 py-3 text-left last:border-b-0 hover:bg-muted/40 disabled:opacity-60"
+          :disabled="tracking || signedIn === null"
+          @click="onGridDownload('mac-intel')"
         >
           <div class="flex items-center gap-3">
             <Icon icon="mdi:apple" class="h-5 w-5 text-foreground" />
             <div>
               <div class="font-semibold">macOS · Intel</div>
               <div class="font-mono text-caption text-muted-foreground">
-                {{ macIntelAvailable ? MACOS_INTEL_DMG : "Coming soon — use Apple Silicon DMG via Rosetta meanwhile" }}
+                {{ MACOS_INTEL_DMG }}
               </div>
             </div>
           </div>
-          <Icon :icon="macIntelAvailable ? 'mdi:download' : 'mdi:clock-outline'" class="h-5 w-5 text-muted-foreground" />
-        </component>
+          <Icon
+            :icon="signedIn === false ? 'mdi:lock-outline' : 'mdi:download'"
+            class="h-5 w-5 text-muted-foreground"
+          />
+        </button>
+        <div
+          v-else
+          class="flex items-center justify-between gap-4 border-b border-border bg-muted/20 px-4 py-3 text-muted-foreground last:border-b-0"
+        >
+          <div class="flex items-center gap-3">
+            <Icon icon="mdi:apple" class="h-5 w-5 text-foreground" />
+            <div>
+              <div class="font-semibold">macOS · Intel</div>
+              <div class="font-mono text-caption">
+                Coming soon — use Apple Silicon DMG via Rosetta meanwhile
+              </div>
+            </div>
+          </div>
+          <Icon icon="mdi:clock-outline" class="h-5 w-5" />
+        </div>
 
         <!-- Linux .deb -->
-        <component
-          :is="linuxAvailable ? 'a' : 'div'"
-          :href="linuxAvailable ? `/downloads/${LINUX_DEB}` : undefined"
-          class="flex items-center justify-between gap-4 border-b border-border bg-muted/20 px-4 py-3 last:border-b-0"
-          :class="linuxAvailable ? 'hover:bg-muted/40' : 'text-muted-foreground'"
+        <button
+          v-if="linuxDebAvailable"
+          type="button"
+          class="flex w-full items-center justify-between gap-4 border-b border-border bg-muted/20 px-4 py-3 text-left last:border-b-0 hover:bg-muted/40 disabled:opacity-60"
+          :disabled="tracking || signedIn === null"
+          @click="onGridDownload('linux-deb')"
         >
           <div class="flex items-center gap-3">
             <Icon icon="mdi:linux" class="h-5 w-5 text-foreground" />
             <div>
               <div class="font-semibold">Linux · Debian / Ubuntu (.deb)</div>
               <div class="font-mono text-caption text-muted-foreground">
-                {{ linuxDebAvailable ? LINUX_DEB : "Coming soon" }}
+                {{ LINUX_DEB }}
               </div>
             </div>
           </div>
-          <Icon :icon="linuxDebAvailable ? 'mdi:download' : 'mdi:clock-outline'" class="h-5 w-5 text-muted-foreground" />
-        </component>
+          <Icon
+            :icon="signedIn === false ? 'mdi:lock-outline' : 'mdi:download'"
+            class="h-5 w-5 text-muted-foreground"
+          />
+        </button>
+        <div
+          v-else
+          class="flex items-center justify-between gap-4 border-b border-border bg-muted/20 px-4 py-3 text-muted-foreground last:border-b-0"
+        >
+          <div class="flex items-center gap-3">
+            <Icon icon="mdi:linux" class="h-5 w-5 text-foreground" />
+            <div>
+              <div class="font-semibold">Linux · Debian / Ubuntu (.deb)</div>
+              <div class="font-mono text-caption">Coming soon</div>
+            </div>
+          </div>
+          <Icon icon="mdi:clock-outline" class="h-5 w-5" />
+        </div>
 
         <!-- Linux AppImage -->
-        <component
-          :is="linuxAppImageAvailable ? 'a' : 'div'"
-          :href="linuxAppImageAvailable ? `/downloads/${LINUX_APPIMAGE}` : undefined"
-          class="flex items-center justify-between gap-4 border-b border-border bg-muted/20 px-4 py-3 last:border-b-0"
-          :class="linuxAppImageAvailable ? 'hover:bg-muted/40' : 'text-muted-foreground'"
+        <button
+          v-if="linuxAppImageAvailable"
+          type="button"
+          class="flex w-full items-center justify-between gap-4 border-b border-border bg-muted/20 px-4 py-3 text-left last:border-b-0 hover:bg-muted/40 disabled:opacity-60"
+          :disabled="tracking || signedIn === null"
+          @click="onGridDownload('linux-appimage')"
         >
           <div class="flex items-center gap-3">
             <Icon icon="mdi:linux" class="h-5 w-5 text-foreground" />
             <div>
               <div class="font-semibold">Linux · AppImage (universal)</div>
               <div class="font-mono text-caption text-muted-foreground">
-                {{ linuxAppImageAvailable ? LINUX_APPIMAGE : "Coming soon" }}
+                {{ LINUX_APPIMAGE }}
               </div>
             </div>
           </div>
-          <Icon :icon="linuxAppImageAvailable ? 'mdi:download' : 'mdi:clock-outline'" class="h-5 w-5 text-muted-foreground" />
-        </component>
+          <Icon
+            :icon="signedIn === false ? 'mdi:lock-outline' : 'mdi:download'"
+            class="h-5 w-5 text-muted-foreground"
+          />
+        </button>
+        <div
+          v-else
+          class="flex items-center justify-between gap-4 border-b border-border bg-muted/20 px-4 py-3 text-muted-foreground last:border-b-0"
+        >
+          <div class="flex items-center gap-3">
+            <Icon icon="mdi:linux" class="h-5 w-5 text-foreground" />
+            <div>
+              <div class="font-semibold">Linux · AppImage (universal)</div>
+              <div class="font-mono text-caption">Coming soon</div>
+            </div>
+          </div>
+          <Icon icon="mdi:clock-outline" class="h-5 w-5" />
+        </div>
 
         <!-- Windows .exe -->
-        <component
-          :is="windowsAvailable ? 'a' : 'div'"
-          :href="windowsAvailable ? `/downloads/${WINDOWS_EXE}` : undefined"
-          class="flex items-center justify-between gap-4 border-b border-border bg-muted/20 px-4 py-3 last:border-b-0"
-          :class="windowsAvailable ? 'hover:bg-muted/40' : 'text-muted-foreground'"
+        <button
+          v-if="windowsAvailable"
+          type="button"
+          class="flex w-full items-center justify-between gap-4 border-b border-border bg-muted/20 px-4 py-3 text-left last:border-b-0 hover:bg-muted/40 disabled:opacity-60"
+          :disabled="tracking || signedIn === null"
+          @click="onGridDownload('windows')"
         >
           <div class="flex items-center gap-3">
             <Icon icon="mdi:microsoft-windows" class="h-5 w-5 text-foreground" />
             <div>
               <div class="font-semibold">Windows · installer (.exe)</div>
               <div class="font-mono text-caption text-muted-foreground">
-                {{ windowsAvailable ? WINDOWS_EXE : "Coming with Trusted Signing approval" }}
+                {{ WINDOWS_EXE }}
               </div>
             </div>
           </div>
-          <Icon :icon="windowsAvailable ? 'mdi:download' : 'mdi:clock-outline'" class="h-5 w-5 text-muted-foreground" />
-        </component>
+          <Icon
+            :icon="signedIn === false ? 'mdi:lock-outline' : 'mdi:download'"
+            class="h-5 w-5 text-muted-foreground"
+          />
+        </button>
+        <div
+          v-else
+          class="flex items-center justify-between gap-4 border-b border-border bg-muted/20 px-4 py-3 text-muted-foreground last:border-b-0"
+        >
+          <div class="flex items-center gap-3">
+            <Icon icon="mdi:microsoft-windows" class="h-5 w-5 text-foreground" />
+            <div>
+              <div class="font-semibold">Windows · installer (.exe)</div>
+              <div class="font-mono text-caption">
+                Coming with Trusted Signing approval
+              </div>
+            </div>
+          </div>
+          <Icon icon="mdi:clock-outline" class="h-5 w-5" />
+        </div>
 
         <!-- Windows .msi (IT/MDM) -->
-        <component
-          :is="windowsAvailable ? 'a' : 'div'"
-          :href="windowsAvailable ? `/downloads/${WINDOWS_MSI}` : undefined"
-          class="flex items-center justify-between gap-4 bg-muted/10 px-4 py-3"
-          :class="windowsAvailable ? 'hover:bg-muted/40' : 'text-muted-foreground'"
+        <button
+          v-if="windowsAvailable"
+          type="button"
+          class="flex w-full items-center justify-between gap-4 bg-muted/10 px-4 py-3 text-left hover:bg-muted/40 disabled:opacity-60"
+          :disabled="tracking || signedIn === null"
+          @click="onGridDownload('windows-msi')"
         >
           <div class="flex items-center gap-3">
             <Icon icon="mdi:microsoft-windows" class="h-5 w-5" />
             <div>
               <div class="font-semibold">Windows · MSI for IT / MDM</div>
               <div class="font-mono text-caption">
-                {{ windowsAvailable ? WINDOWS_MSI : "Coming with Trusted Signing approval" }}
+                {{ WINDOWS_MSI }}
               </div>
             </div>
           </div>
-          <Icon :icon="windowsAvailable ? 'mdi:download' : 'mdi:clock-outline'" class="h-5 w-5" />
-        </component>
+          <Icon
+            :icon="signedIn === false ? 'mdi:lock-outline' : 'mdi:download'"
+            class="h-5 w-5"
+          />
+        </button>
+        <div
+          v-else
+          class="flex items-center justify-between gap-4 bg-muted/10 px-4 py-3 text-muted-foreground"
+        >
+          <div class="flex items-center gap-3">
+            <Icon icon="mdi:microsoft-windows" class="h-5 w-5" />
+            <div>
+              <div class="font-semibold">Windows · MSI for IT / MDM</div>
+              <div class="font-mono text-caption">
+                Coming with Trusted Signing approval
+              </div>
+            </div>
+          </div>
+          <Icon icon="mdi:clock-outline" class="h-5 w-5" />
+        </div>
       </div>
     </section>
 

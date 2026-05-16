@@ -460,7 +460,9 @@ class PiSession:
             try:
                 permission_mode_file.parent.mkdir(parents=True, exist_ok=True)
                 if not permission_mode_file.exists():
-                    permission_mode_file.write_text(mode + "\n", encoding="utf-8")
+                    permission_mode_file.write_text(
+                        self._permission_mode + "\n", encoding="utf-8"
+                    )
                 try:
                     os.chmod(permission_mode_file, 0o644)
                 except OSError:
@@ -645,6 +647,18 @@ class PiSession:
         # committed prior turn (pi writes user messages immediately
         # on receipt, so even the prompt that triggered the Stop is
         # in there).
+        # Pi's bundled example extensions live inside the
+        # pi-coding-agent npm install at:
+        #   /opt/pi-session/node_modules/@mariozechner/pi-coding-agent/examples/extensions/
+        # (See deploy/Dockerfile.session — `npm i @mariozechner/pi-coding-agent`
+        # under /opt/pi-session puts the whole package there, examples
+        # included.) We load the safe + agent-quality ones here; the
+        # SPA already handles every event shape they emit (tool calls
+        # render as generic tool cards, `extension_ui_request` is
+        # intercepted by chat_ws.py for the permission modal).
+        _PI_EXAMPLES_IN_CONTAINER = (
+            "/opt/pi-session/node_modules/@mariozechner/pi-coding-agent/examples/extensions"
+        )
         pi_argv = [
             "pi",
             "--mode", "rpc",
@@ -654,6 +668,46 @@ class PiSession:
             "--continue",
             "--extension", "/opt/pi-session/extensions/typst-tools.ts",
             "--extension", "/opt/pi-session/extensions/permission.ts",
+            # Safety extensions — protected-paths blocks writes to
+            # .env / .git/ / node_modules/, permission-gate prompts
+            # before rm -rf / sudo / chmod 777.
+            "--extension", f"{_PI_EXAMPLES_IN_CONTAINER}/protected-paths.ts",
+            "--extension", f"{_PI_EXAMPLES_IN_CONTAINER}/permission-gate.ts",
+            # Quality-of-life extensions:
+            #   trigger-compact → auto-compact when context > 100k
+            #     tokens; without it long chats hit hard limit.
+            #   git-checkpoint  → git stash before every turn so
+            #     /fork can rewind; no-op outside a git repo.
+            #   todo            → native `todo` tool for multi-step
+            #     plans; state persists in session entries.
+            #   subagent        → spawn isolated sub-agents for
+            #     scoped work without trashing main context.
+            #   structured-output → terminator tool for JSON answers
+            #     (saves one LLM round-trip per structured reply).
+            #   handoff         → `/handoff <goal>` to start a fresh
+            #     focused chat with relevant context summarised.
+            "--extension", f"{_PI_EXAMPLES_IN_CONTAINER}/trigger-compact.ts",
+            "--extension", f"{_PI_EXAMPLES_IN_CONTAINER}/git-checkpoint.ts",
+            "--extension", f"{_PI_EXAMPLES_IN_CONTAINER}/todo.ts",
+            "--extension", f"{_PI_EXAMPLES_IN_CONTAINER}/subagent/index.ts",
+            "--extension", f"{_PI_EXAMPLES_IN_CONTAINER}/structured-output.ts",
+            "--extension", f"{_PI_EXAMPLES_IN_CONTAINER}/handoff.ts",
+            # ── NOTE: do NOT pass `--tools <allowlist>` here ─────────
+            # `--tools` is a HARD allowlist that filters BOTH built-in
+            # and extension tools (see pi-coding-agent
+            # dist/core/agent-session.js, `_refreshToolRegistry`:
+            # the `if (allowedToolNames) {…}` branch shadows the
+            # `else if (includeAllExtensionTools)` branch). Passing
+            # the previous `read,bash,edit,write,grep,find,ls` list
+            # silently filtered out every extension tool we just
+            # registered (todo, subagent, search_docs, web_search,
+            # read_doc, …) — the model would self-report "no todo /
+            # no subagent" even though the extensions loaded fine.
+            # By omitting `--tools` we get the default 4 built-ins
+            # (read/bash/edit/write) PLUS every extension tool. The
+            # native grep/find/ls fall back to `bash grep` / `bash
+            # find` / `bash ls`, which is slower but functional;
+            # caught while debugging on 2026-05-16.
         ]
 
         # ── Labels for container_pool.py ───────────────────────────
@@ -791,6 +845,35 @@ class PiSession:
         # `pi` PATH lookup, exactly as before.
         desktop_node = env.get("PI_DESKTOP_NODE_BIN", "").strip()
         desktop_pi_dir = env.get("PI_DESKTOP_PI_DIR", "").strip()
+        # Names of the bundled pi example-extensions we want to load
+        # in any subprocess path (desktop runtime AND dev fallback).
+        # See docker branch above for what each one does. Loading them
+        # in subprocess too keeps the AI's available-tools surface in
+        # parity across docker / subprocess / desktop — without it the
+        # model self-reports "no todo / no subagent" in subprocess
+        # mode (caught while testing on 2026-05-16).
+        #
+        # IMPORTANT: pi's stock `protected-paths.ts` is INTENTIONALLY
+        # omitted here. It only blocks .env / .git/ / node_modules/
+        # which is fine for the docker runtime (where the container
+        # has no $HOME secrets to begin with) but woefully thin for
+        # subprocess mode (where pi runs with the operator's full
+        # filesystem access — `~/.ssh/`, `~/.pi/agent/auth.json`,
+        # `~/.aws/credentials`, browser cookies, …). We swap it for
+        # our hardened `extensions/desktop-protected-paths.ts` which
+        # also gates `bash` (the obvious bypass — pi's stock guard
+        # leaves `bash cat ~/.ssh/id_rsa` wide open).
+        _QOL_EXTENSIONS: tuple[str, ...] = (
+            # protected-paths.ts deliberately replaced — see comment above.
+            "permission-gate.ts",
+            "trigger-compact.ts",
+            "git-checkpoint.ts",
+            "todo.ts",
+            "subagent/index.ts",
+            "structured-output.ts",
+            "handoff.ts",
+        )
+
         if desktop_node and desktop_pi_dir:
             from pathlib import Path as _Path
             _pi_dir = _Path(desktop_pi_dir)
@@ -804,7 +887,9 @@ class PiSession:
             # that file directly because the symlink doesn't survive a
             # Tauri bundle copy on Windows (NTFS junction limitations
             # vs the npm-created reparse point).
-            _pi_shim = _pi_dir / "node_modules" / "@mariozechner" / "pi-coding-agent" / "dist" / "cli.js"
+            _pi_pkg = _pi_dir / "node_modules" / "@mariozechner" / "pi-coding-agent"
+            _pi_shim = _pi_pkg / "dist" / "cli.js"
+            _examples = _pi_pkg / "examples" / "extensions"
             _ext_typst = _vendor_root / "extensions" / "typst-tools.ts"
             _ext_perm = _vendor_root / "extensions" / "permission.ts"
             cmd = [
@@ -820,16 +905,68 @@ class PiSession:
                 # (where we kill pi). See the docker-mode block
                 # above for the full rationale.
                 "--continue",
+                # See the "NOTE: do NOT pass `--tools <allowlist>`"
+                # comment in the docker branch above. The same hazard
+                # applies here — passing it filters out every
+                # extension tool we register.
             ]
             if _ext_typst.exists():
                 cmd += ["--extension", str(_ext_typst)]
             if _ext_perm.exists():
                 cmd += ["--extension", str(_ext_perm)]
+            # Hardened path-guard — replaces pi's stock protected-paths.ts.
+            # Lives next to the bundled pi tree in the desktop runtime
+            # (`<vendor>/extensions/desktop-protected-paths.ts`). Falls
+            # back to the repo-root copy if the vendor file is missing
+            # (only relevant when an operator runs the web backend with
+            # PI_DESKTOP_* env vars pointing at a hand-rolled vendor
+            # layout — unusual but worth supporting).
+            _ext_hardened = _vendor_root / "extensions" / "desktop-protected-paths.ts"
+            if not _ext_hardened.is_file():
+                _ext_hardened = (
+                    _Path(__file__).resolve().parent.parent.parent.parent
+                    / "extensions" / "desktop-protected-paths.ts"
+                )
+            if _ext_hardened.is_file():
+                cmd += ["--extension", str(_ext_hardened)]
+            for _name in _QOL_EXTENSIONS:
+                _p = _examples / _name
+                if _p.is_file():
+                    cmd += ["--extension", str(_p)]
             # NODE_PATH lets jiti / require resolve the extensions'
             # deps (@google/genai, typebox, …) which live next to the
             # bundled pi install, not in the user's picked folder.
             env["NODE_PATH"] = str(_pi_dir / "node_modules")
             return cmd, str(self.workspace_path), env
+
+        # ── Dev fallback (laptop dev, no PI_DESKTOP_* vars) ──────────
+        # Resolve pi's package install on disk so we can absolute-path
+        # the example extensions; otherwise the relative `./extensions/`
+        # paths point at the operator's checkout (typst-tools, permission)
+        # but we have no way to address the npm-installed examples
+        # except via absolute paths. We discover the package by
+        # following `which pi` → realpath → walk up to the pkg root.
+        from pathlib import Path as _Path
+        import shutil as _shutil
+        _pi_bin = _shutil.which("pi")
+        _examples_dir: Optional[_Path] = None
+        if _pi_bin:
+            try:
+                _real = _Path(_pi_bin).resolve()
+                # …/dist/cli.js or …/dist/cli.mjs depending on version
+                _candidate = _real.parent.parent / "examples" / "extensions"
+                if _candidate.is_dir():
+                    _examples_dir = _candidate
+            except OSError:
+                pass
+
+        # Repo-root absolute path to our hardened path-guard, which
+        # SUPERSEDES pi's stock examples/extensions/protected-paths.ts.
+        # Without this, local-dev subprocess mode runs with pi's anemic
+        # `.env / .git / node_modules` blocklist, leaving `~/.pi/`,
+        # `~/.ssh/`, browser cookies, etc. wide open to the AI.
+        _repo_root_dev = _Path(__file__).resolve().parent.parent.parent.parent
+        _hardened_paths = _repo_root_dev / "extensions" / "desktop-protected-paths.ts"
 
         cmd = [
             "pi",
@@ -841,7 +978,16 @@ class PiSession:
             "--continue",
             "--extension", "./extensions/typst-tools.ts",
             "--extension", "./extensions/permission.ts",
+            # See the "NOTE: do NOT pass `--tools <allowlist>`" comment
+            # in the docker branch above.
         ]
+        if _hardened_paths.is_file():
+            cmd += ["--extension", str(_hardened_paths)]
+        if _examples_dir is not None:
+            for _name in _QOL_EXTENSIONS:
+                _p = _examples_dir / _name
+                if _p.is_file():
+                    cmd += ["--extension", str(_p)]
         return cmd, str(self.workspace_path), env
 
     async def close(self) -> None:

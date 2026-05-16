@@ -99,6 +99,11 @@ def load_history(chats_dir: Path) -> list[dict[str, Any]]:
 
     messages: list[dict[str, Any]] = []
     tool_call_index: dict[str, dict[str, Any]] = {}
+    # Reverse lookup: which assistant message owns each toolCallId.
+    # Used by the orphan sweep below to stamp `stopReason: "aborted"`
+    # on the parent message when its tool call never produced a
+    # result (e.g. pi was SIGKILL'd mid-execution).
+    tool_call_to_message: dict[str, dict[str, Any]] = {}
 
     for path in files:
         try:
@@ -174,8 +179,15 @@ def load_history(chats_dir: Path) -> list[dict[str, Any]]:
                         "cost": float((cost or {}).get("total") or 0),
                     }
                 messages.append(asst)
+                stop_reason = payload.get("stopReason")
+                if isinstance(stop_reason, str):
+                    asst["stopReason"] = stop_reason
+                err_msg = payload.get("errorMessage")
+                if isinstance(err_msg, str) and err_msg:
+                    asst["errorMessage"] = err_msg
                 for tc in tool_calls:
                     tool_call_index[tc["id"]] = tc
+                    tool_call_to_message[tc["id"]] = asst
 
             elif role == "toolResult":
                 tc_id = payload.get("toolCallId")
@@ -195,5 +207,27 @@ def load_history(chats_dir: Path) -> list[dict[str, Any]]:
                     "isError": is_error,
                     "raw": content,
                 }
+
+    # ── orphan sweep ────────────────────────────────────────────────
+    # Any tool call still marked `pending` after replay never received
+    # its `toolResult` — almost always because pi was SIGKILL'd or
+    # crashed mid-execution (e.g. user pressed Stop during a slow
+    # subagent fan-out and we escalated past the graceful grace
+    # window). Without this sweep the SPA would render an eternal
+    # spinner the moment the user refreshes the chat. See the web
+    # copy of this file for the full rationale.
+    for tcid, tc in tool_call_index.items():
+        if tc.get("status") != "pending":
+            continue
+        tc["status"] = "error"
+        tc["result"] = {
+            "text": "Aborted (the previous run was interrupted).",
+            "isError": True,
+            "raw": [{"type": "text", "text": "Aborted (the previous run was interrupted)."}],
+        }
+        parent = tool_call_to_message.get(tcid)
+        if parent is not None and not parent.get("stopReason"):
+            parent["stopReason"] = "aborted"
+            parent.setdefault("errorMessage", "Request was aborted.")
 
     return messages

@@ -454,7 +454,17 @@ export function applyEvent(state: RouterState, evt: RpcEvent): void {
       // (~10×/sec). The payload key is `partialResult.content` (NOT
       // `result.content` — that name only appears on `_end`). Verified
       // against pi-mono-main/packages/coding-agent/docs/rpc.md and a live
-      // WS probe. Other tools never send this event.
+      // WS probe.
+      //
+      // The stock `subagent` extension also rides this event: on every
+      // child `message_end` / `tool_result_end` it calls `onUpdate({
+      // content, details })` (see pi-mono-main subagent/index.ts:284 →
+      // emitUpdate). The `details` payload is the same `SubagentDetails`
+      // shape that lands in `call.result.details` on `_end`, just
+      // mid-flight. Without forwarding it here the SubagentLivePanel
+      // would sit on its skeleton "spawning child agent — first turn
+      // lands in a moment…" until the WHOLE chain finishes, even though
+      // every intermediate turn was already on the wire.
       const id: string | undefined = (evt as any).toolCallId;
       if (!id) return;
       const call = state.toolCallIndex.get(id);
@@ -472,6 +482,23 @@ export function applyEvent(state: RouterState, evt: RpcEvent): void {
       // Snapshot semantics: pi sends the full cumulative output every
       // time, so we overwrite — never append (appending duplicates).
       call.streamingOutput = text;
+      // Forward structured progress (subagent transcripts, future
+      // tools that want incremental UIs) to `call.result.details` so
+      // reactive views re-render mid-flight. Tools that don't ship
+      // `details` (bash, write, edit, read) are unaffected — we only
+      // mutate when the field is actually present.
+      if (partial.details !== undefined) {
+        if (!call.result) {
+          call.result = {
+            text: "",
+            isError: false,
+            raw: [],
+            details: partial.details,
+          };
+        } else {
+          call.result.details = partial.details;
+        }
+      }
       return;
     }
 
@@ -495,11 +522,22 @@ export function applyEvent(state: RouterState, evt: RpcEvent): void {
         .trim();
       call.status = isError ? "error" : "success";
       if (call.endedAt === undefined) call.endedAt = Date.now();
+      // Preserve the most recent `details` we already accumulated from
+      // tool_execution_update if the END payload doesn't carry them.
+      // The stock `subagent` extension always returns `details` on its
+      // final result, but custom extensions may not — and even for
+      // subagent we'd rather defensively keep the last good snapshot
+      // than null-out the SubagentLivePanel's transcript when an event
+      // arrives without that field.
+      const priorDetails =
+        call.result && (call.result as { details?: unknown }).details !== undefined
+          ? (call.result as { details?: unknown }).details
+          : undefined;
       call.result = {
         text,
         isError,
         raw: rawContent,
-        details: result.details,
+        details: result.details !== undefined ? result.details : priorDetails,
       };
       return;
     }

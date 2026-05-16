@@ -21,16 +21,20 @@ import { useRouter } from "vue-router";
 
 import { useBillingStore } from "../stores/billing";
 import { useChatStore } from "../stores/chat";
+import { useSubagentPanelStore } from "../stores/subagent-panel";
 import CompactionPill from "./CompactionPill.vue";
 import Composer from "./Composer.vue";
-import CreditChip from "./CreditChip.vue";
 import MessageList from "./MessageList.vue";
+import PermissionPrompt from "./PermissionPrompt.vue";
 import SessionDisconnectedCard from "./SessionDisconnectedCard.vue";
+import SubagentLivePanel from "./SubagentLivePanel.vue";
 import UpgradeModal from "./UpgradeModal.vue";
 
 const chat = useChatStore();
 const billing = useBillingStore();
 const router = useRouter();
+const subagentPanel = useSubagentPanelStore();
+const { openCallId: subagentOpenCallId } = storeToRefs(subagentPanel);
 
 const {
   messages,
@@ -89,7 +93,15 @@ async function onReconnect(): Promise<void> {
       class="flex items-center justify-between gap-2 border-b border-sidebar-border px-3 py-2"
     >
       <span class="text-caption uppercase tracking-wide text-muted-foreground">chat</span>
-      <CreditChip />
+      <!--
+        Credit chip removed from the chat header. The visible amount
+        used to live here AND in the settings popover; keeping both
+        meant CreditChip's onMounted fetched /api/usage on every
+        ChatPane mount, plus the popover polled it every 30 s. Now
+        the only credit surface is inside ChatSettingsMenu, fetched
+        on click. Zero polling, zero idle network — see the comment
+        on `watch(open, …)` in ChatSettingsMenu.vue.
+      -->
     </header>
 
     <!--
@@ -108,7 +120,21 @@ async function onReconnect(): Promise<void> {
       />
       <span>Connecting…</span>
     </div>
-    <MessageList v-else :messages="messages" />
+    <!--
+      MessageList vs SubagentLivePanel are mutually exclusive in this
+      flex slot. When the user clicks a SubagentToolCard the panel
+      store flips `openCallId`, we hide MessageList, and SubagentLivePanel
+      renders the live transcript using the SAME width/height the chat
+      uses (instead of the previous 560 px right-side drawer that
+      truncated wider tool cards on big screens). PermissionPrompt /
+      CompactionPill / Composer keep working below because they're
+      sibling flex children, not covered by an overlay anymore.
+    -->
+    <MessageList
+      v-if="!isInitialConnecting && !subagentOpenCallId"
+      :messages="messages"
+    />
+    <SubagentLivePanel v-else-if="!isInitialConnecting && subagentOpenCallId" />
 
     <!--
       Reconnecting pill — slim, non-modal indicator that we noticed a
@@ -139,6 +165,15 @@ async function onReconnect(): Promise<void> {
 
     <CompactionPill />
 
+    <!-- Pending-permission banner. Renders nothing when the queue is
+         empty. Anchored just above the Composer because that's where
+         the user's eye lives while a turn is in flight (watching for
+         the next thing to type / for the agent to finish). Earlier
+         iterations parked this at the top of the chat column; users
+         routinely missed the prompt because their gaze had already
+         moved to the composer. See PermissionPrompt.vue header comment. -->
+    <PermissionPrompt />
+
     <Composer />
 
     <SessionDisconnectedCard
@@ -161,5 +196,14 @@ async function onReconnect(): Promise<void> {
       :enabled="billingEnabled"
       @close="billing.dismissAutoUpgrade()"
     />
+
+    <!--
+      SubagentLivePanel was previously rendered here as an absolutely-
+      positioned right-side drawer. It now slots into the MessageList
+      position above (mutually exclusive with MessageList), so the
+      transcript inherits the chat column's responsive width instead of
+      being clamped to 560 px. See the v-if/v-else-if pair near
+      PermissionPrompt above and the comment block in SubagentLivePanel.vue.
+    -->
   </aside>
 </template>
