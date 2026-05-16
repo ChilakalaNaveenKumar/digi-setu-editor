@@ -527,6 +527,34 @@ def _format_skill_chunk(skill: Skill) -> str:
     )
 
 
+# Regex matching ONE leading skill chunk as emitted by `_format_skill_chunk`.
+# Mirror of the web copy in `web/backend/services/skills.py` — see that file
+# for the full rationale. Keep both in lockstep; the persisted JSONL format
+# is identical, so the strip rule must be too.
+_SKILL_PREFIX_RE = re.compile(
+    r'^<skill name="[^"]*" source="[^"]*">\n.*?\n</skill>\n*',
+    re.DOTALL,
+)
+
+
+def strip_skill_prefix(text: str) -> str:
+    """Remove leading `<skill>...</skill>` blocks injected at send time.
+
+    Used by `services/history.py` when projecting pi's JSONL chat log
+    into the SPA's ChatMessage shape — otherwise the skill markup would
+    surface inside the user's bubble on every reload / resume.
+    """
+    if not text or not text.startswith("<skill "):
+        return text
+    out = text
+    while True:
+        m = _SKILL_PREFIX_RE.match(out)
+        if not m:
+            break
+        out = out[m.end():]
+    return out
+
+
 # ── Public helpers used by routes ─────────────────────────────────────
 
 

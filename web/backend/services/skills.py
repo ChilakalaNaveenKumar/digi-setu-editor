@@ -182,6 +182,46 @@ def _format_skill_chunk(skill: Skill) -> str:
     )
 
 
+# Regex matching ONE leading skill chunk as emitted by `_format_skill_chunk`.
+# The chunks are concatenated by `\n\n` and the whole prefix terminates with
+# `\n\n` before the user's message, so allowing `\n*` to consume the
+# separator lets us strip multiple chunks in a loop without a second pass.
+# Anchored to start-of-string so a user who *types* `<skill ...>` mid-message
+# is never silently rewritten.
+_SKILL_PREFIX_RE = re.compile(
+    r'^<skill name="[^"]*" source="[^"]*">\n.*?\n</skill>\n*',
+    re.DOTALL,
+)
+
+
+def strip_skill_prefix(text: str) -> str:
+    """
+    Remove leading `<skill>...</skill>` blocks that `assemble_turn_prefix`
+    prepended to a user message before sending it to pi.
+
+    Why this exists: pi persists user prompts verbatim into its JSONL
+    chat log, including whatever prefix the route added. When the SPA
+    reloads history (page refresh, resume in a new tab, chat URL shared
+    with a teammate), the augmented text would otherwise surface inside
+    the user's own chat bubble — which leaks the skill body, bloats the
+    visible turn, and makes the chat look corrupted.
+
+    The model still sees the skill content because the prefix is
+    inlined at the moment pi processes the prompt; only the post-hoc
+    history reader strips it. In-body `<skill>` tags the user typed
+    themselves are NOT touched (the regex is anchored to start).
+    """
+    if not text or not text.startswith("<skill "):
+        return text
+    out = text
+    while True:
+        m = _SKILL_PREFIX_RE.match(out)
+        if not m:
+            break
+        out = out[m.end():]
+    return out
+
+
 def assemble_turn_prefix(user_id: str, user_message: str) -> str:
     """Auto-loaded bundled skills + matched-trigger skills + @mention skills."""
     chunks: list[str] = []

@@ -24,6 +24,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from services.skills import strip_skill_prefix
+
 
 def _flatten_assistant_content(content: list[dict]) -> tuple[list[dict], list[dict]]:
     """Project an assistant message's content[] into (parts, toolCalls).
@@ -129,6 +131,15 @@ def load_history(chats_dir: Path) -> list[dict[str, Any]]:
                 text = "".join(
                     (c.get("text") or "") for c in content if c.get("type") == "text"
                 ).strip()
+                if not text:
+                    continue
+                # The chat_sse route prepends `<skill ...>...</skill>\n\n`
+                # blocks to user prompts at send time so the model sees
+                # the skill body in-context. Pi persists the prompt
+                # verbatim, so we strip the leading skill chunks back
+                # out here — otherwise reload / resume surfaces the
+                # raw skill markup inside the user's chat bubble.
+                text = strip_skill_prefix(text).strip()
                 if not text:
                     continue
                 messages.append({
